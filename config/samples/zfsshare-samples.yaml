@@ -1,0 +1,29 @@
+---
+# Dynamically export a ZFS dataset over NFS (RWX). The dataset must already be
+# provisioned/mounted on the node by the storage plane.
+apiVersion: storage.zfs-shares.io/v1alpha1
+kind: ZfsShare
+metadata:
+  name: pvc-media-movies
+spec:
+  nodeName: talos-node-01
+  protocol: nfs
+  path: /tank/media/movies
+  nfs:
+    clients:
+      - client: "10.0.0.0/24"
+        options: ["rw", "sync", "no_subtree_check", "no_root_squash"]
+---
+# Export a ZFS zvol over NVMe-oF (TCP). The zvol device must already exist.
+apiVersion: storage.zfs-shares.io/v1alpha1
+kind: ZfsShare
+metadata:
+  name: pvc-postgres-data
+spec:
+  nodeName: talos-node-01
+  protocol: nvmeof
+  path: /dev/zvol/tank/pvc-postgres-data
+  nvmeof:
+    # nqn omitted -> derived as nqn.2025-01.io.zfs-shares:talos-node-01:pvc-postgres-data
+    allowedHosts:
+      - "nqn.2014-08.org.nvmexpress:uuid:worker-01"

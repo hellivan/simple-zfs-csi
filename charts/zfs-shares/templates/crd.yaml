@@ -1,0 +1,159 @@
+{{- if .Values.crds.install }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: zfsshares.storage.zfs-shares.io
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+  {{- if .Values.crds.keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  group: storage.zfs-shares.io
+  names:
+    kind: ZfsShare
+    listKind: ZfsShareList
+    plural: zfsshares
+    singular: zfsshare
+    shortNames:
+      - zshare
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .spec.nodeName
+        - name: Protocol
+          type: string
+          jsonPath: .spec.protocol
+        - name: Path
+          type: string
+          jsonPath: .spec.path
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: ZfsShare represents an intent to share a ZFS path over the network from a specific storage node.
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - nodeName
+                - protocol
+                - path
+              properties:
+                nodeName:
+                  type: string
+                  minLength: 1
+                  description: Physical storage node that holds the underlying ZFS path.
+                protocol:
+                  type: string
+                  enum:
+                    - nfs
+                    - nvmeof
+                  description: Sharing backend.
+                path:
+                  type: string
+                  minLength: 1
+                  description: |
+                    Local node-side source. For nfs: the dataset mountpoint (e.g. /tank/k8s/pvc-1).
+                    For nvmeof: the zvol block device (e.g. /dev/zvol/tank/pvc-1).
+                nfs:
+                  type: object
+                  description: NFS-specific export configuration (required when protocol is nfs).
+                  required:
+                    - clients
+                  properties:
+                    clients:
+                      type: array
+                      minItems: 1
+                      items:
+                        type: object
+                        required:
+                          - client
+                        properties:
+                          client:
+                            type: string
+                            minLength: 1
+                            description: 'Host match: "*", a CIDR, an IP, or a hostname.'
+                          options:
+                            type: array
+                            items:
+                              type: string
+                            description: Raw NFS export options; defaults applied when empty.
+                nvmeof:
+                  type: object
+                  description: NVMe-oF specific configuration (required when protocol is nvmeof).
+                  properties:
+                    nqn:
+                      type: string
+                      description: Subsystem NQN; derived deterministically when empty.
+                    allowedHosts:
+                      type: array
+                      items:
+                        type: string
+                      description: Host NQNs permitted to connect; empty allows any host.
+              oneOf:
+                - properties:
+                    protocol:
+                      const: nfs
+                  required:
+                    - nfs
+                - properties:
+                    protocol:
+                      const: nvmeof
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                observedGeneration:
+                  type: integer
+                  format: int64
+                nqn:
+                  type: string
+                message:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+{{- end }}

@@ -1,0 +1,101 @@
+# Default values for the zfs-shares chart.
+
+# -- Override the chart name used in resource names.
+nameOverride: ""
+# -- Override the full release name used in resource names.
+fullnameOverride: ""
+
+crds:
+  # -- Install the ZfsShare CustomResourceDefinition with the chart.
+  install: true
+  # -- Keep the CRD on `helm uninstall` (prevents data loss). Adds the
+  # `helm.sh/resource-policy: keep` annotation when true.
+  keep: true
+
+image:
+  # -- Container registry hosting the controller images.
+  registry: ghcr.io
+  # -- Image repository prefix; the `-nfs` / `-nvmeof` suffix is appended.
+  repository: hellivan/zfs-shares
+  # -- Image tag. Defaults to the chart appVersion when empty.
+  tag: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Node selector applied to both DaemonSets. Storage nodes should carry this label.
+nodeSelector:
+  zfs-shares.io/storage: "true"
+
+# -- Tolerations applied to both DaemonSets.
+tolerations:
+  - operator: Exists
+
+serviceAccount:
+  # -- Create the ServiceAccounts (one per controller).
+  create: true
+  # -- Extra annotations for the ServiceAccounts.
+  annotations: {}
+
+rbac:
+  # -- Create the ClusterRole and ClusterRoleBindings.
+  create: true
+
+# -------- NFS controller --------
+nfs:
+  # -- Deploy the NFS target DaemonSet.
+  enabled: true
+  image:
+    # -- Override the full NFS image (registry/repo:tag). Empty derives it from `image.*`.
+    repository: ""
+    tag: ""
+  # -- Number of nfsd kernel threads.
+  threads: 8
+  # -- Serve NFSv4 only (disables v2/v3 and rpcbind; single port 2049).
+  v4Only: false
+  # -- Path of the exports file inside the container.
+  exportsPath: /etc/exports
+  pool:
+    # -- Host path of the ZFS pool root that holds exported datasets.
+    hostPath: /tank
+    # -- Mount path of the pool inside the container (must match dataset paths).
+    mountPath: /tank
+  # -- Extra CLI args for the nfs-controller.
+  extraArgs: []
+  # -- Resource requests/limits.
+  resources: {}
+  # -- Pod annotations.
+  podAnnotations: {}
+
+# -------- NVMe-oF controller --------
+nvmeof:
+  # -- Deploy the NVMe-oF target DaemonSet.
+  enabled: true
+  image:
+    # -- Override the full NVMe-oF image (registry/repo:tag). Empty derives it from `image.*`.
+    repository: ""
+    tag: ""
+  # -- Prefix for deterministically derived subsystem NQNs.
+  nqnPrefix: nqn.2025-01.io.zfs-shares
+  # -- Root of the nvmet configfs tree on the host.
+  configfsRoot: /sys/kernel/config
+  transport:
+    # -- NVMe/TCP listen address on the node.
+    address: 0.0.0.0
+    # -- NVMe/TCP listen port.
+    serviceId: "4420"
+    # -- nvmet port directory id.
+    portId: "1"
+  # -- Extra CLI args for the nvmeof-controller.
+  extraArgs: []
+  # -- Resource requests/limits.
+  resources: {}
+  # -- Pod annotations.
+  podAnnotations: {}
+
+# -- Ports for metrics and health probes (shared by both controllers).
+ports:
+  metrics: 8080
+  health: 8081

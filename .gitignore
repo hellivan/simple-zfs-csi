@@ -1,0 +1,5 @@
+# Ignore build output
+/bin/
+/out/
+*.test
+coverage.out

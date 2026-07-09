@@ -1,0 +1,51 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfsshares"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfsshares/status"]
+    verbs: ["get", "update", "patch"]
+{{- if .Values.nfs.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-nfs
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nfs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zfs-shares.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "nfs") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.nvmeof.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-nvmeof
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nvmeof
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zfs-shares.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "nvmeof") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

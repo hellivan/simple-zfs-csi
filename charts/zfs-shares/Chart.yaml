@@ -1,0 +1,20 @@
+apiVersion: v2
+name: zfs-shares
+description: Cloud-native network sharing of pre-provisioned ZFS storage on Talos (NFS + NVMe-oF controllers driven by the ZfsShare CRD).
+type: application
+# version is the chart version; appVersion tracks the container image tag.
+# Both are overwritten by the release pipeline from the git tag.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/hellivan/zfs-shares
+sources:
+  - https://github.com/hellivan/zfs-shares
+keywords:
+  - zfs
+  - nfs
+  - nvme-of
+  - storage
+  - talos
+maintainers:
+  - name: hellivan

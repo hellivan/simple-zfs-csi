@@ -1,0 +1,77 @@
+---
+# NFS target DaemonSet. Runs on nodes labelled zfs-shares.io/storage=true and
+# serves nfs-protocol ZfsShares from an in-container kernel NFS server.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zfs-shares-nfs
+  namespace: zfs-shares
+  labels:
+    app.kubernetes.io/name: zfs-shares
+    app.kubernetes.io/component: nfs
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zfs-shares
+      app.kubernetes.io/component: nfs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zfs-shares
+        app.kubernetes.io/component: nfs
+    spec:
+      serviceAccountName: zfs-shares-nfs
+      # hostNetwork so other nodes reach the server on the node IP (2049/111/20048).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        zfs-shares.io/storage: "true"
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: nfs-controller
+          image: ghcr.io/hellivan/zfs-shares-nfs:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --node-name=$(NODE_NAME)
+            - --nfs-threads=8
+            # Leaner NFSv4-only mode (single port 2049, no rpcbind/statd):
+            # - --nfs-v4-only=true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          ports:
+            - name: metrics
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            # Pool root: the container must see the ZFS dataset mountpoints that
+            # the storage plane creates. Adjust hostPath/mountPath to your pool.
+            - name: pool
+              mountPath: /tank
+              mountPropagation: HostToContainer
+            # NFS server runtime state.
+            - name: nfs-state
+              mountPath: /var/lib/nfs
+      volumes:
+        - name: pool
+          hostPath:
+            path: /tank
+            type: Directory
+        - name: nfs-state
+          emptyDir: {}

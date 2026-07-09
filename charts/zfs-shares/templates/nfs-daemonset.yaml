@@ -1,0 +1,95 @@
+{{- if .Values.nfs.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-nfs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nfs
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: nfs
+  template:
+    metadata:
+      labels:
+        {{- include "zfs-shares.labels" . | nindent 8 }}
+        app.kubernetes.io/component: nfs
+      {{- with .Values.nfs.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "nfs") }}
+      # hostNetwork so other nodes reach the server on the node IP (2049/111/20048).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nfs-controller
+          image: {{ include "zfs-shares.image" (dict "root" . "component" "nfs") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --node-name=$(NODE_NAME)
+            - --nfs-threads={{ .Values.nfs.threads }}
+            - --exports-path={{ .Values.nfs.exportsPath }}
+            - --nfs-v4-only={{ .Values.nfs.v4Only }}
+            - --metrics-bind-address=:{{ .Values.ports.metrics }}
+            - --health-probe-bind-address=:{{ .Values.ports.health }}
+            {{- with .Values.nfs.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.ports.health }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.ports.health }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- with .Values.nfs.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: pool
+              mountPath: {{ .Values.nfs.pool.mountPath }}
+              mountPropagation: HostToContainer
+            - name: nfs-state
+              mountPath: /var/lib/nfs
+      volumes:
+        - name: pool
+          hostPath:
+            path: {{ .Values.nfs.pool.hostPath }}
+            type: Directory
+        - name: nfs-state
+          emptyDir: {}
+{{- end }}

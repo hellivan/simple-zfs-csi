@@ -1,0 +1,99 @@
+{{- if .Values.nvmeof.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-nvmeof
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nvmeof
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: nvmeof
+  template:
+    metadata:
+      labels:
+        {{- include "zfs-shares.labels" . | nindent 8 }}
+        app.kubernetes.io/component: nvmeof
+      {{- with .Values.nvmeof.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "nvmeof") }}
+      # hostNetwork so initiators reach the NVMe/TCP port on the node IP.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nvmeof-controller
+          image: {{ include "zfs-shares.image" (dict "root" . "component" "nvmeof") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --node-name=$(NODE_NAME)
+            - --nqn-prefix={{ .Values.nvmeof.nqnPrefix }}
+            - --nvmet-configfs-root={{ .Values.nvmeof.configfsRoot }}
+            - --transport-address={{ .Values.nvmeof.transport.address }}
+            - --transport-service-id={{ .Values.nvmeof.transport.serviceId }}
+            - --port-id={{ .Values.nvmeof.transport.portId }}
+            - --metrics-bind-address=:{{ .Values.ports.metrics }}
+            - --health-probe-bind-address=:{{ .Values.ports.health }}
+            {{- with .Values.nvmeof.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.ports.health }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.ports.health }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- with .Values.nvmeof.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: configfs
+              mountPath: {{ .Values.nvmeof.configfsRoot }}
+            - name: dev
+              mountPath: /dev
+              mountPropagation: HostToContainer
+      volumes:
+        - name: configfs
+          hostPath:
+            path: {{ .Values.nvmeof.configfsRoot }}
+            type: Directory
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+{{- end }}

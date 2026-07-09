@@ -1,0 +1,105 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 0.1.0 (a leading v is stripped automatically)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [nfs, nvmeof]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            raw='${{ github.event.inputs.version }}'
+          else
+            raw='${{ github.ref_name }}'
+          fi
+          # OCI/chart tags are never v-prefixed (v1.2.3 -> 1.2.3).
+          echo "value=${raw#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/zfs-shares-${{ matrix.component }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.value }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.value }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/${{ matrix.component }}.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  chart:
+    needs: images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            raw='${{ github.event.inputs.version }}'
+          else
+            raw='${{ github.ref_name }}'
+          fi
+          # OCI/chart tags are never v-prefixed (v1.2.3 -> 1.2.3).
+          echo "value=${raw#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package chart
+        run: |
+          helm package charts/zfs-shares \
+            --version "${{ steps.version.outputs.value }}" \
+            --app-version "${{ steps.version.outputs.value }}" \
+            --destination dist
+
+      - name: Log in to GHCR (Helm)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} \
+            --username ${{ github.actor }} --password-stdin
+
+      - name: Push chart (OCI)
+        run: |
+          helm push dist/zfs-shares-${{ steps.version.outputs.value }}.tgz \
+            oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts

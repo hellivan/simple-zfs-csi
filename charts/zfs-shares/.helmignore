@@ -1,0 +1,9 @@
+# Patterns to ignore when building Helm packages.
+.git/
+.github/
+*.tgz
+.DS_Store
+*.go
+go.mod
+go.sum
+Makefile

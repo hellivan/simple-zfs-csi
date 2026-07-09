@@ -1,0 +1,26 @@
+zfs-shares {{ .Chart.AppVersion }} installed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Enabled controllers:
+{{- if .Values.nfs.enabled }}
+  - NFS       (DaemonSet {{ include "zfs-shares.fullname" . }}-nfs)
+{{- end }}
+{{- if .Values.nvmeof.enabled }}
+  - NVMe-oF   (DaemonSet {{ include "zfs-shares.fullname" . }}-nvmeof)
+{{- end }}
+
+Next steps:
+
+1. Label your storage node(s) so the DaemonSets schedule there:
+
+     kubectl label node <node> {{ range $k, $v := .Values.nodeSelector }}{{ $k }}={{ $v }} {{ end }}
+
+2. Ensure host prerequisites (Talos system extensions):
+     - NFS:     nfsd + sunrpc kernel modules
+     - NVMe-oF: nvmet + nvmet-tcp modules, configfs mounted at {{ .Values.nvmeof.configfsRoot }}
+{{- if .Values.nfs.enabled }}
+     - NFS pool root hostPath: {{ .Values.nfs.pool.hostPath }} (adjust nfs.pool.* if different)
+{{- end }}
+
+3. Create a ZfsShare:
+
+     kubectl get zfsshares
