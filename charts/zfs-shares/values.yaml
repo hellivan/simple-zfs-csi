@@ -68,6 +68,11 @@ nfs:
   resources: {}
   # -- Pod annotations.
   podAnnotations: {}
+  # -- Host ports for metrics and health probes. With hostNetwork these bind on
+  # the node, so they must not clash with the nvmeof controller on the same node.
+  ports:
+    metrics: 8080
+    health: 8081
 
 # -------- NVMe-oF controller --------
 nvmeof:
@@ -94,8 +99,8 @@ nvmeof:
   resources: {}
   # -- Pod annotations.
   podAnnotations: {}
-
-# -- Ports for metrics and health probes (shared by both controllers).
-ports:
-  metrics: 8080
-  health: 8081
+  # -- Host ports for metrics and health probes. With hostNetwork these bind on
+  # the node, so they must differ from the nfs controller on the same node.
+  ports:
+    metrics: 8082
+    health: 8083

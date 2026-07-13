@@ -48,8 +48,8 @@ spec:
             - --nfs-threads={{ .Values.nfs.threads }}
             - --exports-path={{ .Values.nfs.exportsPath }}
             - --nfs-v4-only={{ .Values.nfs.v4Only }}
-            - --metrics-bind-address=:{{ .Values.ports.metrics }}
-            - --health-probe-bind-address=:{{ .Values.ports.health }}
+            - --metrics-bind-address=:{{ .Values.nfs.ports.metrics }}
+            - --health-probe-bind-address=:{{ .Values.nfs.ports.health }}
             {{- with .Values.nfs.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -62,17 +62,17 @@ spec:
             privileged: true
           ports:
             - name: metrics
-              containerPort: {{ .Values.ports.metrics }}
+              containerPort: {{ .Values.nfs.ports.metrics }}
           livenessProbe:
             httpGet:
               path: /healthz
-              port: {{ .Values.ports.health }}
+              port: {{ .Values.nfs.ports.health }}
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
             httpGet:
               path: /readyz
-              port: {{ .Values.ports.health }}
+              port: {{ .Values.nfs.ports.health }}
             initialDelaySeconds: 5
             periodSeconds: 10
           {{- with .Values.nfs.resources }}

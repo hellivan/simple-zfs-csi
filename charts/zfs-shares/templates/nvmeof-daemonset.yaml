@@ -50,8 +50,8 @@ spec:
             - --transport-address={{ .Values.nvmeof.transport.address }}
             - --transport-service-id={{ .Values.nvmeof.transport.serviceId }}
             - --port-id={{ .Values.nvmeof.transport.portId }}
-            - --metrics-bind-address=:{{ .Values.ports.metrics }}
-            - --health-probe-bind-address=:{{ .Values.ports.health }}
+            - --metrics-bind-address=:{{ .Values.nvmeof.ports.metrics }}
+            - --health-probe-bind-address=:{{ .Values.nvmeof.ports.health }}
             {{- with .Values.nvmeof.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -64,17 +64,17 @@ spec:
             privileged: true
           ports:
             - name: metrics
-              containerPort: {{ .Values.ports.metrics }}
+              containerPort: {{ .Values.nvmeof.ports.metrics }}
           livenessProbe:
             httpGet:
               path: /healthz
-              port: {{ .Values.ports.health }}
+              port: {{ .Values.nvmeof.ports.health }}
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
             httpGet:
               path: /readyz
-              port: {{ .Values.ports.health }}
+              port: {{ .Values.nvmeof.ports.health }}
             initialDelaySeconds: 5
             periodSeconds: 10
           {{- with .Values.nvmeof.resources }}
