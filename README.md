@@ -137,10 +137,35 @@ Common values (see [charts/zfs-shares/values.yaml](charts/zfs-shares/values.yaml
 | `nodeSelector` | `zfs-shares.io/storage: "true"` | where the DaemonSets run |
 | `image.tag` | chart `appVersion` | image tag override |
 
+### CRD management & upgrades
+
 The `ZfsShare` CRD is generated from the Go types (`make manifests`) and shipped
 in the chart's Helm-native [charts/zfs-shares/crds](charts/zfs-shares/crds)
-directory: `helm install` creates it automatically, but `helm upgrade` does not
-update it — apply schema changes with `make install-crd`.
+directory. Helm treats `crds/` specially:
+
+- **Install:** `helm install` applies the CRD automatically. Skip it (e.g. when
+  CRDs are managed separately) with `helm install --skip-crds`.
+- **Upgrade:** Helm **never** updates (or deletes) CRDs in `crds/` on `helm
+  upgrade`, and there is **no flag** that changes this. When a release changes
+  the CRD schema you must apply it yourself, **before** upgrading the workload:
+
+  ```sh
+  # from a local checkout:
+  make install-crd            # kubectl apply -f charts/zfs-shares/crds/
+
+  # or from a published chart version:
+  helm pull oci://ghcr.io/hellivan/charts/zfs-shares --version <v> --untar
+  kubectl apply -f zfs-shares/crds/
+
+  # then upgrade the workload:
+  helm upgrade zfs-shares oci://ghcr.io/hellivan/charts/zfs-shares --version <v> ...
+  ```
+
+  `kubectl apply` on a CRD is additive and safe for the schema changes this
+  project makes (adding fields/validations). Never `kubectl delete` the CRD to
+  "refresh" it — that cascade-deletes every `ZfsShare` object.
+- **Uninstall:** Helm does not remove `crds/` CRDs, so the CRD and any `ZfsShare`
+  objects are retained by design.
 
 ### Host prerequisites (Talos system extensions)
 
