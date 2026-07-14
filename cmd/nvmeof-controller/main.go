@@ -69,6 +69,9 @@ func main() {
 		setupLog.Error(err, "nvmet target unavailable")
 		os.Exit(1)
 	}
+	if !target.TransportModuleLoaded() {
+		setupLog.Info("nvmet_tcp kernel module not detected; the TCP listener may fail until it is loaded on the node (e.g. Talos machine.kernel.modules: nvmet_tcp)")
+	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,

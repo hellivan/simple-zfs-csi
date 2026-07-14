@@ -70,14 +70,40 @@ func NewTarget(root string, port PortConfig) *Target {
 	return &Target{Root: root, Port: port}
 }
 
-// Available reports whether the nvmet configfs tree is mounted and writable.
+// Available reports whether the nvmet configfs tree is mounted and writable. It
+// distinguishes the two common failure modes (configfs not mounted vs the nvmet
+// kernel module not loaded) so operators get an actionable error.
 func (t *Target) Available() error {
-	if fi, err := os.Stat(t.Root); err != nil {
-		return fmt.Errorf("nvmet configfs not available at %s (is the nvmet kernel module loaded and configfs mounted?): %w", t.Root, err)
-	} else if !fi.IsDir() {
+	// The nvmet subtree lives directly under the configfs mount point; if that
+	// parent is missing, configfs itself is not mounted (into the host or pod).
+	configfsRoot := filepath.Dir(t.Root)
+	if _, err := os.Stat(configfsRoot); err != nil {
+		return fmt.Errorf("configfs not available at %s (is configfs mounted on the node and into the pod?): %w", configfsRoot, err)
+	}
+	// The nvmet directory only appears once the nvmet kernel module is loaded.
+	fi, err := os.Stat(t.Root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("nvmet configfs tree not found at %s: load the nvmet kernel module on the node (e.g. Talos machine.kernel.modules: nvmet and nvmet_tcp)", t.Root)
+		}
+		return fmt.Errorf("stat nvmet root %s: %w", t.Root, err)
+	}
+	if !fi.IsDir() {
 		return fmt.Errorf("%s is not a directory", t.Root)
 	}
 	return nil
+}
+
+// TransportModuleLoaded reports whether the kernel module backing the port's
+// transport appears loaded. It is best-effort: a negative result may simply mean
+// the transport is built into the kernel (no /sys/module entry), so callers
+// should treat false as a warning rather than a hard failure.
+func (t *Target) TransportModuleLoaded() bool {
+	if t.Port.TrType != "tcp" {
+		return true // only the tcp transport is checked here
+	}
+	_, err := os.Stat("/sys/module/nvmet_tcp")
+	return err == nil
 }
 
 func (t *Target) subsystemsDir() string { return filepath.Join(t.Root, "subsystems") }
