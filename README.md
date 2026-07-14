@@ -103,8 +103,6 @@ make helm-template  # render the chart
 
 ## Deploy
 
-### Option A — Helm chart (recommended)
-
 The chart and both images are published to GHCR by the release pipeline:
 
 - `oci://ghcr.io/hellivan/charts/zfs-shares` (chart)
@@ -139,15 +137,6 @@ Common values (see [charts/zfs-shares/values.yaml](charts/zfs-shares/values.yaml
 | `nodeSelector` | `zfs-shares.io/storage: "true"` | where the DaemonSets run |
 | `image.tag` | chart `appVersion` | image tag override |
 | `crds.install` / `crds.keep` | `true` | manage the CRD with the chart |
-
-### Option B — raw manifests
-
-```sh
-kubectl label node talos-node-01 zfs-shares.io/storage=true
-# adjust the pool hostPath in deploy/20-nfs-daemonset.yaml, then:
-make deploy          # CRD + RBAC + both DaemonSets
-kubectl get zfsshares
-```
 
 ### Host prerequisites (Talos system extensions)
 
@@ -189,10 +178,8 @@ cmd/nvmeof-controller/   NVMe-oF controller entrypoint
 internal/controller/     reconcilers (nfs, nvmeof) + shared helpers
 internal/nfsserver/      /etc/exports rendering + NFS daemon supervisor
 internal/nvmet/          nvmet configfs backend
-config/crd/              CustomResourceDefinition (for plain kubectl)
 config/samples/          example ZfsShare objects
-charts/zfs-shares/       Helm chart (canonical deploy path)
-deploy/                  raw namespace, RBAC, DaemonSets
+charts/zfs-shares/       Helm chart (canonical deploy path; CRD lives here)
 build/                   Dockerfiles (multi-arch)
 .github/workflows/       CI + release pipelines
 ```

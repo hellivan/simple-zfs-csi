@@ -27,14 +27,13 @@ vet:
 tidy:
 	go mod tidy
 
-## Regenerate DeepCopy code and the CRD manifest from the Go types.
+## Regenerate DeepCopy code from the Go types.
+## The CRD and RBAC manifests are hand-maintained in the Helm chart
+## (charts/zfs-shares/templates/) — the single source of truth.
 .PHONY: manifests
 manifests:
 	go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION) \
 		object:headerFile= paths=./api/...
-	go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION) \
-		crd rbac:roleName=zfs-shares-controller paths=./api/... paths=./internal/controller/... \
-		output:crd:dir=config/crd output:rbac:dir=config/rbac
 
 .PHONY: docker-nfs
 docker-nfs:
@@ -52,20 +51,10 @@ docker-push: docker
 	docker push $(NFS_IMG)
 	docker push $(NVMEOF_IMG)
 
-## Install just the CRD.
+## Install just the CRD (rendered from the chart, the single source of truth).
 .PHONY: install-crd
 install-crd:
-	kubectl apply -f config/crd/zfsshares.storage.zfs-shares.io.yaml
-
-## Deploy CRD, RBAC and both DaemonSets.
-.PHONY: deploy
-deploy: install-crd
-	kubectl apply -f deploy/
-
-.PHONY: undeploy
-undeploy:
-	kubectl delete -f deploy/ --ignore-not-found
-	kubectl delete -f config/crd/zfsshares.storage.zfs-shares.io.yaml --ignore-not-found
+	helm template zfs-shares $(CHART_DIR) -s templates/crd.yaml | kubectl apply -f -
 
 ## --- Helm ---
 .PHONY: helm-lint
@@ -85,3 +74,9 @@ helm-package:
 helm-install:
 	helm upgrade --install zfs-shares $(CHART_DIR) \
 		--namespace zfs-shares --create-namespace
+
+## Uninstall the chart (the CRD is retained via helm.sh/resource-policy: keep).
+.PHONY: helm-uninstall
+helm-uninstall:
+	helm uninstall zfs-shares --namespace zfs-shares
+
