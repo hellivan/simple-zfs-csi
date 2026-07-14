@@ -182,4 +182,5 @@ config/samples/          example ZfsShare objects
 charts/zfs-shares/       Helm chart (canonical deploy path; CRD lives here)
 build/                   Dockerfiles (multi-arch)
 .github/workflows/       CI + release pipelines
+docs/                    design decisions & future-improvement notes
 ```
