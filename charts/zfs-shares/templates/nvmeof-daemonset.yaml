@@ -46,7 +46,7 @@ spec:
           args:
             - --node-name=$(NODE_NAME)
             - --nqn-prefix={{ .Values.nvmeof.nqnPrefix }}
-            - --nvmet-configfs-root={{ .Values.nvmeof.configfsRoot }}
+            - --nvmet-configfs-root={{ .Values.nvmeof.configfsRoot }}/nvmet
             - --transport-address={{ .Values.nvmeof.transport.address }}
             - --transport-service-id={{ .Values.nvmeof.transport.serviceId }}
             - --port-id={{ .Values.nvmeof.transport.portId }}

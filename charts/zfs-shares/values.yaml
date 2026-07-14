@@ -84,7 +84,8 @@ nvmeof:
     tag: ""
   # -- Prefix for deterministically derived subsystem NQNs.
   nqnPrefix: nqn.2025-01.io.zfs-shares
-  # -- Root of the nvmet configfs tree on the host.
+  # -- Host mount point of the configfs filesystem. The nvmet target subtree
+  # lives at `<configfsRoot>/nvmet`, which is what the controller manages.
   configfsRoot: /sys/kernel/config
   transport:
     # -- NVMe/TCP listen address on the node.
