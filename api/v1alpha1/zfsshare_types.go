@@ -30,6 +30,8 @@ const (
 // ZfsShareSpec describes the desired network export of an already-provisioned
 // ZFS dataset (NFS) or zvol (NVMe-oF). It carries no storage-sizing parameters;
 // allocation is owned by the CSI/storage plane.
+// +kubebuilder:validation:XValidation:rule="self.protocol != 'nfs' || has(self.nfs)",message="spec.nfs is required when protocol is nfs"
+// +kubebuilder:validation:XValidation:rule="self.protocol != 'nvmeof' || has(self.nvmeof)",message="spec.nvmeof is required when protocol is nvmeof"
 type ZfsShareSpec struct {
 	// NodeName pins the export to the physical storage node that holds the
 	// underlying ZFS path. Only the controller running on this node acts on it.

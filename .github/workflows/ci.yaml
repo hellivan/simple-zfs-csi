@@ -26,6 +26,14 @@ jobs:
         run: go vet ./...
       - name: go build
         run: go build ./...
+      - name: generated manifests up to date
+        run: |
+          make manifests
+          if ! git diff --quiet; then
+            echo "Generated CRD/deepcopy are out of date. Run 'make manifests' and commit the result:"
+            git --no-pager diff --stat
+            exit 1
+          fi
       - name: go test
         run: go test ./...
 

@@ -27,13 +27,14 @@ vet:
 tidy:
 	go mod tidy
 
-## Regenerate DeepCopy code from the Go types.
-## The CRD and RBAC manifests are hand-maintained in the Helm chart
-## (charts/zfs-shares/templates/) — the single source of truth.
+## Regenerate DeepCopy code and the CRD from the Go types. The generated CRD is
+## written to the chart's Helm-native crds/ directory (the single source of
+## truth); the API types + kubebuilder markers are authoritative.
 .PHONY: manifests
 manifests:
 	go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION) \
-		object:headerFile= paths=./api/...
+		object:headerFile= paths=./api/... \
+		crd output:crd:dir=$(CHART_DIR)/crds
 
 .PHONY: docker-nfs
 docker-nfs:
@@ -51,10 +52,11 @@ docker-push: docker
 	docker push $(NFS_IMG)
 	docker push $(NVMEOF_IMG)
 
-## Install just the CRD (rendered from the chart, the single source of truth).
+## Install just the CRD from the chart's Helm-native crds/ directory. Use this to
+## roll a schema change, since `helm upgrade` never updates crds/ resources.
 .PHONY: install-crd
 install-crd:
-	helm template zfs-shares $(CHART_DIR) -s templates/crd.yaml | kubectl apply -f -
+	kubectl apply -f $(CHART_DIR)/crds/
 
 ## --- Helm ---
 .PHONY: helm-lint
@@ -75,7 +77,8 @@ helm-install:
 	helm upgrade --install zfs-shares $(CHART_DIR) \
 		--namespace zfs-shares --create-namespace
 
-## Uninstall the chart (the CRD is retained via helm.sh/resource-policy: keep).
+## Uninstall the chart. Helm never deletes CRDs installed from crds/, so the
+## ZfsShare CRD (and any ZfsShare objects) are retained.
 .PHONY: helm-uninstall
 helm-uninstall:
 	helm uninstall zfs-shares --namespace zfs-shares

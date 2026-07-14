@@ -5,13 +5,6 @@ nameOverride: ""
 # -- Override the full release name used in resource names.
 fullnameOverride: ""
 
-crds:
-  # -- Install the ZfsShare CustomResourceDefinition with the chart.
-  install: true
-  # -- Keep the CRD on `helm uninstall` (prevents data loss). Adds the
-  # `helm.sh/resource-policy: keep` annotation when true.
-  keep: true
-
 image:
   # -- Container registry hosting the controller images.
   registry: ghcr.io

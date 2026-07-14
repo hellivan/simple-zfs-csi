@@ -136,7 +136,11 @@ Common values (see [charts/zfs-shares/values.yaml](charts/zfs-shares/values.yaml
 | `nvmeof.nqnPrefix` | `nqn.2025-01.io.zfs-shares` | derived subsystem NQN prefix |
 | `nodeSelector` | `zfs-shares.io/storage: "true"` | where the DaemonSets run |
 | `image.tag` | chart `appVersion` | image tag override |
-| `crds.install` / `crds.keep` | `true` | manage the CRD with the chart |
+
+The `ZfsShare` CRD is generated from the Go types (`make manifests`) and shipped
+in the chart's Helm-native [charts/zfs-shares/crds](charts/zfs-shares/crds)
+directory: `helm install` creates it automatically, but `helm upgrade` does not
+update it — apply schema changes with `make install-crd`.
 
 ### Host prerequisites (Talos system extensions)
 
@@ -182,5 +186,4 @@ config/samples/          example ZfsShare objects
 charts/zfs-shares/       Helm chart (canonical deploy path; CRD lives here)
 build/                   Dockerfiles (multi-arch)
 .github/workflows/       CI + release pipelines
-docs/                    design decisions & future-improvement notes
 ```
