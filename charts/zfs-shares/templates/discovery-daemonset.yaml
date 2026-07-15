@@ -24,10 +24,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "discovery") }}
-      # hostNetwork so status.hostIP is the node's routable address published to
-      # ZfsPool.status.currentIP for CSI clients.
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      # No hostNetwork: discovery only reads the node IP via the downward API
+      # (status.hostIP) and talks to the Kubernetes API; it serves nothing to
+      # other nodes. status.hostIP is the node address regardless of hostNetwork.
       {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "nsenter") }}
       # hostPID lets nsenter reach the target PID's namespaces to run host zpool/zfs.
       hostPID: true

@@ -136,8 +136,8 @@ discovery:
   resources: {}
   # -- Pod annotations.
   podAnnotations: {}
-  # -- Host ports for metrics and health probes. With hostNetwork these bind on
-  # the node, so they must not clash with the nfs/nvmeof controllers.
+  # -- Container ports for metrics and health probes. The discovery pod does not
+  # use hostNetwork, so these are pod-local and need not avoid other components.
   ports:
     metrics: 8084
     health: 8085
