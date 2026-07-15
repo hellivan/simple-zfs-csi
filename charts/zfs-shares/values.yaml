@@ -109,10 +109,25 @@ discovery:
     tag: ""
   # -- How often each node re-discovers its local pools.
   pollInterval: 30s
-  # -- Path to the zpool binary inside the container.
+  # -- Path to the zpool binary (resolved on the host PATH when hostExec is on).
   zpoolBin: zpool
-  # -- Path to the zfs binary inside the container.
+  # -- Path to the zfs binary (resolved on the host PATH when hostExec is on).
   zfsBin: zfs
+  # Run the host's own version-matched zpool/zfs instead of the tools bundled in
+  # the image, so the CLI can never drift from the host ZFS kernel module. This
+  # is the recommended mode on Talos (the siderolabs/zfs extension ships the
+  # utilities on the host).
+  hostExec:
+    # -- Enable running host binaries via a command prefix.
+    enabled: true
+    # -- How to reach the host binaries: "chroot" (Talos-documented, bind-mounts
+    # the host root at /host) or "nsenter" (enters the host mount namespace of
+    # targetPid; requires hostPID).
+    mode: chroot
+    # -- Host PID whose namespaces are entered in nsenter mode.
+    targetPid: 1
+    # -- Host root path bind-mounted to /host in chroot mode.
+    hostRootPath: /
   # -- Extra CLI args for the zpool-discovery binary.
   extraArgs: []
   # -- Resource requests/limits.

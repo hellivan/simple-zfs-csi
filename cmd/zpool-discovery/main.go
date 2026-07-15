@@ -30,20 +30,26 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr string
-		probeAddr   string
-		nodeName    string
-		nodeIP      string
-		zpoolBin    string
-		zfsBin      string
-		interval    time.Duration
+		metricsAddr  string
+		probeAddr    string
+		nodeName     string
+		nodeIP       string
+		zpoolBin     string
+		zfsBin       string
+		hostExecMode string
+		hostRoot     string
+		nsenterPID   int
+		interval     time.Duration
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe binds to.")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Node this discovery runs on (defaults to $NODE_NAME).")
 	flag.StringVar(&nodeIP, "node-ip", os.Getenv("NODE_IP"), "Routable node IP published to status.currentIP (defaults to $NODE_IP).")
-	flag.StringVar(&zpoolBin, "zpool-bin", "zpool", "Path to the zpool binary.")
-	flag.StringVar(&zfsBin, "zfs-bin", "zfs", "Path to the zfs binary.")
+	flag.StringVar(&zpoolBin, "zpool-bin", "zpool", "zpool binary name/path (resolved on the host when host-exec is on).")
+	flag.StringVar(&zfsBin, "zfs-bin", "zfs", "zfs binary name/path (resolved on the host when host-exec is on).")
+	flag.StringVar(&hostExecMode, "host-exec-mode", "", "How to run the host's own version-matched zpool/zfs: \"chroot\" (enter the host root at --host-root), \"nsenter\" (enter --nsenter-target-pid namespaces), or empty to run the in-image tools directly.")
+	flag.StringVar(&hostRoot, "host-root", "/host", "Container-visible mount of the host root filesystem (chroot mode).")
+	flag.IntVar(&nsenterPID, "nsenter-target-pid", 1, "Host PID whose namespaces are entered (nsenter mode).")
 	flag.DurationVar(&interval, "poll-interval", 30*time.Second, "How often to re-discover local pools.")
 
 	opts := zap.Options{Development: false}
@@ -71,6 +77,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	hostExec := zpool.HostExec{
+		Mode:      hostExecMode,
+		HostRoot:  hostRoot,
+		TargetPID: nsenterPID,
+	}
 	reporter := &controller.PoolReporter{
 		Client:   mgr.GetClient(),
 		NodeName: nodeName,
@@ -78,7 +89,7 @@ func main() {
 		Discoverer: &zpool.Discoverer{
 			ZpoolBin: zpoolBin,
 			ZfsBin:   zfsBin,
-			Run:      nil, // real exec runner
+			Run:      hostExec.BuildRunner(nil),
 		},
 		Interval: interval,
 	}
@@ -96,7 +107,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting zpool-discovery", "node", nodeName, "ip", nodeIP, "interval", interval)
+	setupLog.Info("starting zpool-discovery", "node", nodeName, "ip", nodeIP, "interval", interval, "hostExecMode", hostExecMode)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "manager exited with error")
 		os.Exit(1)

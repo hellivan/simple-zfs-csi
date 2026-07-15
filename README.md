@@ -104,6 +104,10 @@ in sync so CSI clients never route to a dead target:
   view and writes `status.currentNode`, `status.currentIP`, `status.baseMountPath`
   (`zfs get mountpoint`) and `status.health` (`ONLINE` / `DEGRADED` / `FAULTED` /
   `SUSPENDED`). Importing a pool on a new node automatically takes over its object.
+  By default it runs the **host's own** `zpool`/`zfs` (via `chroot /host`, which
+  Talos documents for the `siderolabs/zfs` extension) so the CLI can never drift
+  from the host ZFS kernel module. Switch to `nsenter` or the in-image tools via
+  `discovery.hostExec.*` in values.
 - **Tier 2 — `zpool-watcher` (single Deployment):** watches core `Node` objects
   and, when a node goes `NotReady` (or vanishes), forcibly sets every `ZfsPool` it
   last served to `status.health: NODE_OFFLINE`. A completely dead node can't

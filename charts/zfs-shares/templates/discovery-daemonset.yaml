@@ -28,6 +28,10 @@ spec:
       # ZfsPool.status.currentIP for CSI clients.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "nsenter") }}
+      # hostPID lets nsenter reach the target PID's namespaces to run host zpool/zfs.
+      hostPID: true
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -50,6 +54,14 @@ spec:
             - --poll-interval={{ .Values.discovery.pollInterval }}
             - --zpool-bin={{ .Values.discovery.zpoolBin }}
             - --zfs-bin={{ .Values.discovery.zfsBin }}
+            {{- if .Values.discovery.hostExec.enabled }}
+            - --host-exec-mode={{ .Values.discovery.hostExec.mode }}
+            {{- if eq .Values.discovery.hostExec.mode "chroot" }}
+            - --host-root=/host
+            {{- else if eq .Values.discovery.hostExec.mode "nsenter" }}
+            - --nsenter-target-pid={{ .Values.discovery.hostExec.targetPid }}
+            {{- end }}
+            {{- end }}
             - --metrics-bind-address=:{{ .Values.discovery.ports.metrics }}
             - --health-probe-bind-address=:{{ .Values.discovery.ports.health }}
             {{- with .Values.discovery.extraArgs }}
@@ -89,9 +101,20 @@ spec:
             - name: dev
               mountPath: /dev
               mountPropagation: HostToContainer
+            {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "chroot") }}
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+            {{- end }}
       volumes:
         - name: dev
           hostPath:
             path: /dev
             type: Directory
+        {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "chroot") }}
+        - name: host-root
+          hostPath:
+            path: {{ .Values.discovery.hostExec.hostRootPath }}
+            type: Directory
+        {{- end }}
 {{- end }}
