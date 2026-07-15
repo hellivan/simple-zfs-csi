@@ -12,16 +12,13 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldfl
     -o /out/zpool-discovery ./cmd/zpool-discovery
 
 # ---- runtime ----
-# The Tier 1 discovery agent shells out to `zpool`/`zfs`. By default (chart
-# discovery.hostExec) it runs the HOST's version-matched binaries via
-# `chroot /host` or `nsenter` (both from the base image's coreutils/util-linux),
-# so the bundled zfsutils-linux below is only used as a fallback when hostExec is
-# disabled. When relying on the bundled tools, keep their version close to the
-# host ZFS kernel module (Talos siderolabs/zfs extension) to avoid ioctl
-# incompatibilities, and mount /dev/zfs into the pod.
-FROM debian:trixie-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends zfsutils-linux \
-    && rm -rf /var/lib/apt/lists/*
+# The Tier 1 discovery agent runs the HOST's own version-matched zpool/zfs via
+# host-exec (chart discovery.hostExec): `chroot /host` (busybox, the default
+# mode) or `nsenter` (util-linux-misc). The container ships NO ZFS tools of its
+# own — the host provides them (e.g. the Talos siderolabs/zfs extension). The
+# controller binary is fully static (CGO disabled), so Alpine/musl runs it
+# unchanged.
+FROM alpine:3.21
+RUN apk add --no-cache util-linux-misc
 COPY --from=build /out/zpool-discovery /usr/local/bin/zpool-discovery
 ENTRYPOINT ["/usr/local/bin/zpool-discovery"]

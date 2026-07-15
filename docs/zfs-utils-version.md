@@ -19,7 +19,11 @@ matching `zpool`/`zfs` **on the host**.
 Install `zfsutils-linux` in the discovery image and run it directly.
 - **Pro:** self-contained, portable, easy to test.
 - **Con:** the image's ZFS version floats with the base image and can drift from
-  the host kernel module. You must keep them aligned by hand.
+  the host kernel module. You must keep them aligned by hand. It is also not
+  reliably installable everywhere (e.g. `zfsutils-linux` lives in Debian
+  `contrib`, not the default `debian:*-slim` repos).
+- **Not used by the shipped image.** The discovery image is Alpine-based and
+  bundles no ZFS tools; it relies on option 2 (host-exec) instead.
 
 ### 2. Host-exec: run the host's own version-matched binaries (implemented, default)
 Run the host's `zpool`/`zfs` from the privileged pod, so the CLI version always

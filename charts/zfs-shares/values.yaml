@@ -113,12 +113,14 @@ discovery:
   zpoolBin: zpool
   # -- Path to the zfs binary (resolved on the host PATH when hostExec is on).
   zfsBin: zfs
-  # Run the host's own version-matched zpool/zfs instead of the tools bundled in
-  # the image, so the CLI can never drift from the host ZFS kernel module. This
-  # is the recommended mode on Talos (the siderolabs/zfs extension ships the
-  # utilities on the host).
+  # Run the host's own version-matched zpool/zfs. The discovery image ships NO
+  # ZFS tools of its own, so this must stay enabled unless you supply a custom
+  # image that provides zpool/zfs. Running the host binaries also guarantees the
+  # CLI never drifts from the host ZFS kernel module. Recommended on Talos (the
+  # siderolabs/zfs extension ships the utilities on the host).
   hostExec:
-    # -- Enable running host binaries via a command prefix.
+    # -- Enable running the host's zpool/zfs. Disable only with a custom image
+    # that bundles matching ZFS userspace tools.
     enabled: true
     # -- How to reach the host binaries: "chroot" (Talos-documented, bind-mounts
     # the host root at /host) or "nsenter" (enters the host mount namespace of
