@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        component: [nfs, nvmeof]
+        component: [nfs, nvmeof, discovery, watcher]
     steps:
       - uses: actions/checkout@v4
 

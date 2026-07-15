@@ -4,8 +4,8 @@ REGISTRY ?= ghcr.io/hellivan
 TAG      ?= latest
 NFS_IMG      ?= $(REGISTRY)/zfs-shares-nfs:$(TAG)
 NVMEOF_IMG   ?= $(REGISTRY)/zfs-shares-nvmeof:$(TAG)
-DISCOVERY_IMG ?= $(REGISTRY)/zfs-shares-zpool-discovery:$(TAG)
-WATCHER_IMG   ?= $(REGISTRY)/zfs-shares-zpool-watcher:$(TAG)
+DISCOVERY_IMG ?= $(REGISTRY)/zfs-shares-discovery:$(TAG)
+WATCHER_IMG   ?= $(REGISTRY)/zfs-shares-watcher:$(TAG)
 
 CONTROLLER_GEN_VERSION ?= v0.16.5
 CHART_DIR ?= charts/zfs-shares
@@ -46,16 +46,16 @@ docker-nfs:
 docker-nvmeof:
 	docker build -f build/nvmeof.Dockerfile -t $(NVMEOF_IMG) .
 
-.PHONY: docker-zpool-discovery
-docker-zpool-discovery:
-	docker build -f build/zpool-discovery.Dockerfile -t $(DISCOVERY_IMG) .
+.PHONY: docker-discovery
+docker-discovery:
+	docker build -f build/discovery.Dockerfile -t $(DISCOVERY_IMG) .
 
-.PHONY: docker-zpool-watcher
-docker-zpool-watcher:
-	docker build -f build/zpool-watcher.Dockerfile -t $(WATCHER_IMG) .
+.PHONY: docker-watcher
+docker-watcher:
+	docker build -f build/watcher.Dockerfile -t $(WATCHER_IMG) .
 
 .PHONY: docker
-docker: docker-nfs docker-nvmeof docker-zpool-discovery docker-zpool-watcher
+docker: docker-nfs docker-nvmeof docker-discovery docker-watcher
 
 .PHONY: docker-push
 docker-push: docker

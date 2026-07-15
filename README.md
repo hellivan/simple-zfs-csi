@@ -9,8 +9,8 @@ per-node controllers turn that intent into live exports:
 |------------|-------|------------|-----------|
 | `nfs-controller` | `zfs-shares-nfs` | `protocol: nfs` shares | writes `/etc/exports`, runs `exportfs -ra`, supervises the in-container NFS server |
 | `nvmeof-controller` | `zfs-shares-nvmeof` | `protocol: nvmeof` shares | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
-| `zpool-discovery` | `zfs-shares-zpool-discovery` | local ZFS pools (Tier 1) | polls `zpool`/`zfs`, publishes each pool's identity, routing and health into `ZfsPool` objects |
-| `zpool-watcher` | `zfs-shares-zpool-watcher` | core `Node` objects (Tier 2) | detects node death and forces stale `ZfsPool` status to `NODE_OFFLINE` |
+| `zpool-discovery` | `zfs-shares-discovery` | local ZFS pools (Tier 1) | polls `zpool`/`zfs`, publishes each pool's identity, routing and health into `ZfsPool` objects |
+| `zpool-watcher` | `zfs-shares-watcher` | core `Node` objects (Tier 2) | detects node death and forces stale `ZfsPool` status to `NODE_OFFLINE` |
 
 Storage *allocation* (creating datasets/zvols, quotas, snapshots) is intentionally
 **out of scope** here — that is owned by the CSI/storage plane. `ZfsShare` carries
