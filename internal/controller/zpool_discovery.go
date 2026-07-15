@@ -88,7 +88,6 @@ func (r *PoolReporter) upsert(ctx context.Context, p *zpool.Pool) error {
 	case apierrors.IsNotFound(err):
 		pool = storagev1alpha1.ZfsPool{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
-			Spec:       storagev1alpha1.ZfsPoolSpec{PoolName: p.Name},
 		}
 		if err := r.Create(ctx, &pool); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
@@ -102,19 +101,10 @@ func (r *PoolReporter) upsert(ctx context.Context, p *zpool.Pool) error {
 		return err
 	}
 
-	// Keep spec.poolName in sync with the live (possibly renamed) pool name.
-	if pool.Spec.PoolName != p.Name {
-		patched := pool.DeepCopy()
-		patched.Spec.PoolName = p.Name
-		if err := r.Patch(ctx, patched, client.MergeFrom(&pool)); err != nil {
-			return err
-		}
-		pool = *patched
-	}
-
 	patched := pool.DeepCopy()
 	now := metav1.Now()
 	patched.Status.GUID = p.GUID
+	patched.Status.PoolName = p.Name
 	patched.Status.CurrentNode = r.NodeName
 	patched.Status.CurrentIP = r.NodeIP
 	patched.Status.BaseMountPath = p.Mountpoint

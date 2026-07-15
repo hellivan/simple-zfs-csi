@@ -28,16 +28,13 @@ const (
 	PoolHealthUnknown ZfsPoolHealth = "UNKNOWN"
 )
 
-// ZfsPoolSpec declares the stable, human-facing identity of a ZFS pool. The
-// object's metadata.name is the immutable ZFS pool GUID (e.g.
-// "zpool-12140134988506841113") so the same physical pool maps to one CRD no
-// matter which node currently imports it or how it is renamed.
+// ZfsPoolSpec is the desired state of a ZfsPool. A ZfsPool is a purely
+// discovered object: the per-node discovery DaemonSet creates it and reports
+// everything it observes into the status. There is therefore no user-declared
+// intent today, and the spec is intentionally empty. It is retained as an
+// extension point for any future desired-state fields (e.g. an adoption or
+// allow-list policy).
 type ZfsPoolSpec struct {
-	// PoolName is the human-readable ZFS pool name (e.g. "tank"). It may be
-	// renamed on the host without breaking routing, since consumers key off the
-	// immutable GUID (metadata.name) and status.baseMountPath instead.
-	// +kubebuilder:validation:MinLength=1
-	PoolName string `json:"poolName"`
 }
 
 // ZfsPoolStatus holds the dynamic routing and health data. It is written by two
@@ -48,6 +45,13 @@ type ZfsPoolStatus struct {
 	// GUID is the immutable ZFS pool GUID (without the "zpool-" name prefix).
 	// +optional
 	GUID string `json:"guid,omitempty"`
+
+	// PoolName is the current human-readable ZFS pool name (e.g. "tank"). It is
+	// observed, not declared: the pool may be renamed on the host at any time, so
+	// consumers key off the immutable GUID (metadata.name) and status.baseMountPath
+	// for routing rather than this volatile name.
+	// +optional
+	PoolName string `json:"poolName,omitempty"`
 
 	// CurrentNode is the node that most recently reported importing this pool.
 	// It is kept for historical reference even after the node goes offline.
@@ -83,7 +87,7 @@ type ZfsPoolStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=zpool
-// +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.poolName`
+// +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.status.poolName`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.currentNode`
 // +kubebuilder:printcolumn:name="IP",type=string,JSONPath=`.status.currentIP`
 // +kubebuilder:printcolumn:name="MountPath",type=string,JSONPath=`.status.baseMountPath`

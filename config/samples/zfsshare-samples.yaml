@@ -36,11 +36,11 @@ apiVersion: storage.zfs-shares.io/v1alpha1
 kind: ZfsPool
 metadata:
   name: zpool-12140134988506841113   # immutable ZFS pool GUID
-spec:
-  poolName: tank                     # human-readable name; may be renamed safely
+spec: {}                             # intentionally empty; all data is discovered
 # status is managed by the operator:
 # status:
 #   guid: "12140134988506841113"
+#   poolName: tank                   # observed name; may be renamed safely
 #   currentNode: talos-node-01
 #   currentIP: 192.168.10.15
 #   baseMountPath: /tank

@@ -101,9 +101,10 @@ renamed. Nobody authors `ZfsPool` objects by hand — a two-tier monitor keeps t
 in sync so CSI clients never route to a dead target:
 
 - **Tier 1 — `zpool-discovery` (per-node DaemonSet):** polls the local `zpool`
-  view and writes `status.currentNode`, `status.currentIP`, `status.baseMountPath`
-  (`zfs get mountpoint`) and `status.health` (`ONLINE` / `DEGRADED` / `FAULTED` /
-  `SUSPENDED`). Importing a pool on a new node automatically takes over its object.
+  view and writes `status.poolName`, `status.currentNode`, `status.currentIP`,
+  `status.baseMountPath` (`zfs get mountpoint`) and `status.health`
+  (`ONLINE` / `DEGRADED` / `FAULTED` / `SUSPENDED`). Importing a pool on a new
+  node automatically takes over its object.
   By default it runs the **host's own** `zpool`/`zfs` (via `chroot /host`, which
   Talos documents for the `siderolabs/zfs` extension) so the CLI can never drift
   from the host ZFS kernel module. Switch to `nsenter` or the in-image tools via
@@ -118,9 +119,9 @@ apiVersion: storage.zfs-shares.io/v1alpha1
 kind: ZfsPool
 metadata:
   name: zpool-12140134988506841113   # immutable ZFS pool GUID
-spec:
-  poolName: tank                     # human-readable; safe to rename
+spec: {}                             # intentionally empty; ZfsPool is fully discovered
 status:                              # written by the operator, not the user
+  poolName: tank                     # observed name; may be renamed safely
   currentNode: talos-node-01
   currentIP: 192.168.10.15
   baseMountPath: /tank

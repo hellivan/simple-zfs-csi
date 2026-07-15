@@ -17,7 +17,7 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.poolName
+    - jsonPath: .status.poolName
       name: Pool
       type: string
     - jsonPath: .status.currentNode
@@ -63,20 +63,12 @@ spec:
             type: object
           spec:
             description: |-
-              ZfsPoolSpec declares the stable, human-facing identity of a ZFS pool. The
-              object's metadata.name is the immutable ZFS pool GUID (e.g.
-              "zpool-12140134988506841113") so the same physical pool maps to one CRD no
-              matter which node currently imports it or how it is renamed.
-            properties:
-              poolName:
-                description: |-
-                  PoolName is the human-readable ZFS pool name (e.g. "tank"). It may be
-                  renamed on the host without breaking routing, since consumers key off the
-                  immutable GUID (metadata.name) and status.baseMountPath instead.
-                minLength: 1
-                type: string
-            required:
-            - poolName
+              ZfsPoolSpec is the desired state of a ZfsPool. A ZfsPool is a purely
+              discovered object: the per-node discovery DaemonSet creates it and reports
+              everything it observes into the status. There is therefore no user-declared
+              intent today, and the spec is intentionally empty. It is retained as an
+              extension point for any future desired-state fields (e.g. an adoption or
+              allow-list policy).
             type: object
           status:
             description: |-
@@ -125,6 +117,13 @@ spec:
               message:
                 description: Message carries human-readable detail about the current
                   health.
+                type: string
+              poolName:
+                description: |-
+                  PoolName is the current human-readable ZFS pool name (e.g. "tank"). It is
+                  observed, not declared: the pool may be renamed on the host at any time, so
+                  consumers key off the immutable GUID (metadata.name) and status.baseMountPath
+                  for routing rather than this volatile name.
                 type: string
             type: object
         type: object
