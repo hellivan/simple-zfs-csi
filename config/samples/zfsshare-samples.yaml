@@ -27,3 +27,22 @@ spec:
     # nqn omitted -> derived as nqn.2025-01.io.zfs-shares:talos-node-01:pvc-postgres-data
     allowedHosts:
       - "nqn.2014-08.org.nvmexpress:uuid:worker-01"
+---
+# ZfsPool objects are NOT authored by hand: the Tier 1 discovery DaemonSet
+# creates one per imported pool (name = "zpool-<GUID>") and continuously writes
+# status. The Tier 2 watcher overrides status.health with NODE_OFFLINE when the
+# owning node dies. This is only an illustration of the resulting object.
+apiVersion: storage.zfs-shares.io/v1alpha1
+kind: ZfsPool
+metadata:
+  name: zpool-12140134988506841113   # immutable ZFS pool GUID
+spec:
+  poolName: tank                     # human-readable name; may be renamed safely
+# status is managed by the operator:
+# status:
+#   guid: "12140134988506841113"
+#   currentNode: talos-node-01
+#   currentIP: 192.168.10.15
+#   baseMountPath: /tank
+#   health: ONLINE
+#   lastUpdated: "2026-07-15T10:00:00Z"

@@ -7,6 +7,12 @@ Enabled controllers:
 {{- if .Values.nvmeof.enabled }}
   - NVMe-oF   (DaemonSet {{ include "zfs-shares.fullname" . }}-nvmeof)
 {{- end }}
+{{- if .Values.discovery.enabled }}
+  - Discovery (DaemonSet {{ include "zfs-shares.fullname" . }}-discovery, Tier 1 ZfsPool health)
+{{- end }}
+{{- if .Values.watcher.enabled }}
+  - Watcher   (Deployment {{ include "zfs-shares.fullname" . }}-watcher, Tier 2 node-death detection)
+{{- end }}
 
 Next steps:
 
@@ -24,10 +30,16 @@ Next steps:
 3. Create a ZfsShare:
 
      kubectl get zfsshares
+{{- if .Values.discovery.enabled }}
 
-NOTE ON UPGRADES: the ZfsShare CRD is installed from the chart's crds/ directory.
-`helm upgrade` does NOT update it (no Helm flag does). After upgrading to a
-release that changes the CRD schema, apply the CRD manually first:
+4. Watch discovered pools appear as ZfsPool objects (name = ZFS pool GUID):
+
+     kubectl get zfspools
+{{- end }}
+
+NOTE ON UPGRADES: the ZfsShare and ZfsPool CRDs are installed from the chart's
+crds/ directory. `helm upgrade` does NOT update them (no Helm flag does). After
+upgrading to a release that changes a CRD schema, apply the CRDs manually first:
 
      kubectl apply -f charts/zfs-shares/crds/     # local checkout; or `make install-crd`
      # published chart: helm pull ... --untar && kubectl apply -f zfs-shares/crds/

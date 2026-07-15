@@ -9,6 +9,8 @@ per-node controllers turn that intent into live exports:
 |------------|-------|------------|-----------|
 | `nfs-controller` | `zfs-shares-nfs` | `protocol: nfs` shares | writes `/etc/exports`, runs `exportfs -ra`, supervises the in-container NFS server |
 | `nvmeof-controller` | `zfs-shares-nvmeof` | `protocol: nvmeof` shares | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
+| `zpool-discovery` | `zfs-shares-zpool-discovery` | local ZFS pools (Tier 1) | polls `zpool`/`zfs`, publishes each pool's identity, routing and health into `ZfsPool` objects |
+| `zpool-watcher` | `zfs-shares-zpool-watcher` | core `Node` objects (Tier 2) | detects node death and forces stale `ZfsPool` status to `NODE_OFFLINE` |
 
 Storage *allocation* (creating datasets/zvols, quotas, snapshots) is intentionally
 **out of scope** here — that is owned by the CSI/storage plane. `ZfsShare` carries
@@ -89,6 +91,42 @@ spec:
 ```
 
 See `config/samples/` for full examples.
+
+## The `ZfsPool` resource & node-health monitoring
+
+`ZfsPool` is a cluster-scoped, node-agnostic handle to a physical ZFS pool. Its
+`metadata.name` is the **immutable ZFS pool GUID** (`zpool-<GUID>`), so the same
+pool maps to exactly one object no matter which node imports it or how it is
+renamed. Nobody authors `ZfsPool` objects by hand — a two-tier monitor keeps them
+in sync so CSI clients never route to a dead target:
+
+- **Tier 1 — `zpool-discovery` (per-node DaemonSet):** polls the local `zpool`
+  view and writes `status.currentNode`, `status.currentIP`, `status.baseMountPath`
+  (`zfs get mountpoint`) and `status.health` (`ONLINE` / `DEGRADED` / `FAULTED` /
+  `SUSPENDED`). Importing a pool on a new node automatically takes over its object.
+- **Tier 2 — `zpool-watcher` (single Deployment):** watches core `Node` objects
+  and, when a node goes `NotReady` (or vanishes), forcibly sets every `ZfsPool` it
+  last served to `status.health: NODE_OFFLINE`. A completely dead node can't
+  self-report, so this override is what prevents a stale `ONLINE` at a dead IP.
+
+```yaml
+apiVersion: storage.zfs-shares.io/v1alpha1
+kind: ZfsPool
+metadata:
+  name: zpool-12140134988506841113   # immutable ZFS pool GUID
+spec:
+  poolName: tank                     # human-readable; safe to rename
+status:                              # written by the operator, not the user
+  currentNode: talos-node-01
+  currentIP: 192.168.10.15
+  baseMountPath: /tank
+  health: ONLINE
+```
+
+A CSI node plugin resolves the real mount at attach time by reading
+`status.currentIP` + `status.baseMountPath` from the live object and joining the
+logical dataset name — so node deaths, IP changes, pool renames and mountpoint
+shifts never require editing a PersistentVolume.
 
 ## Build
 

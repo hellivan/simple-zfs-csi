@@ -1,0 +1,76 @@
+{{- if .Values.watcher.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-watcher
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watcher
+spec:
+  replicas: {{ .Values.watcher.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: watcher
+  template:
+    metadata:
+      labels:
+        {{- include "zfs-shares.labels" . | nindent 8 }}
+        app.kubernetes.io/component: watcher
+      {{- with .Values.watcher.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "watcher") }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.watcher.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.watcher.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: zpool-watcher
+          image: {{ include "zfs-shares.image" (dict "root" . "component" "watcher") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --leader-elect={{ .Values.watcher.leaderElect }}
+            - --leader-election-namespace=$(POD_NAMESPACE)
+            - --metrics-bind-address=:{{ .Values.watcher.ports.metrics }}
+            - --health-probe-bind-address=:{{ .Values.watcher.ports.health }}
+            {{- with .Values.watcher.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.watcher.ports.metrics }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.watcher.ports.health }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.watcher.ports.health }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- with .Values.watcher.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

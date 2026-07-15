@@ -1,0 +1,134 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: zfspools.storage.zfs-shares.io
+spec:
+  group: storage.zfs-shares.io
+  names:
+    kind: ZfsPool
+    listKind: ZfsPoolList
+    plural: zfspools
+    shortNames:
+    - zpool
+    singular: zfspool
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolName
+      name: Pool
+      type: string
+    - jsonPath: .status.currentNode
+      name: Node
+      type: string
+    - jsonPath: .status.currentIP
+      name: IP
+      type: string
+    - jsonPath: .status.baseMountPath
+      name: MountPath
+      type: string
+    - jsonPath: .status.health
+      name: Health
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ZfsPool is the Schema for the zfspools API. It is a globally-unique, node-
+          agnostic handle to a physical ZFS pool: the name is the immutable pool GUID,
+          while the status tracks which node currently serves it, at which IP and mount
+          path, and how healthy it is.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ZfsPoolSpec declares the stable, human-facing identity of a ZFS pool. The
+              object's metadata.name is the immutable ZFS pool GUID (e.g.
+              "zpool-12140134988506841113") so the same physical pool maps to one CRD no
+              matter which node currently imports it or how it is renamed.
+            properties:
+              poolName:
+                description: |-
+                  PoolName is the human-readable ZFS pool name (e.g. "tank"). It may be
+                  renamed on the host without breaking routing, since consumers key off the
+                  immutable GUID (metadata.name) and status.baseMountPath instead.
+                minLength: 1
+                type: string
+            required:
+            - poolName
+            type: object
+          status:
+            description: |-
+              ZfsPoolStatus holds the dynamic routing and health data. It is written by two
+              independent components: the per-node discovery DaemonSet (Tier 1) publishes
+              live pool state, and the central watcher (Tier 2) overrides health with
+              NODE_OFFLINE when the owning node dies.
+            properties:
+              baseMountPath:
+                description: |-
+                  BaseMountPath is the pool's current ZFS mountpoint on the host, e.g.
+                  "/mnt/watertank". CSI node plugins join this with the logical dataset name
+                  to build the real export path, so pool renames and alternate import roots
+                  never break PersistentVolumes.
+                type: string
+              currentIP:
+                description: |-
+                  CurrentIP is the routable address of CurrentNode used by CSI clients to
+                  reach the network share. Kept for reference after a node goes offline.
+                type: string
+              currentNode:
+                description: |-
+                  CurrentNode is the node that most recently reported importing this pool.
+                  It is kept for historical reference even after the node goes offline.
+                type: string
+              guid:
+                description: GUID is the immutable ZFS pool GUID (without the "zpool-"
+                  name prefix).
+                type: string
+              health:
+                description: Health is the current pool availability.
+                enum:
+                - ONLINE
+                - DEGRADED
+                - FAULTED
+                - SUSPENDED
+                - NODE_OFFLINE
+                - UNKNOWN
+                type: string
+              lastUpdated:
+                description: |-
+                  LastUpdated is when the status was last written. Consumers can use it as a
+                  freshness signal for stale-reporter detection.
+                format: date-time
+                type: string
+              message:
+                description: Message carries human-readable detail about the current
+                  health.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,97 @@
+{{- if .Values.discovery.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-discovery
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: discovery
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: discovery
+  template:
+    metadata:
+      labels:
+        {{- include "zfs-shares.labels" . | nindent 8 }}
+        app.kubernetes.io/component: discovery
+      {{- with .Values.discovery.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "discovery") }}
+      # hostNetwork so status.hostIP is the node's routable address published to
+      # ZfsPool.status.currentIP for CSI clients.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: zpool-discovery
+          image: {{ include "zfs-shares.image" (dict "root" . "component" "discovery") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --node-name=$(NODE_NAME)
+            - --node-ip=$(NODE_IP)
+            - --poll-interval={{ .Values.discovery.pollInterval }}
+            - --zpool-bin={{ .Values.discovery.zpoolBin }}
+            - --zfs-bin={{ .Values.discovery.zfsBin }}
+            - --metrics-bind-address=:{{ .Values.discovery.ports.metrics }}
+            - --health-probe-bind-address=:{{ .Values.discovery.ports.health }}
+            {{- with .Values.discovery.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          securityContext:
+            privileged: true
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.discovery.ports.metrics }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.discovery.ports.health }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.discovery.ports.health }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- with .Values.discovery.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+              mountPropagation: HostToContainer
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+{{- end }}

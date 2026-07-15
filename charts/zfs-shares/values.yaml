@@ -98,3 +98,55 @@ nvmeof:
   ports:
     metrics: 8082
     health: 8083
+
+# -------- ZfsPool discovery (Tier 1: per-node DaemonSet) --------
+discovery:
+  # -- Deploy the per-node zpool discovery DaemonSet that publishes ZfsPool CRDs.
+  enabled: true
+  image:
+    # -- Override the full discovery image (registry/repo:tag). Empty derives it from `image.*`.
+    repository: ""
+    tag: ""
+  # -- How often each node re-discovers its local pools.
+  pollInterval: 30s
+  # -- Path to the zpool binary inside the container.
+  zpoolBin: zpool
+  # -- Path to the zfs binary inside the container.
+  zfsBin: zfs
+  # -- Extra CLI args for the zpool-discovery binary.
+  extraArgs: []
+  # -- Resource requests/limits.
+  resources: {}
+  # -- Pod annotations.
+  podAnnotations: {}
+  # -- Host ports for metrics and health probes. With hostNetwork these bind on
+  # the node, so they must not clash with the nfs/nvmeof controllers.
+  ports:
+    metrics: 8084
+    health: 8085
+
+# -------- ZfsPool watcher (Tier 2: central Deployment) --------
+watcher:
+  # -- Deploy the central node-death watcher that offlines dead nodes' ZfsPools.
+  enabled: true
+  # -- Number of replicas (leader election ensures only one acts at a time).
+  replicas: 1
+  image:
+    # -- Override the full watcher image (registry/repo:tag). Empty derives it from `image.*`.
+    repository: ""
+    tag: ""
+  # -- Enable leader election across watcher replicas.
+  leaderElect: true
+  # -- Extra CLI args for the zpool-watcher binary.
+  extraArgs: []
+  # -- Resource requests/limits.
+  resources: {}
+  # -- Pod annotations.
+  podAnnotations: {}
+  # -- Node selector for the watcher pod (runs anywhere; not a storage node).
+  nodeSelector: {}
+  # -- Tolerations for the watcher pod.
+  tolerations: []
+  ports:
+    metrics: 8086
+    health: 8087
