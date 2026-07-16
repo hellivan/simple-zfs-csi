@@ -1,7 +1,9 @@
-// Command zpool-discovery is the Tier 1 monitor. It runs as a privileged
-// DaemonSet on every storage node, periodically enumerating the ZFS pools
-// imported locally and publishing their identity, routing (node/IP/mountpoint)
-// and health into cluster-scoped ZfsPool objects.
+// Command zpool-discovery is the per-node storage agent. It runs as a
+// privileged DaemonSet on every storage node and hosts two responsibilities:
+// Tier 1 pool discovery (enumerating locally imported ZFS pools and publishing
+// their identity, routing and health into cluster-scoped ZfsPool objects) and
+// the ZfsVolume allocation reconciler (creating/destroying datasets and zvols
+// for volumes whose pool is currently hosted on this node).
 package main
 
 import (
@@ -82,6 +84,7 @@ func main() {
 		HostRoot:  hostRoot,
 		TargetPID: nsenterPID,
 	}
+	hostRunner := hostExec.BuildRunner(nil)
 	reporter := &controller.PoolReporter{
 		Client:   mgr.GetClient(),
 		NodeName: nodeName,
@@ -89,12 +92,22 @@ func main() {
 		Discoverer: &zpool.Discoverer{
 			ZpoolBin: zpoolBin,
 			ZfsBin:   zfsBin,
-			Run:      hostExec.BuildRunner(nil),
+			Run:      hostRunner,
 		},
 		Interval: interval,
 	}
 	if err := mgr.Add(reporter); err != nil {
 		setupLog.Error(err, "unable to add pool reporter")
+		os.Exit(1)
+	}
+
+	if err := (&controller.ZfsVolumeReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		NodeName: nodeName,
+		ZFS:      &zpool.CLI{Bin: zfsBin, Run: hostRunner},
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up ZfsVolume reconciler")
 		os.Exit(1)
 	}
 
@@ -107,7 +120,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting zpool-discovery", "node", nodeName, "ip", nodeIP, "interval", interval, "hostExecMode", hostExecMode)
+	setupLog.Info("starting storage agent", "node", nodeName, "ip", nodeIP, "interval", interval, "hostExecMode", hostExecMode)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "manager exited with error")
 		os.Exit(1)
