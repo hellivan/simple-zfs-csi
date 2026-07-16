@@ -258,3 +258,515 @@ Any application pod (e.g., Plex, Jellyfin) generates a standard PersistentVolume
  * **Safety:** Using Retain on a static PV ensures your media library is completely immune to dynamic PVC lifecycle deletion events.
 
 **Note:** this part has one slight conceptual error. Pvs cannot be bound by multiple pvcs. Hence a pv and pvc combination has to be created for every namespace we want to mount the share.
+
+
+## 5. Dynamic Server Address Resolution (Avoiding Hardcoded IPs)
+### The Challenge: The Danger of Hardcoded IPs
+When a CSI driver provisions a volume, it passes a volume_context (containing the server address) back to Kubernetes. Kubernetes permanently bakes this address into the PersistentVolume (PV) object.
+ * If this address is a hardcoded physical IP (e.g., 10.0.0.100), and the node's static DHCP lease ever changes, the PV permanently breaks.
+ * If the address is the raw node hostname (e.g., talos-node-01), Kubernetes CoreDNS cannot resolve it natively, creating a fragile dependency on the external network router (e.g., OpenWrt) for DNS resolution.
+### The Solution: Talos resolveMemberNames
+To make storage routing 100% dynamic and resilient without relying on external routers, the architecture leverages Talos Linux's native internal DNS discovery mechanism.
+By enabling resolveMemberNames, Talos intercepts DNS queries on the host OS and resolves cluster member hostnames to their IPs entirely locally using its internal cluster state.
+### Implementation Steps
+**1. Talos Machine Configuration**
+Apply the following patch to the Talos machine.yaml for all nodes to enable internal member resolution:
+```yaml
+machine:
+  features:
+    hostDNS:
+      enabled: true
+      resolveMemberNames: true
+
+```
+**2. CSI Controller Modification (Downward API)**
+Instead of reading the node's physical IP, the custom CSI Controller reads its own node's name via the Kubernetes Downward API.
+```yaml
+env:
+  - name: NODE_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.nodeName
+
+```
+**3. The Provisioning Workflow**
+ 1. The CSI Controller creates the ZFS dataset/zvol locally.
+ 2. The Controller writes the ZfsExport CRD for the DaemonSets.
+ 3. The Controller builds the volume_context using NODE_NAME instead of an IP address:
+   {"server": "talos-node-01", "share": "/pool/k8s/pvc-12345"}
+ 4. The Kubelet on the consumer node receives the context and runs:
+   mount -t nfs talos-node-01:/pool/k8s/pvc-12345 ...
+ 5. The Talos host DNS intercepts the request, natively resolves talos-node-01 to the current static DHCP lease, and executes the mount.
+### Architectural Benefits
+ * **Future-Proof:** If a node's DHCP lease changes, Talos updates its internal state automatically. PVs never need to be patched or recreated.
+ * **No External Dependencies:** The mount command does not rely on CoreDNS or the OpenWrt router to resolve the storage target.
+ * **Immutable OS Friendly:** completely bypasses the need to manually hack /etc/hosts files across the cluster.
+
+
+# ZFS Shares on Talos — Design Notes
+
+## Context
+- Custom Kubernetes operator (`zfs-shares`) that exposes ZFS datasets over **NFS** and ZFS zvols over **NVMe-oF (TCP)** on a Talos cluster.
+- Architecture: privileged DaemonSet pods run the in-container kernel NFS server / nvmet target. A `ZfsShare` CRD carries "intent to share"; controllers render exports (NFS) or nvmet configfs (NVMe-oF) per node.
+- Pool: classic `tank`, currently `mountpoint=/tank`.
+
+## Problem 1 — `mountpoint=/tank` breaks on Talos
+- Talos `/` is a **read-only, immutable** filesystem. ZFS can auto-create a mountpoint dir, but **cannot create a top-level `/tank`** because `/` isn't writable.
+- Result: the pool ends up **imported but unmounted** on the host.
+- Fix: move the mountpoint under the writable/persistent **var** tree, e.g. `/var/mnt/tank` (Talos-idiomatic) or `/var/lib/zfs/tank`.
+
+## Problem 2 — Is hostPath into the container OK? (Yes)
+- It's the intended pattern, not a hack: Talos has no host `nfsd`/`nvmetcli`, so the kernel NFS server runs **inside** a privileged pod, with the pool provided via `hostPath`.
+- Critical flag already present: `mountPropagation: HostToContainer` — child datasets mounted on the host (each a separate mount) propagate into the pod. Without it, child datasets appear as empty dirs.
+- Requires `privileged: true` (present) and rshared host mounts (Talos default).
+- `hostPath type: Directory` means the mountpoint must exist when the pod starts (pool imported/mounted by Talos ZFS extension before kubelet launches the pod — normal boot order).
+- NVMe-oF is unaffected — it uses `/dev/zvol/...` via the dev hostPath, not the dataset mountpoint.
+
+## Problem 3 — Do child datasets inherit the mountpoint? (Yes)
+- `zfs set mountpoint=/var/lib/zfs/tank tank` → every child with an **inherited** mountpoint mounts relative to the parent (e.g. `tank/k8s/pvc-123` → `/var/lib/zfs/tank/k8s/pvc-123`). ZFS unmounts/remounts affected datasets immediately.
+- Caveats:
+  - Datasets with an **explicit** mountpoint keep their own value (check: `zfs get -r mountpoint tank`).
+  - Datasets set to `mountpoint=legacy` or `none` are unaffected.
+
+## Critical — keep three paths identical
+- The NFS controller writes `spec.Path` verbatim into exports and runs `exportfs -ra` inside the container.
+- `spec.Path` is the dataset's ZFS mountpoint (a host path). For `exportfs` to succeed, that exact path must also be mounted **inside the container**.
+- Therefore: **`hostPath` == `mountPath` == ZFS mountpoint**.
+- Example chart values:
+  ```yaml
+  nfs:
+    pool:
+      hostPath: /var/lib/zfs/tank
+      mountPath: /var/lib/zfs/tank
+  ```
+  and on host: `zfs set mountpoint=/var/lib/zfs/tank tank`.
+
+## Observation — `zfs mount` in a debug container showed `/tank` in-container but not on host
+Two behaviors with namespaces:
+- **Pool import** (`zpool import`) = global kernel state, not namespaced.
+- **Dataset mounts** (`zfs mount`) = per-mount-namespace VFS mounts.
+
+What happened: host mount at `/tank` failed (read-only `/`), so pool was imported but unmounted. The debug container's `/` is writable, so `zfs mount` succeeded there — but that mount lived only in the container's namespace (default propagation doesn't push back to host). This just confirms the read-only-root issue from another angle.
+
+## Approach comparison — mount in-container vs. host-mount + propagation
+Key point: **for serving NFS, both are identical to nfsd.** The pod has its own mount namespace, and `exportfs`/`rpc.mountd`/`nfsd` all run inside the pod. Current design *propagates* host mounts in; the alternative *creates* them directly in the pod. Either way mounts live in the pod's namespace. No NFS-serving penalty either way. Decision is purely operational.
+
+### Mount inside the container
+- ✅ Sidesteps read-only root — no need to relocate mountpoint to var.
+- ✅ Self-contained: agent owns import + mount + export; matches "reconstruct on restart" philosophy.
+- ⚠️ Must coordinate with Talos ZFS extension (`zpool import -a` at boot): set datasets to **`canmount=noauto`** or **`mountpoint=legacy`** so host and pod don't fight.
+- ⚠️ Agent must run `zpool import` / `zfs mount -a` idempotently and handle already-imported/already-mounted.
+- ⚠️ Data visible **only inside that pod's namespace** — no host tooling, no separate backup/scrub pod can reach the filesystem (without sharing the namespace or its own mount).
+- ⚠️ Mounts die with the pod; rebuilt on restart.
+
+### Host-mounted + hostPath propagation (current design, with var mountpoint)
+- ✅ Host = single source of truth; mounts survive pod restarts.
+- ✅ Every consumer (backup pod, scrub jobs, other DaemonSets) can see the data.
+- ✅ Conventional, least-surprising pattern.
+- ⚠️ Requires moving the mountpoint under a writable tree (`/var/mnt/tank` or `/var/lib/zfs/tank`).
+
+### Recommendation
+- Lean toward **host-mount + var mountpoint**: keeps ZFS ownership on host (important once the pull-based backup pod exists), mounts survive restarts, least surprising.
+- In-container mounting is legitimately clean for a pure NFS/NVMe gateway. If chosen, must-do: set `canmount=noauto` (or `mountpoint=legacy`) so Talos doesn't half-mount at boot, and add explicit import/mount logic to the agent — which today it lacks (`Server.Prepare()` only mounts nfsd and `rpc_pipefs`, never ZFS; it assumes datasets arrive via host propagation).
+
+# ZFS Shares on Talos — Mount, Propagation & Kubelet Findings
+
+## Context
+- Custom Kubernetes operator (`zfs-shares`) exposing ZFS datasets over **NFS** and zvols over **NVMe-oF (TCP)** on a Talos cluster.
+- Privileged DaemonSet pods run the in-container kernel NFS server / nvmet target. A `ZfsShare` CRD carries "intent to share"; controllers render exports (NFS) or nvmet configfs (NVMe-oF) per node.
+- Pool: classic `tank`. Decision: change pool mountpoint to `/var/mnt/tank`.
+- Helm chart stays **generic** (source `hostPath` + destination `mountPath` kept separate — standard Kubernetes volume semantics). All ZFS/Talos specifics live in node config, not the chart.
+
+## Problem: `mountpoint=/tank` breaks on Talos
+- Talos `/` is a **read-only, immutable** filesystem. ZFS can't create a top-level `/tank` dir at the root, so the pool ends up **imported but unmounted** on the host.
+- Fix: move the mountpoint under the writable/persistent **var** tree, e.g. `/var/mnt/tank`.
+- `zfs set mountpoint=/var/mnt/tank tank`.
+
+## Child datasets inherit the mountpoint
+- `zfs set mountpoint=/var/mnt/tank tank` → every child with an **inherited** mountpoint mounts relative to the parent (e.g. `tank/pvc-123` → `/var/mnt/tank/pvc-123`). ZFS unmounts/remounts affected datasets immediately.
+- Caveats:
+  - Datasets with an **explicit** mountpoint keep their own value (`zfs get -r mountpoint tank`).
+  - Datasets set to `mountpoint=legacy` or `none` are unaffected.
+
+## hostPath into a privileged container is the correct pattern
+- Talos has no host `nfsd` / `nvmetcli`, so the kernel NFS server runs **inside** a privileged pod, pool provided via `hostPath`.
+- NVMe-oF is unaffected by mountpoint choices — it uses `/dev/zvol/...` via the dev hostPath, not the dataset mountpoint.
+
+## Why the debug container saw `/tank` but the host didn't
+- **Pool import** (`zpool import`) = global kernel state, not namespaced.
+- **Dataset mounts** (`zfs mount`) = per-mount-namespace VFS mounts.
+- Host mount at `/tank` failed (read-only `/`) → pool imported but unmounted. The debug container's `/` is writable, so `zfs mount` succeeded there — but only in that container's namespace (default propagation doesn't push back to host).
+
+## The export-path identity rule
+- The NFS controller writes `spec.Path` **verbatim** into exports and runs `exportfs` **inside the container**.
+- `spec.Path` only has to resolve **inside the NFS container**; the host path is irrelevant to NFS export resolution.
+- Correct invariant:
+  ```
+  spec.Path == path inside CSI container == path inside NFS container
+  ```
+
+## The critical ZFS mechanic
+- **ZFS mounts a dataset at its `mountpoint` *property* value**, in whatever namespace runs the mount — it ignores where you bind-mounted the pool.
+- `zfs get mountpoint` also returns the property (a host-style path).
+- Consequence: the container `mountPath` must equal the ZFS `mountpoint` property, otherwise ZFS mounts at the property path (outside the bind-mounted subtree) and nothing lines up / nothing propagates.
+
+## Mount propagation: will the NFS pod see a dataset the CSI pod creates?
+- Propagation only carries mounts that occur **inside the propagated (bind-mounted) subtree**.
+- **Case 1 — container path == host mountpoint (both `/var/mnt/tank`): ✅ works**
+  1. CSI pod runs `zfs create` → ZFS mounts at `/var/mnt/tank/pvc-123` inside its shared bind subtree.
+  2. CSI pod mount is `Bidirectional` (rshared) → event propagates **out** to the host peer group.
+  3. NFS pod mount is `HostToContainer` (rslave) → mount propagates **in** to the NFS pod.
+  4. `spec.Path = /var/mnt/tank/pvc-123`, `exportfs` finds it.
+- **Is it impossible due to propagation? No** — `Bidirectional` is exactly the mechanism. Plain one-way `HostToContainer` on the **CSI** side would fail (never flows back out). NFS side only receives, so `HostToContainer` is fine there.
+- **Case — containers match each other but differ from host (both `/tank`, host `/var/mnt/tank`): ❌ fails**
+  - ZFS still mounts at the property path `/var/mnt/tank/pvc-123`, which is outside the containers' `/tank` bind subtree → no propagation. Only fixable by also setting the property to `/tank` (not wanted).
+
+## Working recipe (given `mountpoint=/var/mnt/tank`)
+- `zfs set mountpoint=/var/mnt/tank tank` (host mounts it there — writable, no RO-root problem).
+- **Both** containers: `hostPath: /var/mnt/tank`, `mountPath: /var/mnt/tank` (equal to the property).
+- CSI container: `mountPropagation: Bidirectional`.
+- NFS container: `mountPropagation: HostToContainer`.
+- `spec.Path = /var/mnt/tank/<dataset>`.
+
+## Propagation requirements summary
+For the NFS pod to see a CSI-created dataset, ALL must hold:
+1. CSI pod pool mount = `Bidirectional` (mounts flow out).
+2. NFS pod pool mount = `HostToContainer` or `Bidirectional` (mounts flow in).
+3. The new ZFS mount lands **inside** the shared subtree ⇒ ZFS `mountpoint` property == container bind path.
+4. The host's pool mount is **shared (rshared)** — on Talos, established via the kubelet `extraMount` (below).
+
+## Talos kubelet `extraMounts` — why and whether it's required
+- On normal distros the kubelet runs in the host mount namespace and `/` is already `rshared` (systemd), so hostPath + propagation just work.
+- On Talos the kubelet runs **as a container with its own mount namespace** and only sees explicitly mounted host paths. Two reasons the `extraMount` is needed:
+  1. **Visibility:** hostPath volumes are wired up from the kubelet's view. `/var/mnt/tank` is not a default kubelet mount → without the `extraMount`, pods get an **empty directory**.
+  2. **Propagation:** the chain host → kubelet → pod must be `rshared` for dynamically-created ZFS mounts to reach pods (`HostToContainer`) and for CSI-created mounts to propagate out (`Bidirectional`).
+- **Required in this setup? Yes** — pool is at a non-default path and needs both visibility and propagation.
+- This lives in the Talos `MachineConfig` on the storage node(s), NOT in the Helm chart.
+
+```yaml
+machine:
+  kubelet:
+    extraMounts:
+      - destination: /var/mnt/tank
+        type: bind
+        source: /var/mnt/tank
+        options:
+          - rbind      # recursive: pull in already-mounted child datasets
+          - rshared    # propagate mount/unmount events both ways
+          - rw
+```
+
+- `rbind` = recursive bind so existing nested dataset mounts come along.
+- `rshared` = puts the kubelet's view in the same propagation peer group as the host.
+- Verify on a node: `findmnt -o TARGET,PROPAGATION /var/mnt/tank` should report `shared`.
+- Symptom if missing: pod's `/var/mnt/tank` is empty, or newly-created datasets never appear in the NFS export.
+
+## Alternative considered: mount ZFS inside the container
+- Viable and sidesteps the RO-root problem; for NFS serving it's identical to the host-mount approach (nfsd/mountd/exportfs all run in the pod namespace either way).
+- Downsides: must coordinate with Talos ZFS extension (`canmount=noauto` / `mountpoint=legacy` to avoid double-mount), agent must run `zpool import` / `zfs mount` idempotently, data visible only inside the pod namespace (no host tooling / separate backup/scrub pod access), mounts die with the pod.
+- Chosen direction instead: host owns the mounts at `/var/mnt/tank` (single source of truth, survives pod restarts, visible to other tooling).
+
+
+## 7. Storage Nodes vs. Consumer Nodes: Kubelet and extraMounts
+
+### The Core Distinction
+
+When configuring Talos for this storage architecture, Kubelet behaves completely differently depending on the node's role. A strict distinction must be made between **Storage Nodes** (hosting the physical ZFS disks and CSI/NFS DaemonSets) and **Consumer Nodes** (hosting the application pods like Plex or Radarr).
+
+### 1. Consumer Nodes (Application Nodes)
+
+**Do they need Talos `extraMounts`?** **NO.**
+
+* On nodes where standard applications run, Kubelet does not need host-level access to the ZFS dataset.
+* When a pod claims a volume, Kubelet simply executes a network mount (`mount -t nfs <IP>:/var/mnt/tank/pvc-123`).
+* Because this happens entirely over the network stack (often hairpinned via Cilium eBPF), no host paths, bind mounts, or Talos configuration patches are required on consumer nodes.
+
+### 2. Storage Nodes (CSI & NFS DaemonSet Nodes)
+
+**Do they need Talos `extraMounts`?** **YES.**
+
+* Because Talos runs the Kubelet service inside its own isolated container/mount namespace, Kubelet cannot natively see the host OS's `/var/mnt/tank` directory.
+* If the `extraMount` is missing, Kubernetes will pass an empty directory to the CSI and NFS pods when they request a `hostPath` volume, breaking the entire provisioning and sharing pipeline.
+
+### The Propagation Chain (Why `rshared` is mandatory)
+
+For the NFS Pod to instantly see a dynamically created dataset from the CSI Pod, the mount event must propagate through multiple isolation boundaries. The Kubelet acts as the critical middleman.
+
+The mount event follows this exact chain:
+
+1. **CSI Pod** executes `zfs create`.
+2. Passes through the CSI Pod's `Bidirectional` volume mount to...
+3. **The Kubelet's Mount Namespace**.
+4. Passes through the Kubelet's `rshared` extraMount boundary to...
+5. **The Talos Host OS**.
+6. Passes *back down* through the Kubelet's `rshared` boundary to...
+7. **The Kubelet's Mount Namespace**.
+8. Passes through the NFS Pod's `HostToContainer` volume mount to...
+9. **The NFS Pod**, allowing `exportfs` to detect and share the new path.
+
+If the Talos Kubelet `extraMount` lacks `rshared`, the event is permanently trapped in the CSI Pod/Kubelet layer and never reaches the host or the NFS server.
+
+### Talos MachineConfig for Storage Nodes
+
+This block must be present in the `machine.yaml` of any node physically hosting the ZFS pool and running the storage DaemonSets:
+
+```yaml
+machine:
+  kubelet:
+    extraMounts:
+      - destination: /var/mnt/tank
+        type: bind
+        source: /var/mnt/tank
+        options:
+          - rbind      # recursive: pull in already-mounted child datasets
+          - rshared    # critical: propagates mount/unmount events both ways across Kubelet boundary
+          - rw
+
+```
+
+
+## 8. Network & Metrics Strategy (hostNetwork & Prometheus)
+### The hostNetwork Requirement
+For the storage Data Plane (NFS and NVMe-oF), hostNetwork: true is strictly required.
+ * **Performance (The CNI Tax):** Routing storage traffic through the Kubernetes overlay network (CNI) forces packet encapsulation/decryption, severely degrading throughput and spiking CPU usage.
+ * **NVMe-oF Routing:** NVMe-over-TCP relies on strict, predictable kernel-level routing. Abstracting the initiator connection behind a virtual Pod IP breaks seamless reconnection if a link flaps.
+### Port Collision Management
+Running on hostNetwork introduces the risk of port collisions. The industry standard is to assign default ports and expose them as configurable environment variables.
+ * **Avoid Standard Ports:** Do not use 10250 (Kubelet), 9100 (Node Exporter), or 9090/9962 (Cilium).
+ * **Selection:** Use unassigned blocks from the official Prometheus Wiki (e.g., 9881 for NFS metrics, 9882 for NVMe-oF metrics).
+ * **Best Practice:** Register the chosen ports on the Prometheus Default Port Allocations GitHub Wiki to reserve them publicly.
+### Prometheus Dynamic Discovery
+Scraping host-networked pods does not require hardcoding physical Node IPs into Prometheus. The Prometheus Operator natively handles discovery via standard Kubernetes abstractions.
+ 1. **The Headless Service:** Create a Service with clusterIP: None. Kubernetes will automatically map the physical Node IPs of the hostNetwork pods into the Service's Endpoints object.
+ 2. **The ServiceMonitor:** The ServiceMonitor watches the Service. The Prometheus Operator reads the dynamically generated Endpoints list and automatically configures scrapes directly against the physical Node IP.
+```yaml
+# 1. Headless Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: zfs-shares-metrics
+spec:
+  clusterIP: None
+  selector:
+    app: zfs-shares
+  ports:
+    - name: metrics-nfs
+      port: 9881
+    - name: metrics-nvme
+      port: 9882
+
+# 2. ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: zfs-shares-monitor
+spec:
+  selector:
+    matchLabels:
+      app: zfs-shares
+  endpoints:
+    - port: metrics-nfs
+    - port: metrics-nvme
+
+```
+## 9. NFS Architecture: In-Kernel vs. User-Space
+### The Talos Initialization Constraint
+Talos Linux provides the nfsd kernel modules but completely lacks host-level user-space tools (no systemd, rpcbind, exportfs, or mountd). Therefore, the privileged DaemonSet container must act as the initialization system. The container's entrypoint must manually orchestrate the legacy Linux services before sleeping:
+```bash
+#!/bin/sh
+rpcbind                  # 1. Start portmapper
+rpc.statd --no-notify    # 2. Start state daemon
+rpc.mountd               # 3. Start mount daemon
+exportfs -arv            # 4. Feed exports to kernel
+rpc.nfsd 8               # 5. Spin up kernel threads
+exec sleep infinity      # 6. Keep container alive
+
+```
+### In-Kernel NFS vs. NFS-Ganesha
+ * **In-Kernel (nfsd):** Maximum bare-metal performance. The kernel reads ZFS blocks directly into kernel memory and sends them out the network interface. Data never leaves kernel space. Requires kernel modules loaded via Talos machine.yaml and manual daemon orchestration (above).
+ * **User-Space (NFS-Ganesha):** A single binary (ganesha.nfsd) that handles the entire protocol in user-space, bypassing rpcbind and kernel dependencies. Uses FSAL_VFS to read standard POSIX mounts.
+ * **The Trade-off:** Ganesha is easier to containerize but incurs a heavy performance penalty for local ZFS storage due to constant context switching (Disk → Kernel → User-Space Ganesha → Kernel → Network). In-kernel is the optimal choice for high-throughput ZFS architecture.
+## 10. NVMe-oF Target Architecture
+### In-Kernel (nvmet) vs. User-Space (SPDK)
+Unlike NFS, user-space NVMe-oF (via Intel SPDK) is actually *faster* than the Linux kernel implementation, capable of millions of IOPS per core by bypassing standard kernel interrupts and utilizing 100% CPU polling.
+However, **SPDK is fundamentally incompatible with a ZFS-backed architecture.**
+ * SPDK requires direct, exclusive access to physical flash memory hardware.
+ * ZFS is a massive kernel module. zvols (ZFS block devices) exist entirely in kernel space.
+ * Attempting to pipe a kernel-space zvol up into user-space SPDK just to wrap it in NVMe-oF protocol creates an extreme architectural bottleneck.
+### The Winning Strategy: In-Kernel nvmet-tcp
+Because ZFS zvols already live in the Linux kernel, using the kernel's native nvmet-tcp subsystem keeps the entire data path localized to kernel-space.
+ 1. Talos Linux provides the nvmet and nvmet-tcp kernel modules natively.
+ 2. The custom DaemonSet simply mounts /sys/kernel/config via hostPath.
+ 3. The controller dynamically writes text configuration to /sys/kernel/config/nvmet to map the zvols to target namespaces, streamlining the entire storage pipeline with zero user-space translation overhead.
+
+
+## 11. Storage Data Plane Client Architecture & Cilium Network Policy
+### Mount Execution & Context
+The application container does not make the direct network connection to the storage target. Instead, the connection is initiated by the host kernel on behalf of the node's Kubelet.
+ * **Orchestration:** When a pod requests a volume, Kubelet calls the **CSI Node Plugin** DaemonSet running on that client node.
+ * **The Mount/Connect Commands:** The plugin issues standard kernel-level client commands:
+   * **NFS:** mount -t nfs <target-ip>:/share /var/lib/kubelet/pods/...
+   * **NVMe-oF:** nvme connect -t tcp -a <target-ip> -n <nqn> ...
+ * **Network Namespace:** Because these are kernel-level modules, the TCP connection is routed through the **Host Network Namespace**. The traffic completely bypasses the Cilium CNI overlay network. The application container is completely unaware of the network layer and simply interacts with a local bind-mount injected into its namespace by Kubelet.
+### Traffic Identity
+Because all storage traffic originates from the host kernel, the storage targets (the storage node DaemonSets) will only ever see incoming packets labeled with the **physical IP addresses of the Talos worker nodes**. Pod CIDR IPs (e.g., 10.244.x.x) are never used for the storage data plane.
+### Cilium Network Policy Configuration
+To secure the data plane, Cilium policies must be configured to allow ingress traffic exclusively from the physical node subnet or Cilium's native host/node entities.
+```yaml
+apiVersion: "cilium.io/v2"
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: "secure-storage-dataplane"
+  namespace: storage-system
+spec:
+  endpointSelector:
+    matchLabels:
+      app: zfs-shares  # Targets the storage server DaemonSets
+  ingress:
+    # Option A: Restrict to physical node network CIDR
+    - fromCIDR:
+        - "192.168.10.0/24"
+      toPorts:
+        - ports:
+            - port: "2049"  # NFS
+              protocol: TCP
+            - port: "111"   # rpcbind
+              protocol: TCP
+            - port: "4420"  # NVMe-oF Default Port
+              protocol: TCP
+              
+    # Option B: Restrict via Cilium's native entity tags
+    - fromEntities:
+        - remote-node
+        - host
+      toPorts:
+        - ports:
+            - port: "2049"
+              protocol: TCP
+            - port: "111"
+              protocol: TCP
+            - port: "4420"
+              protocol: TCP
+
+```
+### Application-Level Access Control
+Network policies must be paired with application-level restrictions:
+ * **NFS Exports:** Write your /etc/exports profiles to allow the host subnet rather than wildcard targets:
+   /var/mnt/tank/share1 192.168.10.0/24(rw,sync,no_root_squash)
+ * **NVMe-oF Targets (nvmet):** Configure the allowed_hosts directory inside /sys/kernel/config/nvmet/ to explicitly match only the specific Host NQNs of the authorized client Talos nodes.
+   
+
+## 18. Storage Node Health & Dead Node Resolution (Detailed Architecture)
+### 18.1 The Fallacy of Self-Reporting
+A completely dead node (power loss, kernel panic, or motherboard failure) cannot clean up its own Custom Resource Definition (CRD) or report its status as OFFLINE. Its local discovery DaemonSet dies with it, leaving the ZfsPool CRD falsely claiming the pool is ONLINE at a dead IP.
+### 18.2 Two-Tier Monitoring Architecture
+To handle all failure modes securely without false positives, the operator uses a two-tier monitoring architecture.
+#### Tier 1: Local DaemonSet (Hardware/ZFS Health)
+ * **Scope:** Runs as a privileged DaemonSet on all live storage nodes.
+ * **Role:** Monitors the pool's internal zpool health while the host operating system is still breathing.
+ * **Status Updates:** Reports localized physical array failures to the ZfsPool CRD:
+   * ONLINE: Pool is healthy.
+   * DEGRADED: A drive in the array failed, but the pool is still serving I/O.
+   * FAULTED: Too many drives failed; the pool is locked.
+   * SUSPENDED: Host Bus Adapter (HBA) crash or detached cables; I/O is paused.
+#### Tier 2: Central Watcher (Node Death)
+ * **Scope:** Standard Kubernetes Deployment (1 replica) running anywhere in the cluster.
+ * **Role:** Detects cluster-level node outages and overrides stale CRD statuses.
+ * **The Reconciliation Loop:**
+   1. Continually watches core Kubernetes Node objects.
+   2. Detects when a physical node transitions to Ready: False (or NotReady after the standard Kubelet timeout).
+   3. Queries the Kubernetes API for all ZfsPool CRDs where status.currentNode == <Dead_Node_Name>.
+   4. Forcibly updates those specific CRDs to status.health: NODE_OFFLINE.
+### 18.3 The Custom Resource Definition (CRD) Structure
+To make this work, the custom ZfsPool resource is designed to separate the human-readable name from the globally unique identifier, while tracking network routing state.
+#### The ZfsPool CRD Schema Overview
+ * **Metadata Name:** Must be the immutable ZFS Pool GUID (e.g., zpool-12140134988506841113) to prevent name collisions across nodes.
+ * **Spec:** Declares the human-readable name and configuration.
+ * **Status:** Holds the dynamic routing and health data updated by the Operator components.
+#### Example 1: Healthy State (Written by Local DaemonSet)
+When the node is operating normally, the local DaemonSet patches the status field:
+```yaml
+apiVersion: storage.homelab/v1
+kind: ZfsPool
+metadata:
+  name: zpool-12140134988506841113
+spec:
+  poolName: tank
+status:
+  currentNode: worker-a
+  currentIP: 192.168.10.15
+  health: ONLINE
+  lastUpdated: "2024-05-12T10:00:00Z"
+
+```
+#### Example 2: Dead Node State (Overwritten by Central Watcher)
+When worker-a loses power, the Central Watcher detects the NotReady node state and patches the CRD to prevent the CSI driver from hanging:
+```yaml
+apiVersion: storage.homelab/v1
+kind: ZfsPool
+metadata:
+  name: zpool-12140134988506841113
+spec:
+  poolName: tank
+status:
+  currentNode: worker-a       # Kept for historical reference
+  currentIP: 192.168.10.15    # Kept for historical reference
+  health: NODE_OFFLINE        # <--- Forcibly updated by Watcher
+  lastUpdated: "2024-05-12T10:05:30Z"
+
+```
+### 18.4 CSI Driver Impact & Recovery
+ 1. **Immediate Failure:** By using the Central Watcher, the CSI Node Plugin does not hang trying to establish a TCP/NVMe connection to a non-responsive IP. If the CRD status is NODE_OFFLINE, the plugin immediately halts the mount attempt and returns a clean gRPC error: *"Mount failed: Storage node is offline."*
+ 2. **The Takeover (Recovery):** Once the physical disks are pulled from the dead node and imported on a healthy node, the new node's Local DaemonSet detects the GUID. It immediately overwrites the NODE_OFFLINE state, updating currentNode, currentIP, and setting health back to ONLINE. The CSI driver seamlessly resumes mounting using the new target IP.
+
+
+## 19. NFS Path Abstraction & Pool Renaming Resilience
+### 19.1 The Problem with Hardcoded NFS Paths
+Standard NFS PersistentVolumes hardcode the absolute export path (e.g., /tank/pvc-12345) into the Kubernetes PV object. If the ZFS pool is renamed to watertank, or imported on a new node using an alternate root path (e.g., zpool import -R /mnt tank), the absolute path changes on the host OS. The hardcoded PV permanently breaks because it points to a path that no longer exists.
+### 19.2 ZFS Server-Side Native Resilience
+When a dataset is shared via the ZFS native sharenfs property, ZFS dynamically manages the kernel NFS exports. If a pool is renamed or its mountpoint shifts, ZFS automatically updates the NFS export path on the server OS in real-time. The server naturally tolerates path changes; the architectural challenge is entirely about routing the CSI client.
+### 19.3 The CRD Extension (Dynamic Pathing)
+To make the CSI driver immune to path changes, the Late Binding pattern is extended to track file paths. The Local Discovery DaemonSet executes zfs get -H -o value mountpoint <pool_name> and publishes this to the ZfsPool CRD as status.baseMountPath.
+**Example CRD State:**
+```yaml
+apiVersion: storage.homelab/v1
+kind: ZfsPool
+metadata:
+  name: zpool-12140134988506841113  # The immutable ZFS GUID
+spec:
+  poolName: watertank               # Can be renamed safely
+status:
+  currentNode: worker-b
+  currentIP: 192.168.10.55
+  baseMountPath: /mnt/watertank     # <--- The dynamic root path
+  health: ONLINE
+
+```
+### 19.4 Controller Phase (Logical Identity)
+During the CreateVolume gRPC phase, the CSI Controller must **never** write the absolute path into the VolumeContext. It only writes the logical dataset name (usually the PVC ID) and the Pool GUID.
+```go
+// Controller Plugin VolumeContext Injection
+"protocol":  "nfs",
+"pool_guid": "12140134988506841113",
+"dataset":   "pvc-12345", // Logical folder name only
+
+```
+### 19.5 Real-Time Path Construction (Node Plugin)
+When Kubelet triggers the mount on the application node, the CSI Node Plugin queries the Kubernetes API to fetch the CRD in real-time. It retrieves the IP and the baseMountPath, concatenates them with the logical dataset name, and dynamically executes the mount.
+```go
+// 1. Fetch real-time data from the ZfsPool CRD via API
+targetIP := zfsPoolObj.Status.CurrentIP            // "192.168.10.55"
+basePath := zfsPoolObj.Status.BaseMountPath        // "/mnt/watertank"
+
+// 2. Fetch logical identity from the K8s PV Context
+datasetName := request.VolumeContext["dataset"]    // "pvc-12345"
+
+// 3. Construct the absolute path dynamically
+fullExportPath := filepath.Join(basePath, datasetName) // "/mnt/watertank/pvc-12345"
+
+// 4. Execute standard mount
+cmd := fmt.Sprintf("mount -t nfs %s:%s /var/lib/kubelet/pods/...", targetIP, fullExportPath)
+RunCommand(cmd)
+
+```
+**Result:** The cluster survives node deaths, IP changes, pool renames, and mountpoint shifts without modifying a single Kubernetes PersistentVolume object.
