@@ -770,3 +770,105 @@ RunCommand(cmd)
 
 ```
 **Result:** The cluster survives node deaths, IP changes, pool renames, and mountpoint shifts without modifying a single Kubernetes PersistentVolume object.
+
+
+# zfs-shares — Architecture Decisions, Findings & Container Inventory
+
+## 1. Core Decision: Build a Standalone CSI (reject extending democratic-csi)
+- democratic-csi is a ~31k-line JS monolith (index.js 4165 lines, controller-zfs 2551 lines), config-file driven, imperative, target/SSH-execution model, stalled maintenance (PRs linger).
+- Our project is CRD + reconcile (controller-runtime), cloud-native, etcd = source of truth, in-kernel nfsd/nvmet, GUID-based pool health + dead-node watcher — none of which democratic-csi has.
+- The CSI surface we actually need is small in Go: CreateVolume/DeleteVolume + NodeStage/NodePublish/NodeUnpublish (+ optional expand/snapshot). We already own the hard parts (in-kernel exports, nvmet configfs, discovery, dead-node override).
+- Use democratic-csi only as a *reference* (volume-context shape, idempotency handling, exact `mount`/`nvme connect` invocations) — not as a dependency/fork.
+
+### democratic-csi vs zfs-shares
+| Dimension | democratic-csi | zfs-shares |
+|---|---|---|
+| Model | config-file + imperative driver | CRD + reconcile |
+| Source of truth | driver process state | etcd (ZfsShare/ZfsPool) |
+| Size | ~31k LoC JS monolith | small, focused Go |
+| Execution | SSH/API target (zfs-local shells out via own executor) | in-kernel nfsd/nvmet in privileged pods |
+| Health/routing | none | ZfsPool GUID + node-death watcher |
+| Maintenance | stalled PRs, JS | ours, Go |
+
+## 2. Provisioning Model: CRD Indirection
+- CSI controller is a pure K8s API client (unprivileged, node-agnostic, schedules anywhere). It does NOT run zfs.
+- CreateVolume → writes an allocation CRD (new ZfsVolume/ZfsDataset, or extend ZfsShare with an allocation block) → waits for Ready → returns volume context.
+- The storage-node `agent` executes the actual `zfs create` when it reconciles the allocation CRD.
+- VolumeContext carries ONLY pool_guid + logical dataset name — NEVER an absolute path (survives pool rename / alt import root / mountpoint shift).
+- Node plugin does late binding at attach: reads ZfsPool.status (currentIP + baseMountPath), joins the logical name, then mounts. Refuses to mount when health = NODE_OFFLINE (clean gRPC error instead of hanging on a dead IP).
+
+## 3. Pod/Container Consolidation
+- One pod, multiple containers on storage nodes. Goal: reduce **pods**, NOT **crash domains**.
+- ZFS mutation confined to a single `agent` container (sole holder of /dev/zfs + Bidirectional mount propagation).
+- nfs stays its own container because it is the nfsd init/supervisor on the live data path — a real crash boundary. A discovery/allocation hiccup must not bounce nfsd.
+- Privilege/crash-domain gradient:
+  - `agent`: privileged, /dev/zfs, Bidirectional propagation (creates mounts that must flow out).
+  - `nfs`: nfsd modules + HostToContainer propagation only; no zfs binary.
+  - `nvmeof`: configfs + /dev only; no zfs binary.
+
+## 4. Merge Discovery + Allocation into one `agent`
+- Both are control-plane ZFS ops (list/get vs create/destroy), behind the same Go `ZFS` interface, same host plumbing, same ServiceAccount scope.
+- Both are level-driven & idempotent controller-runtime loops — restart just re-lists pools / re-reconciles CRDs from etcd; neither on the hot data path.
+- Splitting costs a second container + duplicated plumbing for negligible benefit. (Contrast: nfs MUST be separate.)
+
+## 5. No gRPC ZFS Daemon (for now)
+- Two kinds of ZFS access:
+  - **Control-plane**: create/destroy/list/get/snapshot — small, structured, request/response, gRPC-friendly. Only ONE consumer today (`agent`).
+  - **Data-plane**: `zfs send | ssh` / `ssh | zfs recv` — streaming GB–TB, NOT gRPC-friendly.
+- Backup containers are data-plane streamers, so they do NOT validate a gRPC daemon:
+  - Piping a multi-TB send stream through RPC is an anti-pattern.
+  - SSH-pull is inbound: external TrueNAS SSHes in and sshd spawns `zfs send` as its child — that process needs /dev/zfs + the zfs binary directly; routing through a socket needs a zfs shim (more complexity than it removes).
+- A Unix socket in an emptyDir is pod-scoped, so it couldn't serve a separate backup pod without becoming a wider-privileged network service — and still wouldn't fix streaming.
+- Factor out the **plumbing** (host-exec helper: chroot /host or nsenter → host zfs + /dev/zfs), NOT an API. Shared as a library/pod-spec snippet (internal/zpool/hostexec.go). Host-exec also keeps the CLI version-matched to the host ZFS kernel module.
+- Keep a Go `ZFS` interface seam (hostexec impl now). A control-plane gRPC daemon becomes a drop-in swap IF a second in-pod **control-plane** consumer ever appears. Backups are never that trigger.
+- gRPC daemon would only be worth it if: multiple independent control-plane callers need coordination; OR you want the privileged ZFS surface reduced to one audited process while several less-privileged containers request ops; OR you need to serialize/queue concurrent create/destroy across many callers.
+
+## 6. Backups Live in a Separate Pod
+- Periodic/bursty, heavy I/O, own resource limits/schedule; a backup crash/restart must never bounce nfsd.
+- Matches the original "Privileged Backup Pod" model above.
+- At node level multiple containers need zfs, but they split by lifecycle into two pods; within the *serving* pod there is still only one ZFS consumer (`agent`).
+
+## Container Inventory
+
+### Serving pod — DaemonSet on storage nodes (label zfs-shares.io/storage=true)
+| Container | Purpose |
+|---|---|
+| `agent` | Only ZFS-mutating process. Reconciles allocation CRDs (zfs create [-V], quotas, destroy, snapshots) AND discovers pools (zpool/zfs get), publishing ZfsPool status (name, node, IP, mountpoint, health). Holds /dev/zfs + Bidirectional mount propagation. |
+| `nfs` | In-kernel NFS server + init/supervisor. Watches protocol: nfs ZfsShares for this node, renders /etc/exports, runs exportfs -ra, supervises rpcbind/rpc.mountd/nfsd. Consumes propagated dataset mounts — no zfs binary. |
+| `nvmeof` | In-kernel NVMe-oF target. Watches protocol: nvmeof ZfsShares for this node, programs configfs (/sys/kernel/config/nvmet) incrementally (never nvmetcli restore). Consumes /dev/zvol/... device nodes — no zfs binary. |
+
+### CSI controller — Deployment (unprivileged, schedules anywhere)
+| Container | Purpose |
+|---|---|
+| `csi-controller` | CSI ControllerService. CreateVolume→writes allocation CRD, waits for Ready, returns volume context (pool_guid + logical dataset name, never an absolute path); DeleteVolume/expand/snapshot likewise via CRDs. Pure K8s API client. |
+| `csi-provisioner` | Standard sidecar: turns PVC events into CreateVolume/DeleteVolume calls. |
+| `csi-resizer` (if expand) | Standard sidecar: drives ControllerExpandVolume. |
+| `csi-snapshotter` (if snapshots) | Standard sidecar: drives snapshot create/delete. |
+
+### CSI node plugin — DaemonSet on all nodes
+| Container | Purpose |
+|---|---|
+| `csi-node` | CSI NodeService. NodePublish→reads ZfsPool.status (currentIP + baseMountPath), joins logical name, runs mount -t nfs / nvme connect; refuses on NODE_OFFLINE. Does not touch zfs. |
+| `node-driver-registrar` | Standard sidecar: registers the driver socket with the kubelet. |
+
+### Node-death watcher — Deployment, single replica, cluster-wide
+| Container | Purpose |
+|---|---|
+| `zpool-watcher` | Watches core Node objects; when a storage node goes NotReady/vanishes, forces its ZfsPool status to NODE_OFFLINE so clients never route to a dead IP. No ZFS access. |
+
+### Backup pod — FUTURE, DaemonSet/pod on storage nodes (separate lifecycle)
+| Container | Purpose |
+|---|---|
+| `ssh-daemon` | Runs sshd so external TrueNAS can SSH in and zfs send (pull) snapshots of this host. Data-plane streaming; shares the host-exec plumbing helper, not a gRPC socket. |
+| `cron-puller` | Periodically pulls backups from other TrueNAS instances (syncoid/zfs recv). Same host-exec helper. |
+
+## Supporting Findings / Invariants the Container Design Relies On
+- **Mountpoint under /var:** Talos `/` is read-only, so `mountpoint=/tank` leaves the pool imported-but-unmounted. Use `mountpoint=/var/mnt/tank` (writable tree).
+- **Export-path identity rule:** spec.Path must resolve identically inside the CSI/agent container and the nfs container. Invariant: spec.Path == container mountPath == ZFS mountpoint property. ZFS mounts at the *property* path in whatever namespace runs the mount.
+- **Mount propagation chain (why it works):** agent `zfs create` → Bidirectional (rshared) flows out to host peer group → nfs container HostToContainer (rslave) flows in → exportfs finds the path. CSI/agent side MUST be Bidirectional (one-way HostToContainer would never flow back out); nfs side only receives.
+- **Talos kubelet extraMounts (storage nodes only):** kubelet runs in its own mount namespace; a non-default pool path needs an rbind+rshared+rw extraMount at /var/mnt/tank for both visibility (else pods get an empty dir) and propagation. Consumer nodes do NOT need it (they do a network NFS/NVMe mount). Lives in Talos MachineConfig, not the Helm chart.
+- **hostNetwork: true for data plane:** avoids CNI encapsulation tax; NVMe/TCP needs predictable kernel routing + clean reconnect on link flap. Assign non-standard metrics ports (e.g. 9881 NFS, 9882 NVMe-oF); discover via headless Service + ServiceMonitor (no hardcoded node IPs).
+- **In-kernel over user-space:** nfsd (kernel) beats NFS-Ganesha for local ZFS (no user-space context-switch tax). nvmet-tcp (kernel) over SPDK (SPDK needs exclusive flash + can't consume kernel-space zvols).
+- **configfs over nvmetcli restore:** restore tears down/rebuilds the whole target and drops all connections; writing configfs directly reconciles incrementally (only the changed subsystem), preserving live connections.
+- **ZfsPool identity:** metadata.name = immutable pool GUID (zpool-<GUID>); status tracks poolName/currentNode/currentIP/baseMountPath/health. Importing on a new node auto-takes-over the object. Enables node-death, IP change, pool rename, mountpoint shift with zero PV edits.
+- **Static/pre-existing datasets:** bypass the CSI storage plane; admin applies a static ZfsShare (agent exports it) + native NFS PV with Retain. Note: a PV can't be shared by multiple PVCs — need a PV+PVC per namespace that mounts the share.
