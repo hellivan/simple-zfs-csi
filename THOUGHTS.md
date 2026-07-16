@@ -872,3 +872,116 @@ RunCommand(cmd)
 - **configfs over nvmetcli restore:** restore tears down/rebuilds the whole target and drops all connections; writing configfs directly reconciles incrementally (only the changed subsystem), preserving live connections.
 - **ZfsPool identity:** metadata.name = immutable pool GUID (zpool-<GUID>); status tracks poolName/currentNode/currentIP/baseMountPath/health. Importing on a new node auto-takes-over the object. Enables node-death, IP change, pool rename, mountpoint shift with zero PV edits.
 - **Static/pre-existing datasets:** bypass the CSI storage plane; admin applies a static ZfsShare (agent exports it) + native NFS PV with Retain. Note: a PV can't be shared by multiple PVCs — need a PV+PVC per namespace that mounts the share.
+
+
+# zfs-shares — CRD Model & GUID Routing Decisions
+
+## 7. Two-CRD Share Model (generic executor + ZFS-centric sugar)
+The current `ZfsShare` implementation is actually **ZFS-agnostic** — it just exports a
+node-local absolute path (`exportfs` / nvmet `configfs`). That generic primitive is
+worth keeping for non-ZFS use cases, so the share concept splits into two layers:
+
+- **`NetworkExport`** (rename of today's `ZfsShare`): the generic, low-level executor
+  contract. Spec `{ nodeName, protocol, path, nfs{clients} | nvmeof{nqn, allowedHosts} }`.
+  Zero ZFS knowledge. **Keeps `nodeName`** — correct for a node-pinned primitive.
+  Reusable standalone to export any local path from any node.
+- **`ZfsShare`** (new, ZFS-centric): the CSI use case. Spec `{ poolGUID, dataset, protocol,
+  nfs|nvmeof }`. Its controller resolves `poolGUID` → current node + derived path via
+  `ZfsPool`, then **creates and owns a child `NetworkExport`** (owner reference) and keeps
+  it in sync as the pool moves.
+
+### Compile-down, NOT two parallel executors
+`ZfsShare` compiles down to `NetworkExport`; it never touches the export table directly.
+This is mandatory because `/etc/exports` and the nvmet `configfs` tree are **node-global
+singletons** and the executors are level-driven (full rebuild from all owned objects, then
+apply). The invariant is **exactly one aggregator per node per protocol** — two independent
+controllers both rebuilding the same `/etc/exports` would clobber each other. Compile-down
+keeps a single aggregator (the `NetworkExport` nfs/nvmeof controllers), zero duplication of
+exportfs/configfs logic, and keeps the generic executor genuinely generic (never learns
+about `ZfsPool`).
+
+### Layer responsibilities
+- `ZfsShare` layer owns *"which node / which path"*: GUID resolution, path derivation,
+  takeover, watching `ZfsPool`.
+- `NetworkExport` layer owns *"aggregate everything for this node and apply."*
+- On takeover, `ZfsShare` just rewrites its child `NetworkExport`'s `nodeName`+`path`; the
+  old node's aggregator drops it, the new node's picks it up. Each layer changes in one place.
+
+### Cost (accepted)
+One extra object per ZFS share + a small `ZfsShare` reconciler that renders/syncs its child
+(owner ref handles GC; finalizer only if ordered teardown is needed). `ZfsShare` must watch
+`ZfsPool` (already required for GUID routing).
+
+## 8. GUID Routing Replaces nodeName on the ZFS Layer
+- `spec.nodeName` on a ZFS-bound share breaks pool mobility: after a pool is imported on a
+  new node (GUID takeover), a hardcoded `nodeName` keeps the share pinned to the dead node
+  and it silently stops exporting. An absolute `spec.path` rots on pool rename / alt import
+  root.
+- Therefore the **ZFS layer** keys on `poolGUID` + logical `dataset` and **derives** paths at
+  reconcile time:
+  - NFS path = `ZfsPool.status.baseMountPath` + `/` + `dataset`
+  - NVMe-oF zvol = `/dev/zvol/` + `ZfsPool.status.poolName` + `/` + `dataset`
+- Shared filter predicate across all storage-plane reconcilers (`agent`, and the `ZfsShare`
+  renderer): **"do I currently host this pool GUID?"** → resolve `poolGUID` →
+  `ZfsPool.status.currentNode == $NODE_NAME`. Requires watching `ZfsPool` and mapping changes
+  back to the referencing objects so both old and new node re-reconcile on takeover.
+- The **allocation CRD (`ZfsVolume`)** keys off `poolGUID` too, so `agent` uses the identical
+  "is this pool mine right now?" rule for creation, discovery, and share rendering.
+- The generic `NetworkExport` **retains `nodeName`** — GUID routing lives only in the ZFS
+  layer, which *produces* the `nodeName` dynamically.
+
+## 9. Revised Build Order (supersedes the earlier step list)
+1. Rename current `ZfsShare` → `NetworkExport` (type + controllers + CRD + samples + chart);
+   verify with `make manifests` + `make vet`.
+2. Add `ZfsVolume` allocation CRD (keyed on `poolGUID`).
+3. Add the new GUID-based `ZfsShare` whose reconciler renders/syncs a child `NetworkExport`.
+4. Formalize the Go `ZFS` interface (+ hostexec impl) over `internal/zpool/hostexec.go`.
+5. Agent allocation reconciler (create/destroy zvol/dataset, idempotent, finalizer), folded
+   into the discovery loop as one `agent` binary/container.
+6. CSI controller (`cmd/csi-controller`): CreateVolume → writes `ZfsVolume` (+ `ZfsShare`),
+   waits for Ready, returns volume context (pool_guid + logical name).
+7. CSI node plugin (`cmd/csi-node`): NodePublish routes via `ZfsPool.status`, mounts NFS /
+   `nvme connect`, refuses on NODE_OFFLINE; ship `CSIDriver` + node-driver-registrar.
+
+## 10. Home of the `ZfsShare → NetworkExport` Reconciler: the `operator`
+The translation from ZFS-centric `ZfsShare` to generic `NetworkExport` is **not** a new
+container. It is a cluster-wide, unprivileged, single-active (leader-elected), `ZfsPool`-aware
+reconciler — the same shape as the existing node-death watcher.
+
+### Decision: promote `zpool-watcher` → `operator`
+Rename the `zpool-watcher` Deployment to **`operator`** (`cmd/operator`, image
+`zfs-shares-operator`) and make it the cluster-scoped controller-manager that hosts **all**
+unprivileged, cluster-wide, leader-elected reconcilers:
+- node death → `ZfsPool` health (the former watcher)
+- `ZfsShare → NetworkExport` translation
+- room for future cluster-scoped reconcilers
+
+### Why here (and not the CSI controller)
+- **Decoupled from CSI:** a static, GUID-routed `ZfsShare` (e.g. a media library that must
+  survive pool takeover) needs translation but **no dynamic provisioning**. Binding the
+  reconciler to the CSI controller would force a CSI deploy just to render shares.
+- **CSI stays a thin adapter:** the CSI controller only *creates* `ZfsVolume`/`ZfsShare` and
+  returns volume context — no continuous reconcile loops in the gRPC pod.
+- **Cohesion:** watcher and translator are both cluster-wide `ZfsPool`-driven reconcilers.
+- **No extra pods:** reuse the existing cluster-wide Deployment (important for a 2-node homelab).
+- **Failure isolation:** a CSI redeploy never stops share translation.
+
+### Why not per-node (`agent` DaemonSet)
+Translation is cluster-scoped GUID→node resolution, not node-local work. Running it on every
+node would mean N copies racing to write the same `NetworkExport` (needs leader election
+anyway). The per-node `agent`/`nfs`/`nvmeof` only *consume* `NetworkExport`.
+
+### Resulting plane separation
+- **`operator`** (Deployment, cluster-wide, unprivileged, leader-elected): the brain —
+  `zpool-watcher` + `ZfsShare → NetworkExport`.
+- **`csi-controller`** (Deployment): thin gRPC adapter; creates CRDs, returns context.
+- **`agent` / `nfs` / `nvmeof`** (DaemonSet, per storage node, privileged): consume
+  `ZfsVolume`/`NetworkExport`, do the privileged ZFS/export work.
+- **`csi-node`** (DaemonSet, all nodes): mounts.
+
+Fleet naming: `agent` (data plane) · `operator` (brain) · `csi-controller` / `csi-node`
+(CSI adapter). "controller" stays reserved for CSI + the per-node export controllers.
+
+### RBAC delta on `operator`
+Already reconciles `ZfsPool`; add `get/list/watch ZfsShare` + `create/update/delete/watch
+NetworkExport` (owner-reference GC of child `NetworkExport`s).
