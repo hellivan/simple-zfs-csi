@@ -1,0 +1,217 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: zfsvolumes.storage.zfs-shares.io
+spec:
+  group: storage.zfs-shares.io
+  names:
+    kind: ZfsVolume
+    listKind: ZfsVolumeList
+    plural: zfsvolumes
+    shortNames:
+    - zvol
+    singular: zfsvolume
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolGUID
+      name: Pool
+      type: string
+    - jsonPath: .spec.dataset
+      name: Dataset
+      type: string
+    - jsonPath: .spec.type
+      name: Type
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.path
+      name: Path
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ZfsVolume is the Schema for the zfsvolumes API. It is a cluster-scoped
+          "intent to allocate" a ZFS dataset or zvol on a specific pool (by GUID). The
+          CSI controller creates it; the node agent currently hosting the pool creates
+          the underlying ZFS object and reports the result in the status.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ZfsVolumeSpec is the desired allocation of a ZFS dataset or zvol on the pool
+              identified by PoolGUID. It expresses storage intent only (create/size); the
+              network export of the resulting path is a separate concern (ZfsShare ->
+              NetworkExport). The agent on the node currently hosting the pool reconciles it.
+            properties:
+              dataset:
+                description: |-
+                  Dataset is the logical dataset path relative to the pool root, e.g.
+                  "k8s/pvc-123". It is immutable for the lifetime of the volume.
+                minLength: 1
+                type: string
+              poolGUID:
+                description: |-
+                  PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name, without
+                  the "zpool-" prefix) that this volume is allocated on. The agent derives the
+                  concrete pool name and mount root from the matching ZfsPool.status.
+                minLength: 1
+                type: string
+              properties:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Properties are extra ZFS properties applied verbatim at creation, e.g.
+                  {"compression": "lz4", "recordsize": "1M"}. Keys are ZFS property names.
+                type: object
+              quota:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  Quota caps a dataset's referenced space (ZFS "quota"/"refquota"). Applies to
+                  type=dataset only; when omitted or zero the dataset is unlimited.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              size:
+                anyOf:
+                - type: integer
+                - type: string
+                description: Size is the logical volume size of a zvol. Required for
+                  type=zvol.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+              type:
+                description: Type selects a filesystem dataset or a block zvol.
+                enum:
+                - dataset
+                - zvol
+                type: string
+              volblocksize:
+                description: |-
+                  Volblocksize sets a zvol's block size (ZFS "volblocksize"), e.g. "16k". It
+                  is fixed at creation. Applies to type=zvol only; empty means the ZFS default.
+                type: string
+            required:
+            - dataset
+            - poolGUID
+            - type
+            type: object
+            x-kubernetes-validations:
+            - message: spec.size is required when type is zvol
+              rule: self.type != 'zvol' || has(self.size)
+            - message: spec.quota is only valid when type is dataset
+              rule: self.type != 'zvol' || !has(self.quota)
+            - message: spec.volblocksize is only valid when type is zvol
+              rule: self.type != 'dataset' || !has(self.volblocksize)
+          status:
+            description: ZfsVolumeStatus reports the observed allocation state on
+              the node.
+            properties:
+              conditions:
+                description: Conditions represents the latest available observations.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              message:
+                description: Message carries human-readable detail about the current
+                  phase.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the spec generation last reconciled.
+                format: int64
+                type: integer
+              path:
+                description: |-
+                  Path is the node-local path of the created volume once Ready: the dataset
+                  mountpoint (type=dataset) or the zvol device node (type=zvol). Consumers
+                  should still resolve routing via ZfsPool.status rather than pinning this.
+                type: string
+              phase:
+                description: Phase is a coarse summary of the current state.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
