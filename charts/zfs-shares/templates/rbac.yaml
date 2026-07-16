@@ -103,6 +103,15 @@ rules:
   - apiGroups: ["storage.zfs-shares.io"]
     resources: ["zfspools/status"]
     verbs: ["get", "update", "patch"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfsshares"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfsshares/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["networkexports"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

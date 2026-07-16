@@ -1,0 +1,31 @@
+---
+# ZFS-centric share: export the dataset "media/movies" on the pool with the
+# given GUID over NFS. The operator resolves the GUID to the pool's current node
+# and mount path, then renders a node-pinned NetworkExport automatically.
+apiVersion: storage.zfs-shares.io/v1alpha1
+kind: ZfsShare
+metadata:
+  name: pvc-media-movies
+spec:
+  poolGUID: "12140134988506841113"   # ZfsPool metadata.name without the "zpool-" prefix
+  dataset: media/movies              # logical path under the pool root
+  protocol: nfs
+  nfs:
+    clients:
+      - client: "10.0.0.0/24"
+        options: ["rw", "sync", "no_subtree_check", "no_root_squash"]
+---
+# ZFS-centric share over NVMe-oF. Resolves to /dev/zvol/<poolName>/k8s/pvc-postgres-data
+# on whichever node currently imports the pool.
+apiVersion: storage.zfs-shares.io/v1alpha1
+kind: ZfsShare
+metadata:
+  name: pvc-postgres-data
+spec:
+  poolGUID: "12140134988506841113"
+  dataset: k8s/pvc-postgres-data
+  protocol: nvmeof
+  nvmeof:
+    # nqn omitted -> derived by the nvmeof controller from the NetworkExport metadata
+    allowedHosts:
+      - "nqn.2014-08.org.nvmexpress:uuid:worker-01"

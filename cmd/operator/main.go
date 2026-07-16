@@ -4,6 +4,9 @@
 //   - the pool watcher: watches core Node objects and forcibly marks the
 //     ZfsPool objects of a dead storage node as NODE_OFFLINE so CSI node
 //     plugins fail fast instead of hanging on an unreachable target.
+//   - the ZfsShare translator: resolves a ZFS-centric ZfsShare (pool GUID +
+//     dataset) to the pool's current node and renders a node-pinned
+//     NetworkExport, re-targeting it when the pool moves.
 package main
 
 import (
@@ -65,6 +68,14 @@ func main() {
 		Client: mgr.GetClient(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up pool watcher")
+		os.Exit(1)
+	}
+
+	if err := (&controller.ZfsShareReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up zfsshare reconciler")
 		os.Exit(1)
 	}
 
