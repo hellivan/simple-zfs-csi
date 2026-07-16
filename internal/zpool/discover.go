@@ -99,24 +99,15 @@ func (d *Discoverer) Discover(ctx context.Context) ([]Pool, error) {
 	return pools, nil
 }
 
-// mountpoint resolves the pool root's ZFS mountpoint. "none"/"legacy"/"-" are
-// normalized to an empty string.
+// mountpoint resolves the pool root's ZFS mountpoint via the shared ZFS CLI.
+// "none"/"legacy"/"-" are normalized to an empty string.
 func (d *Discoverer) mountpoint(ctx context.Context, run Runner, pool string) (string, error) {
-	zfsBin := d.ZfsBin
-	if zfsBin == "" {
-		zfsBin = "zfs"
-	}
-	out, err := run(ctx, zfsBin, "get", "-H", "-o", "value", "mountpoint", pool)
+	zfs := &CLI{Bin: d.ZfsBin, Run: run}
+	mp, err := zfs.Get(ctx, pool, "mountpoint")
 	if err != nil {
 		return "", err
 	}
-	mp := strings.TrimSpace(out)
-	switch mp {
-	case "", "-", "none", "legacy":
-		return "", nil
-	default:
-		return mp, nil
-	}
+	return normalizeMountpoint(mp), nil
 }
 
 // MapHealth translates a ZFS pool state string (from `zpool list -o health` or

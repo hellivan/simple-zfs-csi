@@ -159,15 +159,22 @@ func (z *CLI) List(ctx context.Context, kind DatasetKind) ([]Dataset, error) {
 		}
 		d := Dataset{Name: fields[0], Type: DatasetKind(fields[1])}
 		if len(fields) >= 3 {
-			switch fields[2] {
-			case "", "-", "none", "legacy":
-			default:
-				d.Mountpoint = fields[2]
-			}
+			d.Mountpoint = normalizeMountpoint(fields[2])
 		}
 		datasets = append(datasets, d)
 	}
 	return datasets, nil
+}
+
+// normalizeMountpoint maps ZFS's non-path mountpoint values ("none", "legacy",
+// "-", empty) to an empty string, leaving real paths untouched.
+func normalizeMountpoint(mp string) string {
+	switch strings.TrimSpace(mp) {
+	case "", "-", "none", "legacy":
+		return ""
+	default:
+		return strings.TrimSpace(mp)
+	}
 }
 
 // propArgs renders a stable, sorted list of "-o key=value" arguments.
