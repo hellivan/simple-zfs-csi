@@ -117,11 +117,11 @@ func TestDeriveVolumePath(t *testing.T) {
 		want          string
 		wantErr       bool
 	}{
-		{name: "dataset joins base mount path", volType: storagev1alpha1.VolumeTypeDataset, baseMountPath: "/mnt/tank", dataset: "k8s/pvc-1", want: "/mnt/tank/k8s/pvc-1"},
-		{name: "zvol device node", volType: storagev1alpha1.VolumeTypeZvol, poolName: "tank", dataset: "k8s/pvc-1", want: "/dev/zvol/tank/k8s/pvc-1"},
-		{name: "dataset without mount path errors", volType: storagev1alpha1.VolumeTypeDataset, dataset: "x", wantErr: true},
-		{name: "zvol without pool name errors", volType: storagev1alpha1.VolumeTypeZvol, dataset: "x", wantErr: true},
-		{name: "empty dataset errors", volType: storagev1alpha1.VolumeTypeDataset, baseMountPath: "/tank", dataset: "/", wantErr: true},
+		{name: "filesystem joins base mount path", volType: storagev1alpha1.VolumeTypeFilesystem, baseMountPath: "/mnt/tank", dataset: "k8s/pvc-1", want: "/mnt/tank/k8s/pvc-1"},
+		{name: "volume device node", volType: storagev1alpha1.VolumeTypeVolume, poolName: "tank", dataset: "k8s/pvc-1", want: "/dev/zvol/tank/k8s/pvc-1"},
+		{name: "filesystem without mount path errors", volType: storagev1alpha1.VolumeTypeFilesystem, dataset: "x", wantErr: true},
+		{name: "volume without pool name errors", volType: storagev1alpha1.VolumeTypeVolume, dataset: "x", wantErr: true},
+		{name: "empty dataset errors", volType: storagev1alpha1.VolumeTypeFilesystem, baseMountPath: "/tank", dataset: "/", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -150,9 +150,9 @@ func TestZfsVolumeReconcile_CreatesDatasetAndSetsReady(t *testing.T) {
 		Spec: storagev1alpha1.ZfsVolumeSpec{
 			PoolGUID:   "999",
 			Dataset:    "k8s/pvc-1",
-			Type:       storagev1alpha1.VolumeTypeDataset,
-			Quota:      &quota,
+			Type:       storagev1alpha1.VolumeTypeFilesystem,
 			Properties: map[string]string{"compression": "lz4"},
+			Filesystem: &storagev1alpha1.FilesystemConfig{Quota: &quota},
 		},
 	}
 
@@ -205,11 +205,10 @@ func TestZfsVolumeReconcile_ZvolUsesSize(t *testing.T) {
 	vol := &storagev1alpha1.ZfsVolume{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-blk", Finalizers: []string{zfsVolumeFinalizer}},
 		Spec: storagev1alpha1.ZfsVolumeSpec{
-			PoolGUID:     "999",
-			Dataset:      "k8s/pvc-blk",
-			Type:         storagev1alpha1.VolumeTypeZvol,
-			Size:         &size,
-			Volblocksize: "16k",
+			PoolGUID: "999",
+			Dataset:  "k8s/pvc-blk",
+			Type:     storagev1alpha1.VolumeTypeVolume,
+			Volume:   &storagev1alpha1.VolumeConfig{Size: size, Volblocksize: "16k"},
 		},
 	}
 
@@ -248,7 +247,7 @@ func TestZfsVolumeReconcile_IdempotentWhenExists(t *testing.T) {
 		Spec: storagev1alpha1.ZfsVolumeSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-1",
-			Type:     storagev1alpha1.VolumeTypeDataset,
+			Type:     storagev1alpha1.VolumeTypeFilesystem,
 		},
 	}
 
@@ -283,7 +282,7 @@ func TestZfsVolumeReconcile_IgnoresVolumeOnOtherNode(t *testing.T) {
 		Spec: storagev1alpha1.ZfsVolumeSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-1",
-			Type:     storagev1alpha1.VolumeTypeDataset,
+			Type:     storagev1alpha1.VolumeTypeFilesystem,
 		},
 	}
 
@@ -327,7 +326,7 @@ func TestZfsVolumeReconcile_DeleteDestroysAndReleases(t *testing.T) {
 		Spec: storagev1alpha1.ZfsVolumeSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-1",
-			Type:     storagev1alpha1.VolumeTypeDataset,
+			Type:     storagev1alpha1.VolumeTypeFilesystem,
 		},
 	}
 

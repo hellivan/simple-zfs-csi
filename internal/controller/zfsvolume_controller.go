@@ -143,21 +143,6 @@ func (r *ZfsVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		"Ready", fmt.Sprintf("provisioned %s on %s", full, r.NodeName))
 }
 
-// create provisions the dataset or zvol described by the volume spec.
-func (r *ZfsVolumeReconciler) create(ctx context.Context, vol *storagev1alpha1.ZfsVolume, full string) error {
-	switch vol.Spec.Type {
-	case storagev1alpha1.VolumeTypeDataset:
-		return r.ZFS.CreateDataset(ctx, full, datasetProps(vol))
-	case storagev1alpha1.VolumeTypeZvol:
-		if vol.Spec.Size == nil {
-			return fmt.Errorf("spec.size is required for zvol")
-		}
-		return r.ZFS.CreateZvol(ctx, full, vol.Spec.Size.Value(), zvolProps(vol))
-	default:
-		return fmt.Errorf("unknown volume type %q", vol.Spec.Type)
-	}
-}
-
 // releaseFinalizer removes the agent finalizer, allowing the API server to
 // complete deletion.
 func (r *ZfsVolumeReconciler) releaseFinalizer(ctx context.Context, vol *storagev1alpha1.ZfsVolume) error {
@@ -165,22 +150,37 @@ func (r *ZfsVolumeReconciler) releaseFinalizer(ctx context.Context, vol *storage
 	return r.Update(ctx, vol)
 }
 
-// datasetProps renders the ZFS properties for a filesystem dataset: the user
-// properties, plus refquota derived from spec.quota when set.
-func datasetProps(vol *storagev1alpha1.ZfsVolume) map[string]string {
+// create provisions the filesystem or volume described by the volume spec.
+func (r *ZfsVolumeReconciler) create(ctx context.Context, vol *storagev1alpha1.ZfsVolume, full string) error {
+	switch vol.Spec.Type {
+	case storagev1alpha1.VolumeTypeFilesystem:
+		return r.ZFS.CreateDataset(ctx, full, filesystemProps(vol))
+	case storagev1alpha1.VolumeTypeVolume:
+		if vol.Spec.Volume == nil {
+			return fmt.Errorf("spec.volume is required for volume")
+		}
+		return r.ZFS.CreateZvol(ctx, full, vol.Spec.Volume.Size.Value(), volumeProps(vol))
+	default:
+		return fmt.Errorf("unknown volume type %q", vol.Spec.Type)
+	}
+}
+
+// filesystemProps renders the ZFS properties for a filesystem dataset: the user
+// properties, plus refquota derived from the filesystem quota when set.
+func filesystemProps(vol *storagev1alpha1.ZfsVolume) map[string]string {
 	props := copyProps(vol.Spec.Properties)
-	if q := vol.Spec.Quota; q != nil && !q.IsZero() {
-		props["refquota"] = strconv.FormatInt(q.Value(), 10)
+	if cfg := vol.Spec.Filesystem; cfg != nil && cfg.Quota != nil && !cfg.Quota.IsZero() {
+		props["refquota"] = strconv.FormatInt(cfg.Quota.Value(), 10)
 	}
 	return props
 }
 
-// zvolProps renders the ZFS properties for a zvol: the user properties, plus
-// volblocksize when set.
-func zvolProps(vol *storagev1alpha1.ZfsVolume) map[string]string {
+// volumeProps renders the ZFS properties for a volume/zvol: the user properties,
+// plus volblocksize when set.
+func volumeProps(vol *storagev1alpha1.ZfsVolume) map[string]string {
 	props := copyProps(vol.Spec.Properties)
-	if vol.Spec.Volblocksize != "" {
-		props["volblocksize"] = vol.Spec.Volblocksize
+	if cfg := vol.Spec.Volume; cfg != nil && cfg.Volblocksize != "" {
+		props["volblocksize"] = cfg.Volblocksize
 	}
 	return props
 }
@@ -217,12 +217,12 @@ func deriveVolumePath(volType storagev1alpha1.VolumeType, baseMountPath, poolNam
 		return "", fmt.Errorf("dataset is empty")
 	}
 	switch volType {
-	case storagev1alpha1.VolumeTypeDataset:
+	case storagev1alpha1.VolumeTypeFilesystem:
 		if baseMountPath == "" {
 			return "", fmt.Errorf("pool baseMountPath is unknown")
 		}
 		return path.Join(baseMountPath, ds), nil
-	case storagev1alpha1.VolumeTypeZvol:
+	case storagev1alpha1.VolumeTypeVolume:
 		if poolName == "" {
 			return "", fmt.Errorf("pool name is unknown")
 		}

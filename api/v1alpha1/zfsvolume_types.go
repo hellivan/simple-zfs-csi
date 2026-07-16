@@ -5,16 +5,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// VolumeType selects whether a ZfsVolume is provisioned as a POSIX filesystem
-// dataset (shared over NFS) or a raw block zvol (shared over NVMe-oF).
-// +kubebuilder:validation:Enum=dataset;zvol
+// VolumeType selects which kind of ZFS dataset a ZfsVolume provisions: a POSIX
+// filesystem (shared over NFS) or a raw block volume/zvol (shared over NVMe-oF).
+// Both are "datasets" in ZFS terms; this is the dataset's type.
+// +kubebuilder:validation:Enum=filesystem;volume
 type VolumeType string
 
 const (
-	// VolumeTypeDataset provisions a ZFS dataset (filesystem), sized by quota.
-	VolumeTypeDataset VolumeType = "dataset"
-	// VolumeTypeZvol provisions a ZFS zvol (block device), sized by size.
-	VolumeTypeZvol VolumeType = "zvol"
+	// VolumeTypeFilesystem provisions a ZFS filesystem dataset, sized by quota.
+	VolumeTypeFilesystem VolumeType = "filesystem"
+	// VolumeTypeVolume provisions a ZFS volume (zvol / block device), sized by size.
+	VolumeTypeVolume VolumeType = "volume"
 )
 
 // ZfsVolumePhase is a high-level summary of the allocation state.
@@ -29,13 +30,40 @@ const (
 	VolumePhaseError ZfsVolumePhase = "Error"
 )
 
-// ZfsVolumeSpec is the desired allocation of a ZFS dataset or zvol on the pool
-// identified by PoolGUID. It expresses storage intent only (create/size); the
-// network export of the resulting path is a separate concern (ZfsShare ->
-// NetworkExport). The agent on the node currently hosting the pool reconciles it.
-// +kubebuilder:validation:XValidation:rule="self.type != 'zvol' || has(self.size)",message="spec.size is required when type is zvol"
-// +kubebuilder:validation:XValidation:rule="self.type != 'zvol' || !has(self.quota)",message="spec.quota is only valid when type is dataset"
-// +kubebuilder:validation:XValidation:rule="self.type != 'dataset' || !has(self.volblocksize)",message="spec.volblocksize is only valid when type is zvol"
+// FilesystemConfig holds the options that apply only to a filesystem dataset
+// (type=filesystem). It is a discriminated-union arm of ZfsVolumeSpec: it must
+// be set when (and only when) type is filesystem.
+type FilesystemConfig struct {
+	// Quota caps the dataset's referenced space (ZFS "refquota"). When omitted or
+	// zero the dataset is unlimited.
+	// +optional
+	Quota *resource.Quantity `json:"quota,omitempty"`
+}
+
+// VolumeConfig holds the options that apply only to a volume/zvol (type=volume).
+// It is a discriminated-union arm of ZfsVolumeSpec: it must be set when (and
+// only when) type is volume.
+type VolumeConfig struct {
+	// Size is the logical volume size of the zvol. It is required.
+	Size resource.Quantity `json:"size"`
+
+	// Volblocksize sets the zvol's block size (ZFS "volblocksize"), e.g. "16k". It
+	// is fixed at creation; empty means the ZFS default.
+	// +optional
+	Volblocksize string `json:"volblocksize,omitempty"`
+}
+
+// ZfsVolumeSpec is the desired allocation of a ZFS dataset on the pool identified
+// by PoolGUID. It expresses storage intent only (create/size); the network
+// export of the resulting path is a separate concern (ZfsShare -> NetworkExport).
+// The agent on the node currently hosting the pool reconciles it.
+//
+// Type-specific options live in a nested discriminated union: exactly the arm
+// matching Type is honoured. Use Filesystem for type=filesystem and Volume for
+// type=volume; the other arm must be absent.
+// +kubebuilder:validation:XValidation:rule="self.type != 'volume' || has(self.volume)",message="spec.volume is required when type is volume"
+// +kubebuilder:validation:XValidation:rule="self.type != 'volume' || !has(self.filesystem)",message="spec.filesystem is only valid when type is filesystem"
+// +kubebuilder:validation:XValidation:rule="self.type != 'filesystem' || !has(self.volume)",message="spec.volume is only valid when type is volume"
 type ZfsVolumeSpec struct {
 	// PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name, without
 	// the "zpool-" prefix) that this volume is allocated on. The agent derives the
@@ -44,31 +72,30 @@ type ZfsVolumeSpec struct {
 	PoolGUID string `json:"poolGUID"`
 
 	// Dataset is the logical dataset path relative to the pool root, e.g.
-	// "k8s/pvc-123". It is immutable for the lifetime of the volume.
+	// "k8s/pvc-123". It names the ZFS object (filesystem or volume) and is
+	// immutable for the lifetime of the volume.
 	// +kubebuilder:validation:MinLength=1
 	Dataset string `json:"dataset"`
 
-	// Type selects a filesystem dataset or a block zvol.
+	// Type selects a filesystem or a volume/zvol and determines which of the
+	// Filesystem/Volume option arms is honoured.
 	Type VolumeType `json:"type"`
-
-	// Quota caps a dataset's referenced space (ZFS "quota"/"refquota"). Applies to
-	// type=dataset only; when omitted or zero the dataset is unlimited.
-	// +optional
-	Quota *resource.Quantity `json:"quota,omitempty"`
-
-	// Size is the logical volume size of a zvol. Required for type=zvol.
-	// +optional
-	Size *resource.Quantity `json:"size,omitempty"`
-
-	// Volblocksize sets a zvol's block size (ZFS "volblocksize"), e.g. "16k". It
-	// is fixed at creation. Applies to type=zvol only; empty means the ZFS default.
-	// +optional
-	Volblocksize string `json:"volblocksize,omitempty"`
 
 	// Properties are extra ZFS properties applied verbatim at creation, e.g.
 	// {"compression": "lz4", "recordsize": "1M"}. Keys are ZFS property names.
+	// They apply to both filesystem and volume datasets.
 	// +optional
 	Properties map[string]string `json:"properties,omitempty"`
+
+	// Filesystem holds filesystem-only options. Set it when (and only when)
+	// type=filesystem.
+	// +optional
+	Filesystem *FilesystemConfig `json:"filesystem,omitempty"`
+
+	// Volume holds volume/zvol-only options. Set it when (and only when)
+	// type=volume.
+	// +optional
+	Volume *VolumeConfig `json:"volume,omitempty"`
 }
 
 // ZfsVolumeStatus reports the observed allocation state on the node.
