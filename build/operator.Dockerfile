@@ -9,11 +9,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" \
-    -o /out/zpool-watcher ./cmd/zpool-watcher
+    -o /out/operator ./cmd/operator
 
 # ---- runtime ----
-# The Tier 2 watcher only talks to the Kubernetes API (watching Nodes, patching
-# ZfsPool status), so a static distroless image suffices.
+# The operator only talks to the Kubernetes API (watching Nodes, patching
+# ZfsPool status, rendering NetworkExports), so a static distroless image suffices.
 FROM gcr.io/distroless/static:latest
-COPY --from=build /out/zpool-watcher /usr/local/bin/zpool-watcher
-ENTRYPOINT ["/usr/local/bin/zpool-watcher"]
+COPY --from=build /out/operator /usr/local/bin/operator
+ENTRYPOINT ["/usr/local/bin/operator"]

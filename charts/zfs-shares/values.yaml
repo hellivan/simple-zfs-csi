@@ -142,27 +142,28 @@ discovery:
     metrics: 8084
     health: 8085
 
-# -------- ZfsPool watcher (Tier 2: central Deployment) --------
-watcher:
-  # -- Deploy the central node-death watcher that offlines dead nodes' ZfsPools.
+# -------- Operator (cluster-wide control-plane Deployment) --------
+operator:
+  # -- Deploy the cluster-wide operator: node-death watcher (offlines dead nodes'
+  # -- ZfsPools) plus the cluster-scoped reconcilers it hosts.
   enabled: true
   # -- Number of replicas (leader election ensures only one acts at a time).
   replicas: 1
   image:
-    # -- Override the full watcher image (registry/repo:tag). Empty derives it from `image.*`.
+    # -- Override the full operator image (registry/repo:tag). Empty derives it from `image.*`.
     repository: ""
     tag: ""
-  # -- Enable leader election across watcher replicas.
+  # -- Enable leader election across operator replicas.
   leaderElect: true
-  # -- Extra CLI args for the zpool-watcher binary.
+  # -- Extra CLI args for the operator binary.
   extraArgs: []
   # -- Resource requests/limits.
   resources: {}
   # -- Pod annotations.
   podAnnotations: {}
-  # -- Node selector for the watcher pod (runs anywhere; not a storage node).
+  # -- Node selector for the operator pod (runs anywhere; not a storage node).
   nodeSelector: {}
-  # -- Tolerations for the watcher pod.
+  # -- Tolerations for the operator pod.
   tolerations: []
   ports:
     metrics: 8086

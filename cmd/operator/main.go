@@ -1,7 +1,9 @@
-// Command zpool-watcher is the Tier 2 monitor. It runs as a single-replica
-// Deployment anywhere in the cluster, watches core Node objects, and forcibly
-// marks the ZfsPool objects of a dead storage node as NODE_OFFLINE so CSI node
-// plugins fail fast instead of hanging on an unreachable target.
+// Command operator is the cluster-wide control-plane manager. It runs as a
+// single-active (leader-elected) Deployment anywhere in the cluster and hosts
+// the unprivileged, cluster-scoped reconcilers:
+//   - the pool watcher: watches core Node objects and forcibly marks the
+//     ZfsPool objects of a dead storage node as NODE_OFFLINE so CSI node
+//     plugins fail fast instead of hanging on an unreachable target.
 package main
 
 import (
@@ -35,7 +37,7 @@ func main() {
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe binds to.")
-	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election so only one watcher acts at a time.")
+	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election so only one operator acts at a time.")
 	flag.StringVar(&leaderElecNS, "leader-election-namespace", os.Getenv("POD_NAMESPACE"), "Namespace for the leader-election lease (defaults to $POD_NAMESPACE).")
 
 	opts := zap.Options{Development: false}
@@ -51,7 +53,7 @@ func main() {
 		Metrics:                 metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress:  probeAddr,
 		LeaderElection:          leaderElect,
-		LeaderElectionID:        "zfspool-watcher.storage.zfs-shares.io",
+		LeaderElectionID:        "operator.storage.zfs-shares.io",
 		LeaderElectionNamespace: leaderElecNS,
 	})
 	if err != nil {
@@ -75,7 +77,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting zpool-watcher", "leaderElection", leaderElect)
+	setupLog.Info("starting operator", "leaderElection", leaderElect)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "manager exited with error")
 		os.Exit(1)

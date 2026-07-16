@@ -1,52 +1,52 @@
-{{- if .Values.watcher.enabled }}
+{{- if .Values.operator.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-watcher
+  name: {{ include "zfs-shares.fullname" . }}-operator
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "zfs-shares.labels" . | nindent 4 }}
-    app.kubernetes.io/component: watcher
+    app.kubernetes.io/component: operator
 spec:
-  replicas: {{ .Values.watcher.replicas }}
+  replicas: {{ .Values.operator.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: watcher
+      app.kubernetes.io/component: operator
   template:
     metadata:
       labels:
         {{- include "zfs-shares.labels" . | nindent 8 }}
-        app.kubernetes.io/component: watcher
-      {{- with .Values.watcher.podAnnotations }}
+        app.kubernetes.io/component: operator
+      {{- with .Values.operator.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "watcher") }}
+      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "operator") }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.watcher.nodeSelector }}
+      {{- with .Values.operator.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.watcher.tolerations }}
+      {{- with .Values.operator.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: zpool-watcher
-          image: {{ include "zfs-shares.image" (dict "root" . "component" "watcher") }}
+        - name: operator
+          image: {{ include "zfs-shares.image" (dict "root" . "component" "operator") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - --leader-elect={{ .Values.watcher.leaderElect }}
+            - --leader-elect={{ .Values.operator.leaderElect }}
             - --leader-election-namespace=$(POD_NAMESPACE)
-            - --metrics-bind-address=:{{ .Values.watcher.ports.metrics }}
-            - --health-probe-bind-address=:{{ .Values.watcher.ports.health }}
-            {{- with .Values.watcher.extraArgs }}
+            - --metrics-bind-address=:{{ .Values.operator.ports.metrics }}
+            - --health-probe-bind-address=:{{ .Values.operator.ports.health }}
+            {{- with .Values.operator.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           env:
@@ -56,20 +56,20 @@ spec:
                   fieldPath: metadata.namespace
           ports:
             - name: metrics
-              containerPort: {{ .Values.watcher.ports.metrics }}
+              containerPort: {{ .Values.operator.ports.metrics }}
           livenessProbe:
             httpGet:
               path: /healthz
-              port: {{ .Values.watcher.ports.health }}
+              port: {{ .Values.operator.ports.health }}
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
             httpGet:
               path: /readyz
-              port: {{ .Values.watcher.ports.health }}
+              port: {{ .Values.operator.ports.health }}
             initialDelaySeconds: 5
             periodSeconds: 10
-          {{- with .Values.watcher.resources }}
+          {{- with .Values.operator.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}

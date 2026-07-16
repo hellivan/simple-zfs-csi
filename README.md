@@ -10,7 +10,7 @@ per-node controllers turn that intent into live exports:
 | `nfs-controller` | `zfs-shares-nfs` | `protocol: nfs` shares | writes `/etc/exports`, runs `exportfs -ra`, supervises the in-container NFS server |
 | `nvmeof-controller` | `zfs-shares-nvmeof` | `protocol: nvmeof` shares | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
 | `zpool-discovery` | `zfs-shares-discovery` | local ZFS pools (Tier 1) | polls `zpool`/`zfs`, publishes each pool's identity, routing and health into `ZfsPool` objects |
-| `zpool-watcher` | `zfs-shares-watcher` | core `Node` objects (Tier 2) | detects node death and forces stale `ZfsPool` status to `NODE_OFFLINE` |
+| `operator` | `zfs-shares-operator` | core `Node` objects (Tier 2) | cluster-wide control plane: detects node death and forces stale `ZfsPool` status to `NODE_OFFLINE` |
 
 Storage *allocation* (creating datasets/zvols, quotas, snapshots) is intentionally
 **out of scope** here — that is owned by the CSI/storage plane. `ZfsShare` carries
@@ -109,7 +109,7 @@ in sync so CSI clients never route to a dead target:
   Talos documents for the `siderolabs/zfs` extension) so the CLI can never drift
   from the host ZFS kernel module. Switch to `nsenter` or the in-image tools via
   `discovery.hostExec.*` in values.
-- **Tier 2 — `zpool-watcher` (single Deployment):** watches core `Node` objects
+- **Tier 2 — `operator` (single Deployment):** watches core `Node` objects
   and, when a node goes `NotReady` (or vanishes), forcibly sets every `ZfsPool` it
   last served to `status.health: NODE_OFFLINE`. A completely dead node can't
   self-report, so this override is what prevents a stale `ONLINE` at a dead IP.

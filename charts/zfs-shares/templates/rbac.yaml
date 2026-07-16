@@ -82,16 +82,17 @@ subjects:
     name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "discovery") }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
-{{- if .Values.watcher.enabled }}
+{{- if .Values.operator.enabled }}
 ---
-# Tier 2 watcher: watches Nodes and offlines dead nodes' ZfsPool status.
+# Operator: cluster-wide control plane. Watches Nodes and offlines dead nodes'
+# ZfsPool status; hosts the cluster-scoped reconcilers.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-watcher
+  name: {{ include "zfs-shares.fullname" . }}-operator
   labels:
     {{- include "zfs-shares.labels" . | nindent 4 }}
-    app.kubernetes.io/component: watcher
+    app.kubernetes.io/component: operator
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
@@ -106,29 +107,29 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-watcher
+  name: {{ include "zfs-shares.fullname" . }}-operator
   labels:
     {{- include "zfs-shares.labels" . | nindent 4 }}
-    app.kubernetes.io/component: watcher
+    app.kubernetes.io/component: operator
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "zfs-shares.fullname" . }}-watcher
+  name: {{ include "zfs-shares.fullname" . }}-operator
 subjects:
   - kind: ServiceAccount
-    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "watcher") }}
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "operator") }}
     namespace: {{ .Release.Namespace }}
-{{- if .Values.watcher.leaderElect }}
+{{- if .Values.operator.leaderElect }}
 ---
-# Namespaced permissions for the watcher's leader-election lease.
+# Namespaced permissions for the operator's leader-election lease.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-watcher-leaderelection
+  name: {{ include "zfs-shares.fullname" . }}-operator-leaderelection
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "zfs-shares.labels" . | nindent 4 }}
-    app.kubernetes.io/component: watcher
+    app.kubernetes.io/component: operator
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
@@ -140,18 +141,18 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-watcher-leaderelection
+  name: {{ include "zfs-shares.fullname" . }}-operator-leaderelection
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "zfs-shares.labels" . | nindent 4 }}
-    app.kubernetes.io/component: watcher
+    app.kubernetes.io/component: operator
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ include "zfs-shares.fullname" . }}-watcher-leaderelection
+  name: {{ include "zfs-shares.fullname" . }}-operator-leaderelection
 subjects:
   - kind: ServiceAccount
-    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "watcher") }}
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "operator") }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- end }}

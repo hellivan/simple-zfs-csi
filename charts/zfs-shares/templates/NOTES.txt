@@ -10,8 +10,8 @@ Enabled controllers:
 {{- if .Values.discovery.enabled }}
   - Discovery (DaemonSet {{ include "zfs-shares.fullname" . }}-discovery, Tier 1 ZfsPool health)
 {{- end }}
-{{- if .Values.watcher.enabled }}
-  - Watcher   (Deployment {{ include "zfs-shares.fullname" . }}-watcher, Tier 2 node-death detection)
+{{- if .Values.operator.enabled }}
+  - Operator  (Deployment {{ include "zfs-shares.fullname" . }}-operator, cluster-wide control plane: node-death detection)
 {{- end }}
 
 Next steps:

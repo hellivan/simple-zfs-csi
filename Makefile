@@ -5,7 +5,7 @@ TAG      ?= latest
 NFS_IMG      ?= $(REGISTRY)/zfs-shares-nfs:$(TAG)
 NVMEOF_IMG   ?= $(REGISTRY)/zfs-shares-nvmeof:$(TAG)
 DISCOVERY_IMG ?= $(REGISTRY)/zfs-shares-discovery:$(TAG)
-WATCHER_IMG   ?= $(REGISTRY)/zfs-shares-watcher:$(TAG)
+OPERATOR_IMG  ?= $(REGISTRY)/zfs-shares-operator:$(TAG)
 
 CONTROLLER_GEN_VERSION ?= v0.16.5
 CHART_DIR ?= charts/zfs-shares
@@ -50,19 +50,19 @@ docker-nvmeof:
 docker-discovery:
 	docker build -f build/discovery.Dockerfile -t $(DISCOVERY_IMG) .
 
-.PHONY: docker-watcher
-docker-watcher:
-	docker build -f build/watcher.Dockerfile -t $(WATCHER_IMG) .
+.PHONY: docker-operator
+docker-operator:
+	docker build -f build/operator.Dockerfile -t $(OPERATOR_IMG) .
 
 .PHONY: docker
-docker: docker-nfs docker-nvmeof docker-discovery docker-watcher
+docker: docker-nfs docker-nvmeof docker-discovery docker-operator
 
 .PHONY: docker-push
 docker-push: docker
 	docker push $(NFS_IMG)
 	docker push $(NVMEOF_IMG)
 	docker push $(DISCOVERY_IMG)
-	docker push $(WATCHER_IMG)
+	docker push $(OPERATOR_IMG)
 
 ## Install just the CRD from the chart's Helm-native crds/ directory. Use this to
 ## roll a schema change, since `helm upgrade` never updates crds/ resources.
