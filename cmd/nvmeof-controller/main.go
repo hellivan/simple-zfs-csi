@@ -1,4 +1,4 @@
-// Command nvmeof-controller reconciles nvmeof-protocol ZfsShare objects for the
+// Command nvmeof-controller reconciles nvmeof-protocol NetworkExport objects for the
 // node it runs on into the kernel NVMe target (nvmet) via configfs.
 package main
 

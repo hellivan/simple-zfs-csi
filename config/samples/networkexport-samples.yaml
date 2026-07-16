@@ -1,8 +1,8 @@
 ---
-# Dynamically export a ZFS dataset over NFS (RWX). The dataset must already be
-# provisioned/mounted on the node by the storage plane.
+# Export an already-mounted filesystem path over NFS (RWX). The path must already
+# be provisioned/mounted on the node by the storage plane.
 apiVersion: storage.zfs-shares.io/v1alpha1
-kind: ZfsShare
+kind: NetworkExport
 metadata:
   name: pvc-media-movies
 spec:
@@ -14,9 +14,10 @@ spec:
       - client: "10.0.0.0/24"
         options: ["rw", "sync", "no_subtree_check", "no_root_squash"]
 ---
-# Export a ZFS zvol over NVMe-oF (TCP). The zvol device must already exist.
+# Export an already-existing block device over NVMe-oF (TCP). The device must
+# already exist.
 apiVersion: storage.zfs-shares.io/v1alpha1
-kind: ZfsShare
+kind: NetworkExport
 metadata:
   name: pvc-postgres-data
 spec:

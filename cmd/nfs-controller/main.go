@@ -1,4 +1,4 @@
-// Command nfs-controller reconciles nfs-protocol ZfsShare objects for the node
+// Command nfs-controller reconciles nfs-protocol NetworkExport objects for the node
 // it runs on and serves them from an in-container NFS server.
 package main
 

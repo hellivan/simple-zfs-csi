@@ -1,4 +1,4 @@
-// Package nfsserver renders /etc/exports from ZfsShare intent and supervises the
+// Package nfsserver renders /etc/exports from NetworkExport intent and supervises the
 // in-container NFS server daemons (rpcbind, rpc.mountd, nfsd kernel threads).
 package nfsserver
 
@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// DefaultOptions are applied to a client when the ZfsShare specifies none.
+// DefaultOptions are applied to a client when the NetworkExport specifies none.
 //
 // no_root_squash lets containerized workloads that run as root write to the
 // share (required by most RWX Kubernetes use cases). Override per-client via

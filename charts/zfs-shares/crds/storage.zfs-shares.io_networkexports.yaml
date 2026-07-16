@@ -4,16 +4,16 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: zfsshares.storage.zfs-shares.io
+  name: networkexports.storage.zfs-shares.io
 spec:
   group: storage.zfs-shares.io
   names:
-    kind: ZfsShare
-    listKind: ZfsShareList
-    plural: zfsshares
+    kind: NetworkExport
+    listKind: NetworkExportList
+    plural: networkexports
     shortNames:
-    - zshare
-    singular: zfsshare
+    - nexport
+    singular: networkexport
   scope: Cluster
   versions:
   - additionalPrinterColumns:
@@ -36,8 +36,10 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          ZfsShare is the Schema for the zfsshares API. It represents an "intent to
-          share" a ZFS path over the network from a specific storage node.
+          NetworkExport is the Schema for the networkexports API. It is a generic,
+          storage-agnostic "intent to export" a node-local path over the network from a
+          specific node. It is the only resource the node-local NFS / NVMe-oF
+          aggregators execute; ZFS-centric intent (ZfsShare) compiles down into it.
         properties:
           apiVersion:
             description: |-
@@ -58,9 +60,11 @@ spec:
             type: object
           spec:
             description: |-
-              ZfsShareSpec describes the desired network export of an already-provisioned
-              ZFS dataset (NFS) or zvol (NVMe-oF). It carries no storage-sizing parameters;
-              allocation is owned by the CSI/storage plane.
+              NetworkExportSpec describes the desired network export of an already-existing
+              node-local path: a filesystem mountpoint (NFS) or a block device (NVMe-oF).
+              It is storage-agnostic — it carries no ZFS or sizing parameters. Higher-level
+              controllers (e.g. the ZfsShare reconciler) compile their intent down into a
+              NetworkExport, which is the only contract the node-local aggregators execute.
             properties:
               nfs:
                 description: NFS holds NFS-specific export configuration. Required
@@ -97,7 +101,7 @@ spec:
               nodeName:
                 description: |-
                   NodeName pins the export to the physical storage node that holds the
-                  underlying ZFS path. Only the controller running on this node acts on it.
+                  underlying path. Only the controller running on this node acts on it.
                 minLength: 1
                 type: string
               nvmeof:
@@ -120,8 +124,8 @@ spec:
               path:
                 description: |-
                   Path is the local, node-side source of the export.
-                  For nfs: the dataset mountpoint to export, e.g. "/tank/k8s/pvc-123".
-                  For nvmeof: the zvol block device, e.g. "/dev/zvol/tank/pvc-123".
+                  For nfs: the mountpoint to export, e.g. "/tank/k8s/pvc-123".
+                  For nvmeof: the block device, e.g. "/dev/zvol/tank/pvc-123".
                 minLength: 1
                 type: string
               protocol:
@@ -141,7 +145,8 @@ spec:
             - message: spec.nvmeof is required when protocol is nvmeof
               rule: self.protocol != 'nvmeof' || has(self.nvmeof)
           status:
-            description: ZfsShareStatus reports the observed export state on the node.
+            description: NetworkExportStatus reports the observed export state on
+              the node.
             properties:
               conditions:
                 description: Conditions represents the latest available observations.
@@ -208,7 +213,7 @@ spec:
                   phase.
                 type: string
               nqn:
-                description: NQN is the effective subsystem NQN for nvmeof shares.
+                description: NQN is the effective subsystem NQN for nvmeof exports.
                 type: string
               observedGeneration:
                 description: ObservedGeneration is the spec generation last reconciled.

@@ -27,9 +27,9 @@ Next steps:
      - NFS pool root hostPath: {{ .Values.nfs.pool.hostPath }} (adjust nfs.pool.* if different)
 {{- end }}
 
-3. Create a ZfsShare:
+3. Create a NetworkExport:
 
-     kubectl get zfsshares
+     kubectl get networkexports
 {{- if .Values.discovery.enabled }}
 
 4. Watch discovered pools appear as ZfsPool objects (name = ZFS pool GUID):
@@ -37,7 +37,7 @@ Next steps:
      kubectl get zfspools
 {{- end }}
 
-NOTE ON UPGRADES: the ZfsShare and ZfsPool CRDs are installed from the chart's
+NOTE ON UPGRADES: the NetworkExport and ZfsPool CRDs are installed from the chart's
 crds/ directory. `helm upgrade` does NOT update them (no Helm flag does). After
 upgrading to a release that changes a CRD schema, apply the CRDs manually first:
 

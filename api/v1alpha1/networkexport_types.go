@@ -4,37 +4,39 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// Protocol selects the network sharing backend for a ZfsShare.
+// Protocol selects the network sharing backend for a NetworkExport.
 // +kubebuilder:validation:Enum=nfs;nvmeof
 type Protocol string
 
 const (
-	// ProtocolNFS exports a ZFS dataset mountpoint over NFS.
+	// ProtocolNFS exports a filesystem mountpoint over NFS.
 	ProtocolNFS Protocol = "nfs"
-	// ProtocolNVMeoF exports a ZFS zvol block device over NVMe-oF (TCP).
+	// ProtocolNVMeoF exports a block device over NVMe-oF (TCP).
 	ProtocolNVMeoF Protocol = "nvmeof"
 )
 
-// ZfsSharePhase is a high-level summary of the share state.
-type ZfsSharePhase string
+// NetworkExportPhase is a high-level summary of the export state.
+type NetworkExportPhase string
 
 const (
-	// PhasePending means the share has not been configured on the node yet.
-	PhasePending ZfsSharePhase = "Pending"
-	// PhaseExported means the share is actively exported on the node.
-	PhaseExported ZfsSharePhase = "Exported"
+	// PhasePending means the export has not been configured on the node yet.
+	PhasePending NetworkExportPhase = "Pending"
+	// PhaseExported means the export is actively served on the node.
+	PhaseExported NetworkExportPhase = "Exported"
 	// PhaseError means the last reconcile attempt failed.
-	PhaseError ZfsSharePhase = "Error"
+	PhaseError NetworkExportPhase = "Error"
 )
 
-// ZfsShareSpec describes the desired network export of an already-provisioned
-// ZFS dataset (NFS) or zvol (NVMe-oF). It carries no storage-sizing parameters;
-// allocation is owned by the CSI/storage plane.
+// NetworkExportSpec describes the desired network export of an already-existing
+// node-local path: a filesystem mountpoint (NFS) or a block device (NVMe-oF).
+// It is storage-agnostic — it carries no ZFS or sizing parameters. Higher-level
+// controllers (e.g. the ZfsShare reconciler) compile their intent down into a
+// NetworkExport, which is the only contract the node-local aggregators execute.
 // +kubebuilder:validation:XValidation:rule="self.protocol != 'nfs' || has(self.nfs)",message="spec.nfs is required when protocol is nfs"
 // +kubebuilder:validation:XValidation:rule="self.protocol != 'nvmeof' || has(self.nvmeof)",message="spec.nvmeof is required when protocol is nvmeof"
-type ZfsShareSpec struct {
+type NetworkExportSpec struct {
 	// NodeName pins the export to the physical storage node that holds the
-	// underlying ZFS path. Only the controller running on this node acts on it.
+	// underlying path. Only the controller running on this node acts on it.
 	// +kubebuilder:validation:MinLength=1
 	NodeName string `json:"nodeName"`
 
@@ -42,8 +44,8 @@ type ZfsShareSpec struct {
 	Protocol Protocol `json:"protocol"`
 
 	// Path is the local, node-side source of the export.
-	// For nfs: the dataset mountpoint to export, e.g. "/tank/k8s/pvc-123".
-	// For nvmeof: the zvol block device, e.g. "/dev/zvol/tank/pvc-123".
+	// For nfs: the mountpoint to export, e.g. "/tank/k8s/pvc-123".
+	// For nvmeof: the block device, e.g. "/dev/zvol/tank/pvc-123".
 	// +kubebuilder:validation:MinLength=1
 	Path string `json:"path"`
 
@@ -56,7 +58,7 @@ type ZfsShareSpec struct {
 	NVMeoF *NVMeoFExportSpec `json:"nvmeof,omitempty"`
 }
 
-// NFSExportSpec configures how a dataset is exported via NFS.
+// NFSExportSpec configures how a mountpoint is exported via NFS.
 type NFSExportSpec struct {
 	// Clients is the set of client match specs allowed to mount the export.
 	// Each entry maps to one line fragment in /etc/exports.
@@ -77,7 +79,7 @@ type NFSClient struct {
 	Options []string `json:"options,omitempty"`
 }
 
-// NVMeoFExportSpec configures how a zvol is exported via NVMe-oF (TCP).
+// NVMeoFExportSpec configures how a block device is exported via NVMe-oF (TCP).
 type NVMeoFExportSpec struct {
 	// NQN is the subsystem NQN clients use to connect. When empty the controller
 	// derives a deterministic NQN from the resource metadata.
@@ -90,17 +92,17 @@ type NVMeoFExportSpec struct {
 	AllowedHosts []string `json:"allowedHosts,omitempty"`
 }
 
-// ZfsShareStatus reports the observed export state on the node.
-type ZfsShareStatus struct {
+// NetworkExportStatus reports the observed export state on the node.
+type NetworkExportStatus struct {
 	// Phase is a coarse summary of the current state.
 	// +optional
-	Phase ZfsSharePhase `json:"phase,omitempty"`
+	Phase NetworkExportPhase `json:"phase,omitempty"`
 
 	// ObservedGeneration is the spec generation last reconciled.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// NQN is the effective subsystem NQN for nvmeof shares.
+	// NQN is the effective subsystem NQN for nvmeof exports.
 	// +optional
 	NQN string `json:"nqn,omitempty"`
 
@@ -117,32 +119,34 @@ type ZfsShareStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster,shortName=zshare
+// +kubebuilder:resource:scope=Cluster,shortName=nexport
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.spec.nodeName`
 // +kubebuilder:printcolumn:name="Protocol",type=string,JSONPath=`.spec.protocol`
 // +kubebuilder:printcolumn:name="Path",type=string,JSONPath=`.spec.path`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// ZfsShare is the Schema for the zfsshares API. It represents an "intent to
-// share" a ZFS path over the network from a specific storage node.
-type ZfsShare struct {
+// NetworkExport is the Schema for the networkexports API. It is a generic,
+// storage-agnostic "intent to export" a node-local path over the network from a
+// specific node. It is the only resource the node-local NFS / NVMe-oF
+// aggregators execute; ZFS-centric intent (ZfsShare) compiles down into it.
+type NetworkExport struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ZfsShareSpec   `json:"spec,omitempty"`
-	Status ZfsShareStatus `json:"status,omitempty"`
+	Spec   NetworkExportSpec   `json:"spec,omitempty"`
+	Status NetworkExportStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// ZfsShareList contains a list of ZfsShare.
-type ZfsShareList struct {
+// NetworkExportList contains a list of NetworkExport.
+type NetworkExportList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ZfsShare `json:"items"`
+	Items           []NetworkExport `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&ZfsShare{}, &ZfsShareList{})
+	SchemeBuilder.Register(&NetworkExport{}, &NetworkExportList{})
 }

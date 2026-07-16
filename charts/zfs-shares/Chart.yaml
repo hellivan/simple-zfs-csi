@@ -1,6 +1,6 @@
 apiVersion: v2
 name: zfs-shares
-description: Cloud-native network sharing of pre-provisioned ZFS storage on Talos (NFS + NVMe-oF controllers driven by the ZfsShare CRD).
+description: Cloud-native network sharing of pre-provisioned ZFS storage on Talos (NFS + NVMe-oF controllers driven by the NetworkExport CRD).
 type: application
 # version is the chart version; appVersion tracks the container image tag.
 # Both are overwritten by the release pipeline from the git tag.

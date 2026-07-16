@@ -14,7 +14,7 @@ import (
 	"github.com/hellivan/zfs-shares/internal/nfsserver"
 )
 
-// NFSReconciler reconciles nfs-protocol ZfsShares for a single node into the
+// NFSReconciler reconciles nfs-protocol NetworkExports for a single node into the
 // kernel NFS export table.
 type NFSReconciler struct {
 	client.Client
@@ -22,14 +22,14 @@ type NFSReconciler struct {
 	Exports  *nfsserver.ExportManager
 }
 
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfsshares,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfsshares/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=networkexports,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=networkexports/status,verbs=get;update;patch
 
-// Reconcile rebuilds /etc/exports from all nfs shares owned by this node.
+// Reconcile rebuilds /etc/exports from all nfs exports owned by this node.
 func (r *NFSReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	shares, err := listOwnedShares(ctx, r.Client, r.NodeName, storagev1alpha1.ProtocolNFS)
+	shares, err := listOwnedExports(ctx, r.Client, r.NodeName, storagev1alpha1.ProtocolNFS)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -59,7 +59,7 @@ func (r *NFSReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	return ctrl.Result{}, nil
 }
 
-func (r *NFSReconciler) markInvalid(ctx context.Context, s *storagev1alpha1.ZfsShare, msg string) {
+func (r *NFSReconciler) markInvalid(ctx context.Context, s *storagev1alpha1.NetworkExport, msg string) {
 	if err := updateStatus(ctx, r.Client, s, storagev1alpha1.PhaseError, "InvalidSpec", msg, ""); err != nil {
 		log.FromContext(ctx).Error(err, "status update failed", "share", s.Name)
 	}
@@ -88,8 +88,8 @@ func (r *NFSReconciler) markExportedForRequest(ctx context.Context, req ctrl.Req
 	}
 }
 
-func (r *NFSReconciler) getRequested(ctx context.Context, req ctrl.Request) (*storagev1alpha1.ZfsShare, bool) {
-	var s storagev1alpha1.ZfsShare
+func (r *NFSReconciler) getRequested(ctx context.Context, req ctrl.Request) (*storagev1alpha1.NetworkExport, bool) {
+	var s storagev1alpha1.NetworkExport
 	if err := r.Get(ctx, req.NamespacedName, &s); err != nil {
 		if !apierrors.IsNotFound(err) {
 			log.FromContext(ctx).Error(err, "get share for status", "share", req.Name)
@@ -105,9 +105,9 @@ func (r *NFSReconciler) getRequested(ctx context.Context, req ctrl.Request) (*st
 // SetupWithManager wires the reconciler into the manager.
 func (r *NFSReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.ZfsShare{}).
+		For(&storagev1alpha1.NetworkExport{}).
 		WithEventFilter(nodeProtocolPredicate(r.NodeName, storagev1alpha1.ProtocolNFS)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Named("nfs-zfsshare").
+		Named("nfs-networkexport").
 		Complete(r)
 }

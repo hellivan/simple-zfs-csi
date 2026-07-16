@@ -90,7 +90,7 @@ helm-install:
 		--namespace zfs-shares --create-namespace
 
 ## Uninstall the chart. Helm never deletes CRDs installed from crds/, so the
-## ZfsShare CRD (and any ZfsShare objects) are retained.
+## NetworkExport CRD (and any NetworkExport objects) are retained.
 .PHONY: helm-uninstall
 helm-uninstall:
 	helm uninstall zfs-shares --namespace zfs-shares

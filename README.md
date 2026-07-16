@@ -1,25 +1,25 @@
 # zfs-shares
 
 Cloud-native network sharing of pre-provisioned ZFS storage on Talos Linux
-(no SSH, no systemd-in-a-pod). A single cluster-scoped CRD, `ZfsShare`, expresses
-the intent to export a ZFS path from a specific storage node. Two lightweight,
+(no SSH, no systemd-in-a-pod). A generic, cluster-scoped CRD, `NetworkExport`, expresses
+the intent to export a node-local path from a specific storage node. Two lightweight,
 per-node controllers turn that intent into live exports:
 
 | Controller | Image | Reconciles | Mechanism |
 |------------|-------|------------|-----------|
-| `nfs-controller` | `zfs-shares-nfs` | `protocol: nfs` shares | writes `/etc/exports`, runs `exportfs -ra`, supervises the in-container NFS server |
-| `nvmeof-controller` | `zfs-shares-nvmeof` | `protocol: nvmeof` shares | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
+| `nfs-controller` | `zfs-shares-nfs` | `protocol: nfs` exports | writes `/etc/exports`, runs `exportfs -ra`, supervises the in-container NFS server |
+| `nvmeof-controller` | `zfs-shares-nvmeof` | `protocol: nvmeof` exports | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
 | `zpool-discovery` | `zfs-shares-discovery` | local ZFS pools (Tier 1) | polls `zpool`/`zfs`, publishes each pool's identity, routing and health into `ZfsPool` objects |
 | `operator` | `zfs-shares-operator` | core `Node` objects (Tier 2) | cluster-wide control plane: detects node death and forces stale `ZfsPool` status to `NODE_OFFLINE` |
 
 Storage *allocation* (creating datasets/zvols, quotas, snapshots) is intentionally
-**out of scope** here — that is owned by the CSI/storage plane. `ZfsShare` carries
+**out of scope** here — that is owned by the CSI/storage plane. `NetworkExport` carries
 no sizing parameters; it is strictly an "intent to share" over the network.
 
 ## Architecture
 
 ```
-[ ZfsShare CRD (etcd = source of truth) ]
+[ NetworkExport CRD (etcd = source of truth) ]
 			│  spec.nodeName + spec.protocol
 	 ┌──────────────┴───────────────┐
 	 ▼                              ▼
@@ -36,7 +36,7 @@ Each controller:
 - Acts **only** on shares whose `spec.nodeName` matches its own `$NODE_NAME`
   (injected via the downward API) and whose `spec.protocol` matches.
 - Is **level-driven**: every event triggers a full rebuild of that node's export
-  set from the complete list of owned `ZfsShare` objects, so state is always
+  set from the complete list of owned `NetworkExport` objects, so state is always
   reconstructed from etcd (self-healing across pod/node restarts).
 - Runs with `MaxConcurrentReconciles: 1`; no leader election (one owner per node).
 
@@ -58,11 +58,11 @@ children** (their logs are piped to the controller's stdout), starts the `nfsd`
 kernel threads, and treats the death of any critical daemon as fatal — the
 container exits non-zero and Kubernetes restarts the pod.
 
-## The `ZfsShare` resource
+## The `NetworkExport` resource
 
 ```yaml
 apiVersion: storage.zfs-shares.io/v1alpha1
-kind: ZfsShare
+kind: NetworkExport
 metadata:
   name: pvc-media-movies
 spec:
@@ -77,7 +77,7 @@ spec:
 
 ```yaml
 apiVersion: storage.zfs-shares.io/v1alpha1
-kind: ZfsShare
+kind: NetworkExport
 metadata:
   name: pvc-postgres-data
 spec:
@@ -182,7 +182,7 @@ Common values (see [charts/zfs-shares/values.yaml](charts/zfs-shares/values.yaml
 
 ### CRD management & upgrades
 
-The `ZfsShare` CRD is generated from the Go types (`make manifests`) and shipped
+The `NetworkExport` CRD is generated from the Go types (`make manifests`) and shipped
 in the chart's Helm-native [charts/zfs-shares/crds](charts/zfs-shares/crds)
 directory. Helm treats `crds/` specially:
 
@@ -206,8 +206,8 @@ directory. Helm treats `crds/` specially:
 
   `kubectl apply` on a CRD is additive and safe for the schema changes this
   project makes (adding fields/validations). Never `kubectl delete` the CRD to
-  "refresh" it — that cascade-deletes every `ZfsShare` object.
-- **Uninstall:** Helm does not remove `crds/` CRDs, so the CRD and any `ZfsShare`
+  "refresh" it — that cascade-deletes every `NetworkExport` object.
+- **Uninstall:** Helm does not remove `crds/` CRDs, so the CRD and any `NetworkExport`
   objects are retained by design.
 
 ### Host prerequisites (Talos system extensions)
@@ -244,13 +244,13 @@ version at package time, so `helm install --version 0.1.0` pulls the matching
 ## Repository layout
 
 ```
-api/v1alpha1/            ZfsShare types + generated deepcopy
+api/v1alpha1/            NetworkExport types + generated deepcopy
 cmd/nfs-controller/      NFS controller entrypoint
 cmd/nvmeof-controller/   NVMe-oF controller entrypoint
 internal/controller/     reconcilers (nfs, nvmeof) + shared helpers
 internal/nfsserver/      /etc/exports rendering + NFS daemon supervisor
 internal/nvmet/          nvmet configfs backend
-config/samples/          example ZfsShare objects
+config/samples/          example NetworkExport objects
 charts/zfs-shares/       Helm chart (canonical deploy path; CRD lives here)
 build/                   Dockerfiles (multi-arch)
 .github/workflows/       CI + release pipelines

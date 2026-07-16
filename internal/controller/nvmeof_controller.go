@@ -14,7 +14,7 @@ import (
 	"github.com/hellivan/zfs-shares/internal/nvmet"
 )
 
-// NVMeoFReconciler reconciles nvmeof-protocol ZfsShares for a single node into
+// NVMeoFReconciler reconciles nvmeof-protocol NetworkExports for a single node into
 // the kernel NVMe target (nvmet) configfs tree.
 type NVMeoFReconciler struct {
 	client.Client
@@ -23,14 +23,14 @@ type NVMeoFReconciler struct {
 	NQNPrefix string
 }
 
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfsshares,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfsshares/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=networkexports,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=networkexports/status,verbs=get;update;patch
 
-// Reconcile rebuilds the nvmet target from all nvmeof shares owned by this node.
+// Reconcile rebuilds the nvmet target from all nvmeof exports owned by this node.
 func (r *NVMeoFReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	shares, err := listOwnedShares(ctx, r.Client, r.NodeName, storagev1alpha1.ProtocolNVMeoF)
+	shares, err := listOwnedExports(ctx, r.Client, r.NodeName, storagev1alpha1.ProtocolNVMeoF)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -64,7 +64,7 @@ func (r *NVMeoFReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 }
 
 // effectiveNQN returns the explicit NQN or a deterministic derived one.
-func (r *NVMeoFReconciler) effectiveNQN(s *storagev1alpha1.ZfsShare) string {
+func (r *NVMeoFReconciler) effectiveNQN(s *storagev1alpha1.NetworkExport) string {
 	if s.Spec.NVMeoF != nil && s.Spec.NVMeoF.NQN != "" {
 		return s.Spec.NVMeoF.NQN
 	}
@@ -96,8 +96,8 @@ func (r *NVMeoFReconciler) markExportedForRequest(ctx context.Context, req ctrl.
 	}
 }
 
-func (r *NVMeoFReconciler) getRequested(ctx context.Context, req ctrl.Request) (*storagev1alpha1.ZfsShare, bool) {
-	var s storagev1alpha1.ZfsShare
+func (r *NVMeoFReconciler) getRequested(ctx context.Context, req ctrl.Request) (*storagev1alpha1.NetworkExport, bool) {
+	var s storagev1alpha1.NetworkExport
 	if err := r.Get(ctx, req.NamespacedName, &s); err != nil {
 		if !apierrors.IsNotFound(err) {
 			log.FromContext(ctx).Error(err, "get share for status", "share", req.Name)
@@ -113,9 +113,9 @@ func (r *NVMeoFReconciler) getRequested(ctx context.Context, req ctrl.Request) (
 // SetupWithManager wires the reconciler into the manager.
 func (r *NVMeoFReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.ZfsShare{}).
+		For(&storagev1alpha1.NetworkExport{}).
 		WithEventFilter(nodeProtocolPredicate(r.NodeName, storagev1alpha1.ProtocolNVMeoF)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Named("nvmeof-zfsshare").
+		Named("nvmeof-networkexport").
 		Complete(r)
 }

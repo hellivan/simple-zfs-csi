@@ -7,10 +7,10 @@ metadata:
     {{- include "zfs-shares.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["storage.zfs-shares.io"]
-    resources: ["zfsshares"]
+    resources: ["networkexports"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["storage.zfs-shares.io"]
-    resources: ["zfsshares/status"]
+    resources: ["networkexports/status"]
     verbs: ["get", "update", "patch"]
 {{- if .Values.nfs.enabled }}
 ---
