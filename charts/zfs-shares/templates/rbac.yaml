@@ -263,4 +263,36 @@ subjects:
     name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "csi-controller") }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- if .Values.csiNode.enabled }}
+---
+# CSI node plugin: read-only access to resolve routing (ZfsPool.status) and the
+# NVMe-oF subsystem NQN (NetworkExport.status). It writes no CRDs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-node
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-node
+rules:
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfspools", "networkexports"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-node
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-node
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zfs-shares.fullname" . }}-csi-node
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "csi-node") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

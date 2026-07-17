@@ -14,8 +14,10 @@ import (
 
 // Serve starts the CSI gRPC server on endpoint and blocks until ctx is cancelled
 // or the server fails. endpoint is a URL such as "unix:///csi/csi.sock" or
-// "tcp://127.0.0.1:10000".
-func Serve(ctx context.Context, endpoint string, ids csi.IdentityServer, cs csi.ControllerServer, log logr.Logger) error {
+// "tcp://127.0.0.1:10000". The Controller and Node services are registered only
+// when the corresponding server is non-nil, so the same entrypoint serves both
+// the controller Deployment and the node DaemonSet.
+func Serve(ctx context.Context, endpoint string, ids csi.IdentityServer, cs csi.ControllerServer, ns csi.NodeServer, log logr.Logger) error {
 	network, addr, err := parseEndpoint(endpoint)
 	if err != nil {
 		return err
@@ -33,7 +35,12 @@ func Serve(ctx context.Context, endpoint string, ids csi.IdentityServer, cs csi.
 
 	srv := grpc.NewServer(grpc.ChainUnaryInterceptor(logInterceptor(log)))
 	csi.RegisterIdentityServer(srv, ids)
-	csi.RegisterControllerServer(srv, cs)
+	if cs != nil {
+		csi.RegisterControllerServer(srv, cs)
+	}
+	if ns != nil {
+		csi.RegisterNodeServer(srv, ns)
+	}
 
 	go func() {
 		<-ctx.Done()

@@ -1,0 +1,130 @@
+{{- if .Values.csiNode.enabled }}
+{{- $kubeletDir := trimSuffix "/" .Values.csiNode.kubeletDir }}
+{{- $pluginDir := printf "%s/plugins/%s" $kubeletDir .Values.driverName }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: csi-node
+  template:
+    metadata:
+      labels:
+        {{- include "zfs-shares.labels" . | nindent 8 }}
+        app.kubernetes.io/component: csi-node
+      {{- with .Values.csiNode.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "csi-node") }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- if and .Values.csiNode.hostExec.enabled (eq .Values.csiNode.hostExec.mode "nsenter") }}
+      hostPID: true
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csiNode.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csiNode.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: csi-node
+          image: {{ include "zfs-shares.image" (dict "root" . "component" "csiNode" "suffix" "csi-node") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --driver-name={{ .Values.driverName }}
+            - --node-name=$(NODE_NAME)
+            - --nvme-transport={{ .Values.csiNode.nvmeTransport }}
+            - --nvme-port={{ .Values.csiNode.nvmePort }}
+            {{- if .Values.csiNode.hostExec.enabled }}
+            - --host-exec-mode={{ .Values.csiNode.hostExec.mode }}
+            {{- if eq .Values.csiNode.hostExec.mode "chroot" }}
+            - --host-root=/host
+            {{- else if eq .Values.csiNode.hostExec.mode "nsenter" }}
+            - --nsenter-target-pid={{ .Values.csiNode.hostExec.targetPid }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.csiNode.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: {{ $kubeletDir }}/pods
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+              mountPropagation: HostToContainer
+            {{- if and .Values.csiNode.hostExec.enabled (eq .Values.csiNode.hostExec.mode "chroot") }}
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+            {{- end }}
+          {{- with .Values.csiNode.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: node-driver-registrar
+          image: {{ .Values.csiNode.registrar.image }}:{{ .Values.csiNode.registrar.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ $pluginDir }}/csi.sock
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          {{- with .Values.csiNode.registrar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ $pluginDir }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ $kubeletDir }}/plugins_registry
+            type: Directory
+        - name: pods-mount-dir
+          hostPath:
+            path: {{ $kubeletDir }}/pods
+            type: DirectoryOrCreate
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        {{- if and .Values.csiNode.hostExec.enabled (eq .Values.csiNode.hostExec.mode "chroot") }}
+        - name: host-root
+          hostPath:
+            path: {{ .Values.csiNode.hostExec.hostRootPath }}
+            type: Directory
+        {{- end }}
+{{- end }}

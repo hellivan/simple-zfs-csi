@@ -8,6 +8,74 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0003 — CSI node plugin: routing-only publish, NODE_OFFLINE fencing, protocol dispatch
+
+**Status:** Accepted (2026-07-17) · **Scope:** Step 7 (`cmd/csi-node`), Helm chart
+
+### Context
+
+The node plugin is a privileged DaemonSet on every node. The controller
+(ADR-0001) returns only a routing `volume_context = { poolGUID, dataset,
+protocol }` — never an absolute path — so the node must resolve the real mount
+target itself, at publish time, from live cluster state. It writes no CRDs.
+
+### Decisions
+
+1. **Routing resolved from `ZfsPool.status` at publish time.** `NodePublishVolume`
+   loads the `ZfsPool` by `zpool.ResourceName(poolGUID)` (the same GUID→object
+   mapping the operator uses) and reads `CurrentIP`, `BaseMountPath`, `PoolName`
+   and `Health`. Resolving per-publish (not from a cached path) means pool
+   takeover to a new node is picked up automatically on the next mount.
+
+2. **NODE_OFFLINE fencing.** If `status.health == NODE_OFFLINE` (or there is no
+   `CurrentIP`), publish fails `FailedPrecondition` with a clear message rather
+   than mounting a stale/dead target. This is the node-side half of the watcher's
+   fencing: the watcher marks the pool offline, the node refuses to mount it.
+
+3. **`protocol` dispatches the publish mechanism; `volumeMode` is orthogonal.**
+   - `nfs` → `mount -t nfs <CurrentIP>:<baseMountPath>/<dataset>` (filesystem
+     only; block mode is rejected — mirrors the controller's rule).
+   - `nvmeof` → `nvme connect` to `<CurrentIP>:<nvmePort>` for the export's NQN,
+     then: filesystem mode → `mkfs` if unformatted + mount (fs-on-zvol); block
+     mode → bind-mount the raw device node.
+   The NVMe-oF subsystem NQN is read from the child `NetworkExport.status.NQN`
+   (falling back to `spec.nvmeof.nqn`); an absent/empty NQN yields
+   `FailedPrecondition` ("export not ready"), which naturally gates publish on the
+   operator having rendered and the aggregator having configured the export.
+
+4. **Privileged host operations behind a `NodeMounter` interface.** All mounts,
+   `mkfs`, and `nvme connect/disconnect` go through
+   [internal/csi/mount.go](../internal/csi/mount.go) `NodeMounter`, with a
+   host-exec-aware command runner (`chroot`/`nsenter`, reusing the discovery
+   plane's `zpool.HostExec`). The interface lets the routing logic be unit-tested
+   with a fake (no real host). The node image bundles `nfs-common` + `nvme-cli` +
+   `util-linux` + mkfs helpers so in-container mounting works by default;
+   `--host-exec-mode` switches to the host's binaries (e.g. Talos).
+
+5. **Publish-only (no stage/unstage).** The plugin advertises no optional node
+   capabilities and does all work in `NodePublishVolume`/`NodeUnpublishVolume`.
+   Publish is idempotent (an already-mounted target returns success). Unpublish
+   unmounts, removes the target, and best-effort `nvme disconnect`s.
+
+6. **Deployment.** DaemonSet (plugin + `node-driver-registrar` sidecar) with
+   `hostNetwork` (to reach the storage node's NFS/NVMe endpoints), a
+   `Bidirectional`-propagated `<kubeletDir>/pods` mount, the plugin/registration
+   socket dirs, and `/dev`. The shared `CSIDriver` object (ADR-0001 render,
+   `attachRequired: false`) covers both planes; the same driver name ties the
+   registrar registration to the controller's provisioner.
+
+### Consequences
+
+- The node never learns an absolute path from the controller and never writes
+  CRDs; its only inputs are the `volume_context` and read-only `ZfsPool` /
+  `NetworkExport` status.
+- A pool that has moved or died is fenced cleanly at mount time.
+- `csi-sanity` node tests and live NFS + NVMe-oF pod mounts are the manual
+  verification steps (not unit-tested); the fake-mounter unit tests cover routing,
+  fencing, protocol dispatch, idempotency and unpublish.
+
+---
+
 ## ADR-0002 — `poolGUID` and `datasetPrefix` are StorageClass-only
 
 **Status:** Accepted (2026-07-17) · **Scope:** Step 6 (`cmd/csi-controller`), Helm chart

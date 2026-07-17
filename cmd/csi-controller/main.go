@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
 	zfscsi "github.com/hellivan/zfs-shares/internal/csi"
 )
@@ -67,7 +68,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	ids := &zfscsi.IdentityServer{DriverName: driverName, Version: version}
+	ids := &zfscsi.IdentityServer{
+		DriverName:   driverName,
+		Version:      version,
+		Capabilities: []*csi.PluginCapability{zfscsi.ControllerServiceCapability()},
+	}
 	cs := &zfscsi.ControllerServer{
 		Client:           cl,
 		DefaultParams:    defaultParams,
@@ -78,7 +83,7 @@ func main() {
 	}
 
 	setupLog.Info("starting CSI controller", "driver", driverName, "endpoint", endpoint, "version", version)
-	if err := zfscsi.Serve(ctrl.SetupSignalHandler(), endpoint, ids, cs, ctrl.Log.WithName("grpc")); err != nil {
+	if err := zfscsi.Serve(ctrl.SetupSignalHandler(), endpoint, ids, cs, nil, ctrl.Log.WithName("grpc")); err != nil {
 		setupLog.Error(err, "CSI server exited with error")
 		os.Exit(1)
 	}

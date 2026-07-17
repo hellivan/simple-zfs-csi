@@ -221,6 +221,54 @@ csiController:
   # -- Tolerations for the controller pod.
   tolerations: []
 
+# -------- CSI node plugin (per-node mount/attach DaemonSet) --------
+csiNode:
+  # -- Deploy the CSI node plugin DaemonSet (plugin + node-driver-registrar sidecar).
+  enabled: true
+  image:
+    # -- Override the full CSI node image (registry/repo:tag). Empty derives it from `image.*`.
+    repository: ""
+    tag: ""
+  # -- Kubelet root directory. The plugin, registration and pod mount dirs live
+  # -- beneath it; override for k0s/microk8s/RKE non-standard layouts.
+  kubeletDir: /var/lib/kubelet
+  # -- NVMe-oF transport used to connect to the storage node.
+  nvmeTransport: tcp
+  # -- NVMe-oF service port on the storage node (must match `nvmeof.transport.serviceId`).
+  nvmePort: "4420"
+  # Run mount.nfs / nvme against the host's binaries instead of the in-image
+  # tools. The node image bundles nfs-common + nvme-cli, so this is off by
+  # default; enable on hosts (e.g. Talos) where mounts must run in the host
+  # context.
+  hostExec:
+    # -- Enable running the host's mount/nvme binaries via chroot/nsenter.
+    enabled: false
+    # -- "chroot" (bind-mount host root at /host) or "nsenter" (enter targetPid namespaces).
+    mode: chroot
+    # -- Host PID whose namespaces are entered in nsenter mode.
+    targetPid: 1
+    # -- Host root path bind-mounted to /host in chroot mode.
+    hostRootPath: /
+  # node-driver-registrar sidecar.
+  registrar:
+    # -- node-driver-registrar image repository.
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar
+    # -- node-driver-registrar image tag.
+    tag: v2.13.0
+    # -- Resource requests/limits for the sidecar.
+    resources: {}
+  # -- Extra CLI args for the csi-node binary.
+  extraArgs: []
+  # -- Resource requests/limits for the plugin container.
+  resources: {}
+  # -- Pod annotations.
+  podAnnotations: {}
+  # -- Node selector limiting which nodes run the plugin (empty = all nodes).
+  nodeSelector: {}
+  # -- Tolerations; defaults to tolerating everything so the plugin runs on every node.
+  tolerations:
+    - operator: Exists
+
 # -------- CSIDriver object --------
 csiDriver:
   # -- Install the CSIDriver object for the driver.

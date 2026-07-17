@@ -14,6 +14,10 @@ type IdentityServer struct {
 
 	DriverName string
 	Version    string
+	// Capabilities are the plugin-level capabilities advertised by
+	// GetPluginCapabilities. The controller plugin sets CONTROLLER_SERVICE; the
+	// node plugin leaves it empty (no controller service, no topology).
+	Capabilities []*csi.PluginCapability
 }
 
 // GetPluginInfo returns the driver name and version.
@@ -24,21 +28,23 @@ func (s *IdentityServer) GetPluginInfo(_ context.Context, _ *csi.GetPluginInfoRe
 	}, nil
 }
 
-// GetPluginCapabilities advertises the CONTROLLER_SERVICE. Topology/accessibility
-// is intentionally not advertised: pools are selected by StorageClass, not by
-// scheduler topology.
+// GetPluginCapabilities advertises the capabilities configured on the server.
+// Topology/accessibility is intentionally not advertised: pools are selected by
+// StorageClass, not by scheduler topology.
 func (s *IdentityServer) GetPluginCapabilities(_ context.Context, _ *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
-	return &csi.GetPluginCapabilitiesResponse{
-		Capabilities: []*csi.PluginCapability{
-			{
-				Type: &csi.PluginCapability_Service_{
-					Service: &csi.PluginCapability_Service{
-						Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
-					},
-				},
+	return &csi.GetPluginCapabilitiesResponse{Capabilities: s.Capabilities}, nil
+}
+
+// ControllerServiceCapability returns the plugin capability advertising the
+// CONTROLLER_SERVICE, for use by the controller plugin's IdentityServer.
+func ControllerServiceCapability() *csi.PluginCapability {
+	return &csi.PluginCapability{
+		Type: &csi.PluginCapability_Service_{
+			Service: &csi.PluginCapability_Service{
+				Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
 			},
 		},
-	}, nil
+	}
 }
 
 // Probe reports readiness.
