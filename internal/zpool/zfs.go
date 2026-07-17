@@ -49,6 +49,10 @@ type ZFS interface {
 	// "pool/dataset@snap". It is idempotent: an already-existing snapshot is not
 	// an error.
 	Snapshot(ctx context.Context, name string) error
+	// Clone creates dest as a clone of the snapshot (both full ZFS names),
+	// applying optional settable properties. Idempotent: an already-existing dest
+	// is not an error.
+	Clone(ctx context.Context, snapshot, dest string, props map[string]string) error
 	// Destroy removes a dataset/zvol. It is idempotent: destroying a
 	// non-existent object is not an error. recursive also destroys children.
 	Destroy(ctx context.Context, name string, recursive bool) error
@@ -142,6 +146,25 @@ func (z *CLI) Snapshot(ctx context.Context, name string) error {
 		return fmt.Errorf("snapshot name %q must be of the form pool/dataset@snap", name)
 	}
 	_, err := z.run(ctx, "snapshot", name)
+	if err != nil && isExists(err) {
+		return nil
+	}
+	return err
+}
+
+// Clone creates dest as a clone of snapshot, treating an already-existing dest as
+// success (idempotent). Only settable properties should be passed (a clone
+// inherits read-only properties such as volblocksize from its origin).
+func (z *CLI) Clone(ctx context.Context, snapshot, dest string, props map[string]string) error {
+	if snapshot == "" || dest == "" {
+		return fmt.Errorf("clone requires both snapshot and dest names")
+	}
+	if !strings.Contains(snapshot, "@") {
+		return fmt.Errorf("clone source %q must be a snapshot (pool/dataset@snap)", snapshot)
+	}
+	args := append([]string{"clone"}, propArgs(props)...)
+	args = append(args, snapshot, dest)
+	_, err := z.run(ctx, args...)
 	if err != nil && isExists(err) {
 		return nil
 	}

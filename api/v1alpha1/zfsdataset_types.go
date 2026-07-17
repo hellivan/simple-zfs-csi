@@ -53,6 +53,24 @@ type VolumeConfig struct {
 	Volblocksize string `json:"volblocksize,omitempty"`
 }
 
+// DatasetSource references a ZFS source to clone the new dataset from instead of
+// creating it empty (CSI VolumeContentSource). Clones are same-pool by ZFS
+// constraint, so the source lives on the same pool (PoolGUID) as the dataset.
+// Exactly one of Snapshot or Volume is set.
+type DatasetSource struct {
+	// Snapshot is the source snapshot's logical reference "<dataset>@<snapshot>"
+	// relative to the pool root, when restoring from a snapshot. The agent runs
+	// `zfs clone <pool>/<Snapshot> <pool>/<dataset>`.
+	// +optional
+	Snapshot string `json:"snapshot,omitempty"`
+
+	// Volume is the source dataset's logical path relative to the pool root, when
+	// cloning from another volume. The agent takes an intermediate snapshot of it
+	// first, then clones that.
+	// +optional
+	Volume string `json:"volume,omitempty"`
+}
+
 // ZfsDatasetSpec is the desired allocation of a ZFS dataset on the pool identified
 // by PoolGUID. It expresses storage intent only (create/size); the network
 // export of the resulting path is a separate concern (ZfsShare -> NetworkExport).
@@ -96,6 +114,12 @@ type ZfsDatasetSpec struct {
 	// type=volume.
 	// +optional
 	Volume *VolumeConfig `json:"volume,omitempty"`
+
+	// Source, when set, clones the dataset from an existing snapshot or volume
+	// instead of creating it empty (CSI VolumeContentSource). The source must be
+	// on the same pool (PoolGUID) and of the same Type.
+	// +optional
+	Source *DatasetSource `json:"source,omitempty"`
 }
 
 // ZfsDatasetStatus reports the observed allocation state on the node.

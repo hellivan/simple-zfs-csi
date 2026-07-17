@@ -126,7 +126,7 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 				"LookupFailed", err.Error())
 		}
-		if err := r.create(ctx, &vol, full); err != nil {
+		if err := r.create(ctx, &vol, pool.Status.PoolName, full); err != nil {
 			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 				"CreateFailed", err.Error())
 		}
@@ -158,8 +158,13 @@ func (r *ZfsDatasetReconciler) releaseFinalizer(ctx context.Context, vol *storag
 	return r.Update(ctx, vol)
 }
 
-// create provisions the filesystem or volume described by the volume spec.
-func (r *ZfsDatasetReconciler) create(ctx context.Context, vol *storagev1alpha1.ZfsDataset, full string) error {
+// create provisions the filesystem or volume described by the volume spec. When
+// spec.Source is set it clones the dataset from an existing snapshot or volume
+// (on the same pool) instead of creating it empty.
+func (r *ZfsDatasetReconciler) create(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, full string) error {
+	if vol.Spec.Source != nil {
+		return r.clone(ctx, vol, poolName, full)
+	}
 	switch vol.Spec.Type {
 	case storagev1alpha1.DatasetTypeFilesystem:
 		return r.ZFS.CreateDataset(ctx, full, filesystemProps(vol))
@@ -170,6 +175,28 @@ func (r *ZfsDatasetReconciler) create(ctx context.Context, vol *storagev1alpha1.
 		return r.ZFS.CreateZvol(ctx, full, vol.Spec.Volume.Size.Value(), volumeProps(vol))
 	default:
 		return fmt.Errorf("unknown volume type %q", vol.Spec.Type)
+	}
+}
+
+// clone provisions the dataset by cloning a source snapshot or volume. Sizing is
+// left to ensureSize (which runs right after) so the clone inherits the origin's
+// size and then converges to the requested capacity.
+func (r *ZfsDatasetReconciler) clone(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, dest string) error {
+	src := vol.Spec.Source
+	props := copyProps(vol.Spec.Properties)
+	switch {
+	case src.Snapshot != "":
+		snapFull := poolName + "/" + strings.TrimLeft(src.Snapshot, "/")
+		return r.ZFS.Clone(ctx, snapFull, dest, props)
+	case src.Volume != "":
+		srcFull := poolName + "/" + strings.Trim(src.Volume, "/")
+		snapFull := srcFull + "@clone-" + vol.Name
+		if err := r.ZFS.Snapshot(ctx, snapFull); err != nil {
+			return err
+		}
+		return r.ZFS.Clone(ctx, snapFull, dest, props)
+	default:
+		return fmt.Errorf("spec.source has neither snapshot nor volume")
 	}
 }
 

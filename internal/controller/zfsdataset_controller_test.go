@@ -21,14 +21,16 @@ import (
 // fakeZFS is an in-memory zpool.ZFS used to assert the reconciler's create,
 // destroy and resize behaviour without shelling out.
 type fakeZFS struct {
-	existing    map[string]bool
-	props       map[string]map[string]string
-	createdDS   []string
-	createdZvol map[string]int64
-	destroyed   []string
-	lastDSProps map[string]string
-	lastZvProps map[string]string
-	setProps    []string // records "name property=value" for each SetProperty
+	existing       map[string]bool
+	props          map[string]map[string]string
+	createdDS      []string
+	createdZvol    map[string]int64
+	destroyed      []string
+	lastDSProps    map[string]string
+	lastZvProps    map[string]string
+	cloned         []string // records "snapshot -> dest" for each Clone
+	lastCloneProps map[string]string
+	setProps       []string // records "name property=value" for each SetProperty
 }
 
 func newFakeZFS(existing ...string) *fakeZFS {
@@ -79,6 +81,14 @@ func (f *fakeZFS) Snapshot(_ context.Context, name string) error {
 	f.createdDS = append(f.createdDS, name)
 	f.existing[name] = true
 	f.props[name] = map[string]string{"creation": "1700000000", "referenced": "1048576"}
+	return nil
+}
+
+func (f *fakeZFS) Clone(_ context.Context, snapshot, dest string, props map[string]string) error {
+	f.cloned = append(f.cloned, snapshot+" -> "+dest)
+	f.lastCloneProps = props
+	f.existing[dest] = true
+	f.store(dest, props)
 	return nil
 }
 
@@ -278,6 +288,69 @@ func TestZfsDatasetReconcile_ZvolUsesSize(t *testing.T) {
 	}
 	if got.Status.Path != "/dev/zvol/tank/k8s/pvc-blk" {
 		t.Errorf("path = %q, want /dev/zvol/tank/k8s/pvc-blk", got.Status.Path)
+	}
+}
+
+func TestZfsDatasetReconcile_ClonesFromSnapshot(t *testing.T) {
+	scheme := newTestScheme(t)
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-restore", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999",
+			Dataset:  "k8s/pvc-restore",
+			Type:     storagev1alpha1.DatasetTypeFilesystem,
+			Source:   &storagev1alpha1.DatasetSource{Snapshot: "k8s/pvc-src@snap-1"},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
+		Build()
+
+	z := newFakeZFS()
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-restore"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if len(z.cloned) != 1 || z.cloned[0] != "tank/k8s/pvc-src@snap-1 -> tank/k8s/pvc-restore" {
+		t.Fatalf("expected clone from snapshot, got %v", z.cloned)
+	}
+	if len(z.createdDS) != 0 {
+		t.Errorf("clone should not create an empty dataset, got %v", z.createdDS)
+	}
+}
+
+func TestZfsDatasetReconcile_ClonesFromVolume(t *testing.T) {
+	scheme := newTestScheme(t)
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-clone", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999",
+			Dataset:  "k8s/pvc-clone",
+			Type:     storagev1alpha1.DatasetTypeFilesystem,
+			Source:   &storagev1alpha1.DatasetSource{Volume: "k8s/pvc-src"},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
+		Build()
+
+	z := newFakeZFS()
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-clone"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	wantSnap := "tank/k8s/pvc-src@clone-pvc-clone"
+	if len(z.createdDS) != 1 || z.createdDS[0] != wantSnap {
+		t.Fatalf("expected intermediate snapshot %q, got %v", wantSnap, z.createdDS)
+	}
+	if len(z.cloned) != 1 || z.cloned[0] != wantSnap+" -> tank/k8s/pvc-clone" {
+		t.Fatalf("expected clone from volume snapshot, got %v", z.cloned)
 	}
 }
 

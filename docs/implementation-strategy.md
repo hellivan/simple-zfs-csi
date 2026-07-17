@@ -182,7 +182,7 @@ Dedicated `ZfsSnapshot` CRD (grouped by lifecycle, not ZFS taxonomy — ADR-0006
 | 7 node | `build` | — | csi-sanity + pod mounts (NFS + NVMe-oF) |
 | 8 expansion ✅ | `vet`+`build`+`helm-template` | controller/node expand unit tests | PVC resize grows fs/zvol |
 | 9 snapshots ✅ | `make manifests`+`build` | snapshot reconcile + CreateSnapshot | `VolumeSnapshot` create/delete |
-| 10 clone/restore | `make manifests`+`build` | clone spec + CreateVolume source | PVC from snapshot; PVC clone |
+| 10 clone/restore ✅ | `make manifests`+`build` | clone spec + CreateVolume source | PVC from snapshot; PVC clone |
 
 ## Out of scope (tracked, not now)
 - Backup pod (`ssh-daemon` + `cron-puller`) — separate pod, later; shares the host-exec helper.

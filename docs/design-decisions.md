@@ -8,6 +8,63 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0009 — Clone/restore: `spec.source` on `ZfsDataset`, same-pool `zfs clone`
+
+**Status:** Accepted (2026-07-17) · **Scope:** Step 10 — API, agent, CSI controller, Helm RBAC
+
+### Context
+
+The last parity capability is provisioning a volume *from* a snapshot (restore) or
+*from* another volume (clone). CSI expresses both through
+`CreateVolume.VolumeContentSource` (`Snapshot` or `Volume`), resolved by
+`external-provisioner` from a PVC `dataSource`. ZFS implements both with
+`zfs clone`, which is copy-on-write and — critically — **same-pool only** (a clone
+must live in the pool of its origin snapshot).
+
+### Decisions
+
+1. **Clone rides the existing `ZfsDataset` ownership boundary.** `ZfsDatasetSpec`
+   grows an optional `source { snapshot | volume }` (a logical path relative to the
+   pool root). The CSI controller sets it; the agent, on the hosting node, runs
+   `zfs clone` instead of `zfs create`. No new CRD, no CSI-plane ZFS work — the
+   agent stays the only ZFS actor, exactly like allocation, expansion and snapshot.
+
+2. **From a snapshot → direct clone; from a volume → snapshot-then-clone.** For a
+   `volume` source the agent first takes a deterministic intermediate snapshot
+   (`<src>@clone-<newName>`, idempotent) and clones that, since `zfs clone` only
+   consumes snapshots. Sizing is left to the existing `ensureSize` step: the clone
+   inherits the origin's size, then converges to the requested capacity (grow
+   only), so no size arg is passed at clone time and `volblocksize` stays inherited.
+
+3. **Same-pool + same-type are enforced in the controller.** A clone across pools
+   is impossible in ZFS, so `CreateVolume` rejects a source whose `poolGUID` differs
+   from the (StorageClass-fixed) target pool with `InvalidArgument`. It likewise
+   rejects a type mismatch (e.g. restoring a filesystem snapshot into an nvmeof
+   zvol), deriving the source type from the source `ZfsDataset`. The controller
+   echoes the `content_source` in the response and advertises `CLONE_VOLUME`.
+
+4. **No new sidecar; only RBAC.** Restore/clone are built into
+   `external-provisioner`; the chart just adds `volumesnapshots` read access
+   (gated on `snapshotter.enabled`) so the provisioner can resolve a snapshot
+   `dataSource` into a `VolumeContentSource`.
+
+### Consequences
+
+- Cross-pool restore/clone is intentionally unsupported (would need
+  `zfs send/recv`, a heavier copy) — acceptable for the base driver; can be layered
+  later behind the same `spec.source`.
+- `DeleteVolume` still `zfs destroy -r`s the dataset; a clone's origin snapshot is
+  independent (a snapshot's own `ZfsSnapshot`/finalizer governs it), and ZFS
+  refuses to destroy an origin while clones exist — surfaced as a delete error and
+  retried, rather than silently corrupting data.
+- Verified by unit tests (agent clone from snapshot and from volume; controller
+  restore/clone happy paths + cross-pool and type-mismatch rejection). Live
+  `kubectl apply` of a PVC with a snapshot/PVC `dataSource` is the manual e2e step.
+  With this, the base CSI feature set (provision, expand, snapshot, clone/restore)
+  is complete.
+
+---
+
 ## ADR-0008 — Snapshots: `ZfsSnapshot` CRD, agent-owned `zfs snapshot`
 
 **Status:** Accepted (2026-07-17) · **Scope:** Step 9 — API, agent, CSI controller, Helm chart

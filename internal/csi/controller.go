@@ -76,8 +76,14 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, status.Error(codes.InvalidArgument, "capacity is required for nvmeof (zvol) volumes")
 	}
 
+	source, err := c.resolveContentSource(ctx, req, rp)
+	if err != nil {
+		return nil, err
+	}
+
 	dataset := rp.Dataset(name)
 	desiredVol := volumeSpec(rp, dataset, sizeBytes)
+	desiredVol.Source = source
 
 	if err := c.ensureVolume(ctx, name, desiredVol); err != nil {
 		return nil, err
@@ -100,6 +106,7 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 				CtxDataset:  dataset,
 				CtxProtocol: string(rp.Protocol),
 			},
+			ContentSource: req.GetVolumeContentSource(),
 		},
 	}, nil
 }
@@ -132,6 +139,7 @@ func (c *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.C
 			rpcCapability(csi.ControllerServiceCapability_RPC_EXPAND_VOLUME),
 			rpcCapability(csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT),
 			rpcCapability(csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS),
+			rpcCapability(csi.ControllerServiceCapability_RPC_CLONE_VOLUME),
 		},
 	}, nil
 }
@@ -391,7 +399,18 @@ func volumeSpecCompatible(existing, desired storagev1alpha1.ZfsDatasetSpec) bool
 	if existing.PoolGUID != desired.PoolGUID || existing.Dataset != desired.Dataset || existing.Type != desired.Type {
 		return false
 	}
+	if !datasetSourceEqual(existing.Source, desired.Source) {
+		return false
+	}
 	return quantityEqual(volumeSize(existing), volumeSize(desired))
+}
+
+// datasetSourceEqual compares two optional clone sources for equality.
+func datasetSourceEqual(a, b *storagev1alpha1.DatasetSource) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Snapshot == b.Snapshot && a.Volume == b.Volume
 }
 
 // volumeSize returns the sizing quantity for a spec (zvol size or fs quota), or

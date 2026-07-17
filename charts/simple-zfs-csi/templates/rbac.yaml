@@ -237,6 +237,10 @@ rules:
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotcontents/status"]
     verbs: ["update", "patch"]
+  # external-provisioner resolves a snapshot/volume dataSource for restore/clone.
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
