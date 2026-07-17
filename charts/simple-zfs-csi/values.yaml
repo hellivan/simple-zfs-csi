@@ -238,12 +238,11 @@ csiController:
     extraArgs: []
     # -- Resource requests/limits for the sidecar.
     resources: {}
-  # external-attacher sidecar (attach-stage access control). Drives
-  # ControllerPublish/Unpublish so a volume is exported only to authorized nodes
-  # (ADR-0010). Keep enabled in sync with csiDriver.attachRequired.
+  # external-attacher sidecar (attach-stage access control). Mandatory: the share
+  # lifecycle lives at the attach stage (ADR-0010), so a volume is exported only
+  # to nodes that hold an attach request. It is always deployed (like the
+  # provisioner) — only its image/args/resources are configurable.
   attacher:
-    # -- Deploy the external-attacher sidecar (enables attach-stage access control).
-    enabled: true
     # -- external-attacher image repository.
     image: registry.k8s.io/sig-storage/csi-attacher
     # -- external-attacher image tag.
@@ -276,8 +275,11 @@ csiNode:
   kubeletDir: /var/lib/kubelet
   # -- NVMe-oF transport used to connect to the storage node.
   nvmeTransport: tcp
-  # -- NVMe-oF service port on the storage node (must match `nvmeof.transport.serviceId`).
-  nvmePort: "4420"
+  # -- Optional override for the NVMe-oF service port the node connects to. Empty
+  # -- (recommended) derives it from `nvmeof.transport.serviceId`, so the target
+  # -- and initiator ports cannot drift. Set only to target a different port
+  # -- (e.g. a load balancer in front of the storage nodes).
+  nvmePort: ""
   # Run mount.nfs / nvme against the host's binaries instead of the in-image
   # tools. The node image bundles nfs-common + nvme-cli, so this is off by
   # default; enable on hosts (e.g. Talos) where mounts must run in the host
@@ -315,10 +317,6 @@ csiNode:
 csiDriver:
   # -- Install the CSIDriver object for the driver.
   create: true
-  # -- Require a controller-issued attach step (external-attacher). This drives
-  # -- the zero-trust share lifecycle (ADR-0010): a volume is exported only to
-  # -- nodes that hold an attach request. Keep in sync with csiController.attacher.
-  attachRequired: true
 
 # -------- Example StorageClasses --------
 # -- StorageClasses to install with the chart. Each entry becomes a StorageClass

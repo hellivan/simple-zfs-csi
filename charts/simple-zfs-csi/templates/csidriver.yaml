@@ -8,8 +8,9 @@ metadata:
 spec:
   # Attach is used purely as the zero-trust authorization hook (ADR-0010): the
   # controller creates the network export only for authorized nodes at
-  # ControllerPublishVolume. Set false to disable attach-stage access control.
-  attachRequired: {{ .Values.csiDriver.attachRequired }}
+  # ControllerPublishVolume. This is mandatory for mounting, so it is not
+  # configurable.
+  attachRequired: true
   # The node plugin reads the volume_context at publish time.
   podInfoOnMount: false
   volumeLifecycleModes:

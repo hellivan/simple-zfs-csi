@@ -52,7 +52,7 @@ spec:
             - --driver-name={{ .Values.driverName }}
             - --node-name=$(NODE_NAME)
             - --nvme-transport={{ .Values.csiNode.nvmeTransport }}
-            - --nvme-port={{ .Values.csiNode.nvmePort }}
+            - --nvme-port={{ .Values.csiNode.nvmePort | default .Values.nvmeof.transport.serviceId }}
             {{- if .Values.csiNode.hostExec.enabled }}
             - --host-exec-mode={{ .Values.csiNode.hostExec.mode }}
             {{- if eq .Values.csiNode.hostExec.mode "chroot" }}
