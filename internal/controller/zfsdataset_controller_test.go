@@ -75,6 +75,13 @@ func (f *fakeZFS) Destroy(_ context.Context, name string, _ bool) error {
 	return nil
 }
 
+func (f *fakeZFS) Snapshot(_ context.Context, name string) error {
+	f.createdDS = append(f.createdDS, name)
+	f.existing[name] = true
+	f.props[name] = map[string]string{"creation": "1700000000", "referenced": "1048576"}
+	return nil
+}
+
 func (f *fakeZFS) Get(_ context.Context, name, property string) (string, error) {
 	if !f.existing[name] {
 		return "", fmt.Errorf("%w: %s", zpool.ErrNotExist, name)

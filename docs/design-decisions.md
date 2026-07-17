@@ -8,6 +8,61 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0008 — Snapshots: `ZfsSnapshot` CRD, agent-owned `zfs snapshot`
+
+**Status:** Accepted (2026-07-17) · **Scope:** Step 9 — API, agent, CSI controller, Helm chart
+
+### Context
+
+Snapshots complete the democratic-csi-class base feature set (after expansion,
+ADR-0004). CSI drives them through `external-snapshotter` →
+`CreateSnapshot`/`DeleteSnapshot`, keyed on a source volume. The taxonomy decision
+(ADR-0006) already fixed a *separate* `ZfsSnapshot` CRD rather than a third
+`ZfsDataset` type, because a snapshot has its own lifecycle (derive-from-source,
+read-only, restore/clone) and never carries an export or an expand path.
+
+### Decisions
+
+1. **`ZfsSnapshot` mirrors the `ZfsDataset` ownership boundary.** Spec is
+   `{ poolGUID, dataset, snapshotName, sourceVolume }`; the CSI controller creates
+   it, and the per-node **agent** that currently hosts the pool takes
+   `zfs snapshot <poolName>/<dataset>@<snapshotName>` idempotently and destroys it
+   via a finalizer (`storage.simple-zfs-csi.io/zfssnapshot`). No CSI-plane ZFS
+   work — the agent stays the only ZFS actor, exactly like allocation.
+
+2. **Status carries the CSI reply fields.** The agent reads them straight from
+   ZFS: `readyToUse` (snapshot exists), `creationTime` (the `creation` property),
+   `restoreSize` (the `referenced` bytes — the minimum size to restore). The
+   controller's `CreateSnapshot` waits for `readyToUse` (like `CreateVolume` waits
+   for `Ready`), then maps status → `csi.Snapshot`.
+
+3. **The snapshot id is the object name.** `CreateSnapshot.Name` becomes both the
+   `ZfsSnapshot` metadata.name and the ZFS `@` short name; `sourceVolume` (the CSI
+   source volume id = source `ZfsDataset` name) is stored for `ListSnapshots`
+   reporting and idempotency checks. `DeleteSnapshot` deletes the object; the
+   finalizer drives `zfs destroy`. `ListSnapshots` supports id/source filters with
+   offset-based pagination and advertises `LIST_SNAPSHOTS` alongside
+   `CREATE_DELETE_SNAPSHOT`.
+
+4. **Snapshot CRDs + controller are a cluster prerequisite.** The chart ships the
+   `csi-snapshotter` sidecar (`csiController.snapshotter.*`, on by default), its
+   `volumesnapshotcontents`/`volumesnapshotclasses` RBAC, and an optional
+   `volumeSnapshotClasses` values map, but **not** the upstream snapshot CRDs or
+   the `snapshot-controller` (installed once per cluster, like Ceph CSI docs).
+
+### Consequences
+
+- No new ZFS actor and no absolute paths cross the CSI boundary; snapshots reuse
+  the same GUID→pool→node resolution and host-exec seam as allocation.
+- Restore/clone (`VolumeContentSource` in `CreateVolume`) is **Step 10** and not
+  yet implemented; `ZfsSnapshot` already carries enough (`poolGUID` + `dataset` +
+  `snapshotName`) for a future `zfs clone` to consume.
+- Verified by unit tests (zfs `Snapshot` idempotency, agent reconcile create/
+  destroy/host-scoping, controller CreateSnapshot/DeleteSnapshot/ListSnapshots);
+  live `VolumeSnapshot` create/restore is the manual e2e step.
+
+---
+
 ## ADR-0007 — Project identity: renamed to `simple-zfs-csi`
 
 **Status:** Accepted (2026-07-17) · **Scope:** module path, API group, CSI driver name, PVC annotation prefix, Helm chart, image names

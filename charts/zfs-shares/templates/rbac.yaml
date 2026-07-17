@@ -1,0 +1,158 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfsshares"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfsshares/status"]
+    verbs: ["get", "update", "patch"]
+{{- if .Values.nfs.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-nfs
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nfs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zfs-shares.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "nfs") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.nvmeof.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-nvmeof
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nvmeof
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zfs-shares.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "nvmeof") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.discovery.enabled }}
+---
+# Tier 1 discovery: publishes ZfsPool objects and their status from each node.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-discovery
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: discovery
+rules:
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfspools"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfspools/status"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-discovery
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zfs-shares.fullname" . }}-discovery
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "discovery") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.watcher.enabled }}
+---
+# Tier 2 watcher: watches Nodes and offlines dead nodes' ZfsPool status.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-watcher
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watcher
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfspools"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfspools/status"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-watcher
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zfs-shares.fullname" . }}-watcher
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "watcher") }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.watcher.leaderElect }}
+---
+# Namespaced permissions for the watcher's leader-election lease.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-watcher-leaderelection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watcher
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-watcher-leaderelection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "zfs-shares.fullname" . }}-watcher-leaderelection
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "watcher") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}

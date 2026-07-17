@@ -1,0 +1,199 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: zfssnapshots.storage.simple-zfs-csi.io
+spec:
+  group: storage.simple-zfs-csi.io
+  names:
+    kind: ZfsSnapshot
+    listKind: ZfsSnapshotList
+    plural: zfssnapshots
+    shortNames:
+    - zsnap
+    singular: zfssnapshot
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolGUID
+      name: Pool
+      type: string
+    - jsonPath: .spec.dataset
+      name: Dataset
+      type: string
+    - jsonPath: .spec.snapshotName
+      name: Snapshot
+      type: string
+    - jsonPath: .status.readyToUse
+      name: Ready
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ZfsSnapshot is the Schema for the zfssnapshots API. It is a cluster-scoped
+          "intent to snapshot" a ZFS dataset or zvol on a specific pool (by GUID). The
+          CSI controller creates it; the node agent currently hosting the pool takes the
+          ZFS snapshot and reports readiness, creation time and restore size.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ZfsSnapshotSpec is the desired point-in-time snapshot of a source dataset/zvol
+              on the pool identified by PoolGUID. It is a separate lifecycle from ZfsDataset
+              (derive-from-source, read-only, restore/clone) — see design-decisions ADR-0006.
+              The agent on the node currently hosting the pool takes `<dataset>@<snapshotName>`.
+            properties:
+              dataset:
+                description: |-
+                  Dataset is the source dataset's logical path relative to the pool root, e.g.
+                  "k8s/pvc-123". Combined with the pool name and SnapshotName it yields the
+                  full ZFS snapshot name "<poolName>/<dataset>@<snapshotName>".
+                minLength: 1
+                type: string
+              poolGUID:
+                description: |-
+                  PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name without
+                  the "zpool-" prefix) that hosts the source dataset. The agent derives the
+                  concrete pool name from the matching ZfsPool.status.
+                minLength: 1
+                type: string
+              snapshotName:
+                description: |-
+                  SnapshotName is the ZFS snapshot short name (the part after "@"). It is
+                  immutable for the lifetime of the snapshot.
+                minLength: 1
+                type: string
+              sourceVolume:
+                description: |-
+                  SourceVolume is the CSI source volume id (the source ZfsDataset's
+                  metadata.name). It is carried for back-reference and CSI ListSnapshots
+                  reporting; the agent does not need it to take the snapshot.
+                type: string
+            required:
+            - dataset
+            - poolGUID
+            - snapshotName
+            type: object
+          status:
+            description: ZfsSnapshotStatus reports the observed snapshot state on
+              the node.
+            properties:
+              conditions:
+                description: Conditions represents the latest available observations.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              creationTime:
+                description: |-
+                  CreationTime is the snapshot's ZFS creation time (from the `creation`
+                  property). It maps to the CSI Snapshot.creation_time field.
+                format: date-time
+                type: string
+              message:
+                description: Message carries human-readable detail about the current
+                  phase.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the spec generation last reconciled.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is a coarse summary of the current state.
+                type: string
+              readyToUse:
+                description: |-
+                  ReadyToUse is true once the snapshot exists and can be restored/cloned. It
+                  maps directly to the CSI Snapshot.ready_to_use field.
+                type: boolean
+              restoreSize:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  RestoreSize is the referenced logical size of the snapshot in bytes — the
+                  minimum volume size needed to restore it. It maps to CSI Snapshot.size_bytes.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

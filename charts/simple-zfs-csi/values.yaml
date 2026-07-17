@@ -223,6 +223,21 @@ csiController:
     extraArgs: []
     # -- Resource requests/limits for the sidecar.
     resources: {}
+  # external-snapshotter sidecar (volume snapshots). Requires the snapshot CRDs
+  # and the snapshot-controller to be installed cluster-wide (a prerequisite,
+  # not shipped by this chart). Create a VolumeSnapshotClass via
+  # `volumeSnapshotClasses` below.
+  snapshotter:
+    # -- Deploy the csi-snapshotter sidecar (enables volume snapshots).
+    enabled: true
+    # -- csi-snapshotter image repository.
+    image: registry.k8s.io/sig-storage/csi-snapshotter
+    # -- csi-snapshotter image tag.
+    tag: v8.2.0
+    # -- Extra args for csi-snapshotter.
+    extraArgs: []
+    # -- Resource requests/limits for the sidecar.
+    resources: {}
   # -- Extra CLI args for the csi-controller binary.
   extraArgs: []
   # -- Resource requests/limits for the plugin container.
@@ -310,3 +325,14 @@ storageClasses: {}
   #     datasetPrefix: k8s/block
   #     protocol: nvmeof
   #     volblocksize: 16k
+
+# -------- Example VolumeSnapshotClasses --------
+# -- VolumeSnapshotClasses to install with the chart. Each entry becomes a
+# -- VolumeSnapshotClass named "<fullname>-<key>". By default none are installed.
+# -- Requires the snapshot CRDs + snapshot-controller installed cluster-wide and
+# -- `csiController.snapshotter.enabled: true`.
+volumeSnapshotClasses: {}
+  # nfs:
+  #   isDefault: false
+  #   deletionPolicy: Delete
+  #   parameters: {}

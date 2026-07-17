@@ -126,6 +126,30 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
         {{- end }}
+        {{- if .Values.csiController.snapshotter.enabled }}
+        - name: csi-snapshotter
+          image: {{ .Values.csiController.snapshotter.image }}:{{ .Values.csiController.snapshotter.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --csi-address={{ .Values.csiController.socketDir }}/csi.sock
+            - --leader-election
+            - --leader-election-namespace=$(POD_NAMESPACE)
+            {{- with .Values.csiController.snapshotter.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ .Values.csiController.socketDir }}
+          {{- with .Values.csiController.snapshotter.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
       volumes:
         - name: socket-dir
           emptyDir: {}

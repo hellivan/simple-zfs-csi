@@ -82,6 +82,33 @@ func TestDestroy_PropagatesOtherErrors(t *testing.T) {
 	}
 }
 
+func TestSnapshot_Args(t *testing.T) {
+	f := &fakeRunner{}
+	z := &CLI{Run: f.run}
+	if err := z.Snapshot(context.Background(), "tank/k8s/pvc-1@snap-1"); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	want := []string{"snapshot", "tank/k8s/pvc-1@snap-1"}
+	if !reflect.DeepEqual(f.gotArgs, want) {
+		t.Errorf("args = %v, want %v", f.gotArgs, want)
+	}
+}
+
+func TestSnapshot_IdempotentOnExists(t *testing.T) {
+	f := &fakeRunner{err: errors.New("cannot create snapshot 'tank/x@s': dataset already exists")}
+	z := &CLI{Run: f.run}
+	if err := z.Snapshot(context.Background(), "tank/x@s"); err != nil {
+		t.Fatalf("Snapshot should ignore already-exists, got %v", err)
+	}
+}
+
+func TestSnapshot_RejectsMissingAt(t *testing.T) {
+	z := &CLI{Run: (&fakeRunner{}).run}
+	if err := z.Snapshot(context.Background(), "tank/x"); err == nil {
+		t.Fatal("expected error for snapshot name without '@'")
+	}
+}
+
 func TestGet_NotExistWrapsSentinel(t *testing.T) {
 	f := &fakeRunner{err: errors.New("cannot open 'tank/x': dataset does not exist")}
 	z := &CLI{Run: f.run}

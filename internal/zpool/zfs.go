@@ -45,6 +45,10 @@ type ZFS interface {
 	CreateDataset(ctx context.Context, name string, props map[string]string) error
 	// CreateZvol creates a block zvol of the given logical size in bytes.
 	CreateZvol(ctx context.Context, name string, sizeBytes int64, props map[string]string) error
+	// Snapshot creates the snapshot named by the full ZFS snapshot name
+	// "pool/dataset@snap". It is idempotent: an already-existing snapshot is not
+	// an error.
+	Snapshot(ctx context.Context, name string) error
 	// Destroy removes a dataset/zvol. It is idempotent: destroying a
 	// non-existent object is not an error. recursive also destroys children.
 	Destroy(ctx context.Context, name string, recursive bool) error
@@ -123,6 +127,22 @@ func (z *CLI) Destroy(ctx context.Context, name string, recursive bool) error {
 	args = append(args, name)
 	_, err := z.run(ctx, args...)
 	if err != nil && isNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+// Snapshot creates the snapshot "pool/dataset@snap", treating an already-existing
+// snapshot as success (idempotent).
+func (z *CLI) Snapshot(ctx context.Context, name string) error {
+	if name == "" {
+		return fmt.Errorf("snapshot name is empty")
+	}
+	if !strings.Contains(name, "@") {
+		return fmt.Errorf("snapshot name %q must be of the form pool/dataset@snap", name)
+	}
+	_, err := z.run(ctx, "snapshot", name)
+	if err != nil && isExists(err) {
 		return nil
 	}
 	return err
@@ -212,6 +232,12 @@ func propArgs(props map[string]string) []string {
 // isNotExist reports whether a CLI error is a ZFS "does not exist" failure.
 func isNotExist(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "does not exist")
+}
+
+// isExists reports whether a CLI error is a ZFS "already exists" failure, letting
+// snapshot creation be idempotent.
+func isExists(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "already exists")
 }
 
 // compile-time assertion that CLI satisfies ZFS.

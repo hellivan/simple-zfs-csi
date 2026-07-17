@@ -19,13 +19,15 @@ node-pinned *exports*, and per-node aggregators execute those exports.
 | `nfs-controller` | `simple-zfs-csi-nfs` | DaemonSet (storage nodes) | `protocol: nfs` `NetworkExport` | writes `/etc/exports`, runs `exportfs -ra`, supervises the NFS server |
 | `nvmeof-controller` | `simple-zfs-csi-nvmeof` | DaemonSet (storage nodes) | `protocol: nvmeof` `NetworkExport` | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
 
-The four CRDs form a compile-down chain — a PVC turns into a `ZfsDataset` +
-`ZfsShare`, and the `ZfsShare` renders a `NetworkExport`:
+The CRDs form a compile-down chain — a PVC turns into a `ZfsDataset` +
+`ZfsShare`, and the `ZfsShare` renders a `NetworkExport`; separately, a
+`VolumeSnapshot` turns into a `ZfsSnapshot`:
 
 | CRD | Scope | Keyed on | Written by | Purpose |
 |-----|-------|----------|------------|---------|
 | `ZfsPool` | Cluster | pool GUID (`metadata.name`) | discovery + operator | routing + health of a physical pool |
 | `ZfsDataset` | Cluster | `spec.poolGUID` | csi-controller (creates), agent (reconciles) | dataset/zvol allocation intent |
+| `ZfsSnapshot` | Cluster | `spec.poolGUID` + source dataset | csi-controller (creates), agent (reconciles) | point-in-time `dataset@snap` for restore/clone |
 | `ZfsShare` | Cluster | `spec.poolGUID` + `spec.dataset` | csi-controller (creates), operator (reconciles) | ZFS-centric "intent to share"; renders a `NetworkExport` |
 | `NetworkExport` | Cluster | `spec.nodeName` + `spec.path` | operator (owns) or admin (standalone) | generic, ZFS-agnostic node-local export executor contract |
 
@@ -310,7 +312,7 @@ Common values (see [charts/simple-zfs-csi/values.yaml](charts/simple-zfs-csi/val
 
 ### CRD management & upgrades
 
-The four CRDs (`ZfsPool`, `ZfsDataset`, `ZfsShare`, `NetworkExport`) are generated
+The five CRDs (`ZfsPool`, `ZfsDataset`, `ZfsSnapshot`, `ZfsShare`, `NetworkExport`) are generated
 from the Go types (`make manifests`) and shipped in the chart's Helm-native
 [charts/simple-zfs-csi/crds](charts/simple-zfs-csi/crds) directory. Helm treats `crds/`
 specially:

@@ -130,6 +130,8 @@ func (c *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.C
 		Capabilities: []*csi.ControllerServiceCapability{
 			rpcCapability(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME),
 			rpcCapability(csi.ControllerServiceCapability_RPC_EXPAND_VOLUME),
+			rpcCapability(csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT),
+			rpcCapability(csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS),
 		},
 	}, nil
 }

@@ -40,7 +40,7 @@ tracks **what to build, in what order, and how to verify each step.**
 | `ZfsDataset` | Cluster | `spec.poolGUID` | CSI controller (creates), agent (reconciles) | dataset/zvol allocation intent |
 | `ZfsShare` | Cluster | `spec.poolGUID` + `spec.dataset` | CSI controller (creates), operator (ZfsShare reconciler) | ZFS-centric "intent to share"; renders a child `NetworkExport` |
 | `NetworkExport` | Cluster | `spec.nodeName` + `spec.path` | operator (ZfsShare reconciler, owns) or admin (standalone) | generic, ZFS-agnostic node-local export executor contract |
-| `ZfsSnapshot` *(Step 9)* | Cluster | `spec.poolGUID` + source dataset | CSI controller (creates), agent (reconciles) | point-in-time `dataset@snap`; source for clone/restore (separate CRD per ADR-0006) |
+| `ZfsSnapshot` | Cluster | `spec.poolGUID` + source dataset | CSI controller (creates), agent (reconciles) | point-in-time `dataset@snap`; source for clone/restore (separate CRD per ADR-0006) |
 
 Key rule: **ZfsShare compiles down to NetworkExport.** Only `NetworkExport` controllers
 touch `/etc/exports` / nvmet `configfs` — exactly one aggregator per node per protocol.
@@ -145,14 +145,21 @@ Spec-driven size convergence, online grow.
   `allowVolumeExpansion: true` on StorageClasses.
 - Verify: unit tests (controller expand fs/zvol, node expand nvme/nfs); `helm template`.
 
-### Step 9 — Snapshots
+### Step 9 — Snapshots  ✅ done (ADR-0008)
 Dedicated `ZfsSnapshot` CRD (grouped by lifecycle, not ZFS taxonomy — ADR-0006).
 - Agent: `zfs snapshot pool/ds@snap` (create), `zfs destroy pool/ds@snap` (finalizer);
-  status `readyToUse`, `creationTime`, `restoreSize` (referenced/used bytes).
-- CSI controller: `CreateSnapshot`/`DeleteSnapshot`/`ListSnapshots`; advertise
+  status `readyToUse`, `creationTime` (from the ZFS `creation` property),
+  `restoreSize` (referenced bytes). Only the node currently hosting the pool acts.
+- CSI controller: `CreateSnapshot` (looks up the source `ZfsDataset` for pool +
+  dataset, writes a `ZfsSnapshot`, waits `readyToUse`), `DeleteSnapshot`,
+  `ListSnapshots` (id/source filters + offset pagination); advertises
   `CREATE_DELETE_SNAPSHOT` + `LIST_SNAPSHOTS`.
-- Deploy: `csi-snapshotter` sidecar + `VolumeSnapshotClass` + RBAC; snapshot CRDs.
-- Verify: `make manifests` (new CRD/field), unit tests, e2e `VolumeSnapshot`.
+- Deploy: `csi-snapshotter` sidecar (`csiController.snapshotter.*`, on by default) +
+  RBAC for `volumesnapshotcontents`/`volumesnapshotclasses`; optional
+  `volumeSnapshotClasses` chart values render `VolumeSnapshotClass` objects. The
+  snapshot CRDs + snapshot-controller are a cluster prerequisite (not shipped).
+- Verify: `make manifests` (new CRD), unit tests (zfs `Snapshot`, agent reconcile,
+  controller CreateSnapshot/DeleteSnapshot/ListSnapshots); `helm template`.
 
 ### Step 10 — Volume from snapshot / clone
 - CSI controller: `CreateVolume` honours `VolumeContentSource` (snapshot or volume) →
@@ -174,7 +181,7 @@ Dedicated `ZfsSnapshot` CRD (grouped by lifecycle, not ZFS taxonomy — ADR-0006
 | 6 controller | `build` | — | csi-sanity + PVC provisions |
 | 7 node | `build` | — | csi-sanity + pod mounts (NFS + NVMe-oF) |
 | 8 expansion ✅ | `vet`+`build`+`helm-template` | controller/node expand unit tests | PVC resize grows fs/zvol |
-| 9 snapshots | `make manifests`+`build` | snapshot reconcile + CreateSnapshot | `VolumeSnapshot` create/delete |
+| 9 snapshots ✅ | `make manifests`+`build` | snapshot reconcile + CreateSnapshot | `VolumeSnapshot` create/delete |
 | 10 clone/restore | `make manifests`+`build` | clone spec + CreateVolume source | PVC from snapshot; PVC clone |
 
 ## Out of scope (tracked, not now)

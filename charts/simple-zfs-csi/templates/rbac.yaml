@@ -73,6 +73,13 @@ rules:
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfsdatasets/status"]
     verbs: ["get", "update", "patch"]
+  # ZfsSnapshot: the agent takes/destroys `dataset@snap` on the hosting node.
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfssnapshots"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfssnapshots/status"]
+    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -187,10 +194,10 @@ metadata:
 rules:
   # --- driver: ZFS-centric CRDs it authors ---
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsdatasets", "zfsshares"]
+    resources: ["zfsdatasets", "zfsshares", "zfssnapshots"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsdatasets/status", "zfsshares/status"]
+    resources: ["zfsdatasets/status", "zfsshares/status", "zfssnapshots/status"]
     verbs: ["get"]
   # --- driver: PVC annotations for the parameter inheritance layer ---
   - apiGroups: [""]
@@ -219,6 +226,18 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims/status"]
     verbs: ["patch", "update"]
+  {{- if .Values.csiController.snapshotter.enabled }}
+  # --- external-snapshotter sidecar ---
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents/status"]
+    verbs: ["update", "patch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

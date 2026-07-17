@@ -1,0 +1,20 @@
+{{- range $name, $vsc := .Values.volumeSnapshotClasses }}
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "simple-zfs-csi.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: volumesnapshotclass
+  {{- if $vsc.isDefault }}
+  annotations:
+    snapshot.storage.kubernetes.io/is-default-class: "true"
+  {{- end }}
+driver: {{ $.Values.driverName }}
+deletionPolicy: {{ $vsc.deletionPolicy | default "Delete" }}
+{{- with $vsc.parameters }}
+parameters:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
