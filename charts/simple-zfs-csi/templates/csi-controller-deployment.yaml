@@ -150,6 +150,30 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
         {{- end }}
+        {{- if .Values.csiController.attacher.enabled }}
+        - name: csi-attacher
+          image: {{ .Values.csiController.attacher.image }}:{{ .Values.csiController.attacher.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --csi-address={{ .Values.csiController.socketDir }}/csi.sock
+            - --leader-election
+            - --leader-election-namespace=$(POD_NAMESPACE)
+            {{- with .Values.csiController.attacher.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ .Values.csiController.socketDir }}
+          {{- with .Values.csiController.attacher.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
       volumes:
         - name: socket-dir
           emptyDir: {}

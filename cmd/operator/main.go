@@ -7,6 +7,10 @@
 //   - the ZfsShare translator: resolves a ZFS-centric ZfsShare (pool GUID +
 //     dataset) to the pool's current node and renders a node-pinned
 //     NetworkExport, re-targeting it when the pool moves.
+//   - the attach-request aggregator: ref-counts ZfsShareAttachRequest objects
+//     (one per attached node) into a lazily-managed ZfsShare per volume, so a
+//     volume is exported only to nodes that currently hold an attach request
+//     (zero-trust attach-stage access control, ADR-0010).
 package main
 
 import (
@@ -76,6 +80,14 @@ func main() {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up zfsshare reconciler")
+		os.Exit(1)
+	}
+
+	if err := (&controller.ZfsShareAttachRequestReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up zfsshareattachrequest reconciler")
 		os.Exit(1)
 	}
 

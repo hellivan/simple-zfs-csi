@@ -11,8 +11,13 @@ const (
 	// SharePhasePending means the target pool is not yet resolvable (unknown
 	// GUID, no current node, or the node is offline); no export is rendered.
 	SharePhasePending ZfsSharePhase = "Pending"
-	// SharePhaseBound means the share resolved to a node and a child
-	// NetworkExport has been rendered.
+	// SharePhaseExporting means the child NetworkExport has been rendered but the
+	// node-local aggregator has not yet confirmed it live for the current
+	// generation; consumers must not mount yet.
+	SharePhaseExporting ZfsSharePhase = "Exporting"
+	// SharePhaseBound means the share resolved to a node, a child NetworkExport
+	// has been rendered, and the aggregator confirmed it exported for the
+	// current generation.
 	SharePhaseBound ZfsSharePhase = "Bound"
 	// SharePhaseError means the last reconcile attempt failed.
 	SharePhaseError ZfsSharePhase = "Error"

@@ -10,7 +10,17 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ## ADR-0010 — Attach-stage share lifecycle & zero-trust access control
 
-**Status:** Accepted direction (2026-07-17), not yet implemented · **Scope:** CSI controller, csi-node (`CSIDriver`), operator, new `ZfsShareAttachRequest` CRD, `NetworkExport`/`ZfsShare` status · **Supersedes** ADR-0001 §2; **implements/extends** ADR-0005.
+**Status:** Accepted & implemented (2026-07-17) · **Scope:** CSI controller, csi-node (`CSIDriver`), operator, new `ZfsShareAttachRequest` CRD, `NetworkExport`/`ZfsShare` status · **Supersedes** ADR-0001 §2; **implements/extends** ADR-0005.
+
+> **Implementation note.** Readiness is generation-gated using the existing
+> `status.observedGeneration` fields rather than the mooted per-object
+> `allowedClients` status: `ZfsShare` gained an `Exporting` phase and is marked
+> `Bound` only once its child `NetworkExport` reports `Exported` for the current
+> generation; the attach request is `Ready` only when its `ZfsShare` is `Bound`
+> at `observedGeneration >= generation`. NVMe-oF host-NQN allow-listing is
+> deferred (decision 3 ref-counting only exercises for NFS RWX), so an NVMe-oF
+> share is temporal-only for now: it exists solely while its single consumer is
+> attached, with allowed hosts left open.
 
 ### Context
 

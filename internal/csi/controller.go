@@ -2,6 +2,9 @@ package csi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -96,10 +99,10 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if err != nil {
 		return nil, err
 	}
-	if err := c.ensureShare(ctx, name, shareSpec(rp, dataset)); err != nil {
-		return nil, err
-	}
 
+	// The share is lazy (ADR-0010): CreateVolume writes only the ZfsDataset. The
+	// export is created on demand at ControllerPublishVolume (attach) and torn
+	// down at the last detach, so nothing is exported until a node is authorized.
 	c.Log.Info("provisioned volume", "name", name, "pool", rp.PoolGUID, "dataset", dataset, "protocol", rp.Protocol, "path", ready.Status.Path)
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
@@ -122,6 +125,11 @@ func (c *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
 
+	// Best-effort: remove any lingering attach requests so the operator tears the
+	// share down instead of trying to re-aggregate against a deleted dataset.
+	if err := c.deleteAttachRequests(ctx, id); err != nil {
+		return nil, err
+	}
 	share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: id}}
 	if err := c.Client.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
 		return nil, status.Errorf(codes.Internal, "delete ZfsShare %q: %v", id, err)
@@ -135,11 +143,75 @@ func (c *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
+// ControllerPublishVolume authorizes a node to access a volume by creating a
+// ZfsShareAttachRequest{volume, node} and waiting for the operator to export the
+// aggregated share for the node. It is the zero-trust attach hook (ADR-0010):
+// the export exists only while at least one node holds an attach request.
+func (c *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	nodeID := req.GetNodeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if nodeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "node id is required")
+	}
+
+	vol := &storagev1alpha1.ZfsDataset{}
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: volumeID}, vol); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, status.Errorf(codes.NotFound, "volume %q not found", volumeID)
+		}
+		return nil, status.Errorf(codes.Internal, "get ZfsDataset %q: %v", volumeID, err)
+	}
+	// Defense in depth: a zvol (NVMe-oF) is single-node only.
+	if vol.Spec.Type == storagev1alpha1.DatasetTypeVolume &&
+		hasMultiNodeAccessMode([]*csi.VolumeCapability{req.GetVolumeCapability()}) {
+		return nil, status.Error(codes.InvalidArgument,
+			"protocol nvmeof is single-node only; multi-node (RWX) access modes are not supported")
+	}
+
+	name := attachRequestName(volumeID, nodeID)
+	if err := c.ensureAttachRequest(ctx, name, volumeID, nodeID); err != nil {
+		return nil, err
+	}
+	if err := c.waitAttachReady(ctx, name); err != nil {
+		return nil, err
+	}
+
+	c.Log.Info("published volume", "name", volumeID, "node", nodeID, "attachRequest", name)
+	return &csi.ControllerPublishVolumeResponse{}, nil
+}
+
+// ControllerUnpublishVolume revokes a node's access by deleting its attach
+// request; the operator tears down the aggregated share once the last request is
+// gone.
+func (c *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	nodeID := req.GetNodeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if nodeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "node id is required")
+	}
+
+	name := attachRequestName(volumeID, nodeID)
+	ar := &storagev1alpha1.ZfsShareAttachRequest{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if err := c.Client.Delete(ctx, ar); err != nil && !apierrors.IsNotFound(err) {
+		return nil, status.Errorf(codes.Internal, "delete ZfsShareAttachRequest %q: %v", name, err)
+	}
+
+	c.Log.Info("unpublished volume", "name", volumeID, "node", nodeID, "attachRequest", name)
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
+}
+
 // ControllerGetCapabilities advertises CREATE_DELETE_VOLUME.
 func (c *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	return &csi.ControllerGetCapabilitiesResponse{
 		Capabilities: []*csi.ControllerServiceCapability{
 			rpcCapability(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME),
+			rpcCapability(csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME),
 			rpcCapability(csi.ControllerServiceCapability_RPC_EXPAND_VOLUME),
 			rpcCapability(csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT),
 			rpcCapability(csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS),
@@ -290,30 +362,90 @@ func (c *ControllerServer) ensureVolume(ctx context.Context, name string, desire
 	}
 }
 
-// ensureShare creates the ZfsShare, or validates compatibility of an existing one.
-func (c *ControllerServer) ensureShare(ctx context.Context, name string, desired storagev1alpha1.ZfsShareSpec) error {
-	existing := &storagev1alpha1.ZfsShare{}
+// ensureAttachRequest creates the ZfsShareAttachRequest for a (volume, node)
+// pair, or validates that an existing one matches (idempotent publish).
+func (c *ControllerServer) ensureAttachRequest(ctx context.Context, name, volume, node string) error {
+	existing := &storagev1alpha1.ZfsShareAttachRequest{}
 	err := c.Client.Get(ctx, client.ObjectKey{Name: name}, existing)
 	switch {
 	case apierrors.IsNotFound(err):
-		share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: desired}
-		if err := c.Client.Create(ctx, share); err != nil {
+		ar := &storagev1alpha1.ZfsShareAttachRequest{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: volume, NodeName: node},
+		}
+		if err := c.Client.Create(ctx, ar); err != nil {
 			if apierrors.IsAlreadyExists(err) {
-				return c.ensureShare(ctx, name, desired)
+				return c.ensureAttachRequest(ctx, name, volume, node)
 			}
-			return status.Errorf(codes.Internal, "create ZfsShare %q: %v", name, err)
+			return status.Errorf(codes.Internal, "create ZfsShareAttachRequest %q: %v", name, err)
 		}
 		return nil
 	case err != nil:
-		return status.Errorf(codes.Internal, "get ZfsShare %q: %v", name, err)
+		return status.Errorf(codes.Internal, "get ZfsShareAttachRequest %q: %v", name, err)
 	default:
-		if existing.Spec.PoolGUID != desired.PoolGUID ||
-			existing.Spec.Dataset != desired.Dataset ||
-			existing.Spec.Protocol != desired.Protocol {
-			return status.Errorf(codes.AlreadyExists, "share %q already exists with different parameters", name)
+		if existing.Spec.VolumeName != volume || existing.Spec.NodeName != node {
+			return status.Errorf(codes.AlreadyExists, "attach request %q already exists for a different (volume, node)", name)
 		}
 		return nil
 	}
+}
+
+// waitAttachReady polls the ZfsShareAttachRequest until the operator reports the
+// aggregated share exported for the current generation, or the deadline elapses.
+func (c *ControllerServer) waitAttachReady(ctx context.Context, name string) error {
+	interval := c.PollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	waitCtx := ctx
+	if c.CreateTimeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, c.CreateTimeout)
+		defer cancel()
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		ar := &storagev1alpha1.ZfsShareAttachRequest{}
+		if err := c.Client.Get(waitCtx, client.ObjectKey{Name: name}, ar); err != nil {
+			return status.Errorf(codes.Internal, "get ZfsShareAttachRequest %q: %v", name, err)
+		}
+		if ar.Status.Ready && ar.Status.ObservedGeneration >= ar.Generation {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return status.Errorf(codes.DeadlineExceeded, "timed out waiting for volume attach %q to become ready", name)
+		case <-ticker.C:
+		}
+	}
+}
+
+// deleteAttachRequests best-effort removes every attach request for a volume,
+// used on DeleteVolume so no orphan keeps a share aggregated.
+func (c *ControllerServer) deleteAttachRequests(ctx context.Context, volume string) error {
+	var list storagev1alpha1.ZfsShareAttachRequestList
+	if err := c.Client.List(ctx, &list); err != nil {
+		return status.Errorf(codes.Internal, "list attach requests for %q: %v", volume, err)
+	}
+	for i := range list.Items {
+		if list.Items[i].Spec.VolumeName != volume {
+			continue
+		}
+		if err := c.Client.Delete(ctx, &list.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return status.Errorf(codes.Internal, "delete attach request %q: %v", list.Items[i].Name, err)
+		}
+	}
+	return nil
+}
+
+// attachRequestName derives a stable, DNS-safe object name for a (volume, node)
+// attach request. The node is hashed to bound the length and avoid invalid
+// characters while keeping the volume id readable.
+func attachRequestName(volume, node string) string {
+	sum := sha256.Sum256([]byte(node))
+	return fmt.Sprintf("%s-%s", volume, hex.EncodeToString(sum[:])[:12])
 }
 
 // waitVolumeReady polls the ZfsDataset until it is Ready, fails, or the deadline
@@ -394,22 +526,6 @@ func volumeSpec(rp *ResolvedParams, dataset string, sizeBytes int64) storagev1al
 			Size:         *resource.NewQuantity(sizeBytes, resource.BinarySI),
 			Volblocksize: rp.Volblocksize,
 		}
-	}
-	return spec
-}
-
-// shareSpec builds the desired ZfsShare spec from resolved parameters.
-func shareSpec(rp *ResolvedParams, dataset string) storagev1alpha1.ZfsShareSpec {
-	spec := storagev1alpha1.ZfsShareSpec{
-		PoolGUID: rp.PoolGUID,
-		Dataset:  dataset,
-		Protocol: rp.Protocol,
-	}
-	switch rp.Protocol {
-	case storagev1alpha1.ProtocolNFS:
-		spec.NFS = &storagev1alpha1.NFSExportSpec{Clients: rp.NFSClients}
-	case storagev1alpha1.ProtocolNVMeoF:
-		spec.NVMeoF = &storagev1alpha1.NVMeoFExportSpec{AllowedHosts: rp.NVMeoFAllowedHosts}
 	}
 	return spec
 }

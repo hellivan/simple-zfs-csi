@@ -6,8 +6,10 @@ metadata:
   labels:
     {{- include "simple-zfs-csi.labels" . | nindent 4 }}
 spec:
-  # The controller provisions via CRDs; no attach step is required.
-  attachRequired: false
+  # Attach is used purely as the zero-trust authorization hook (ADR-0010): the
+  # controller creates the network export only for authorized nodes at
+  # ControllerPublishVolume. Set false to disable attach-stage access control.
+  attachRequired: {{ .Values.csiDriver.attachRequired }}
   # The node plugin reads the volume_context at publish time.
   podInfoOnMount: false
   volumeLifecycleModes:

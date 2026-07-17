@@ -168,24 +168,32 @@ Dedicated `ZfsSnapshot` CRD (grouped by lifecycle, not ZFS taxonomy — ADR-0006
   `zfs snapshot`+`zfs clone` (from volume) instead of `zfs create`.
 - Verify: `make manifests` if spec grows a source ref; unit tests; e2e restore + clone.
 
-### Step 11 — Attach-stage share lifecycle & zero-trust access control (ADR-0010)
+### Step 11 — Attach-stage share lifecycle & zero-trust access control (ADR-0010) ✅
 Move the share lifecycle to the CSI attach stage so nothing is exported until a
 node is authorized; forbid NVMe-oF multi-node.
-- **11a (ship first, standalone):** reject `MULTI_NODE_*` access modes for
+- **11a ✅ (shipped standalone):** reject `MULTI_NODE_*` access modes for
   `protocol: nvmeof` in `CreateVolume` + `ValidateVolumeCapabilities` (RWX-on-zvol
   corruption). NFS stays the RWX path.
-- New `ZfsShareAttachRequest` CRD (one per `volume,node`); `allowedClients` +
-  status subresources on `ZfsShare`/`NetworkExport`.
-- CSI controller: stop creating `ZfsShare` in `CreateVolume` (now `ZfsDataset`
-  only); implement `ControllerPublish/Unpublish` to create/delete the request;
-  poll the request status (generation-gated) before returning. Advertise
+- New `ZfsShareAttachRequest` CRD (one per `volume,node`). Readiness is
+  generation-gated using the existing `status.observedGeneration` fields (no new
+  `allowedClients` fields were needed): a new `Exporting` phase on `ZfsShare`
+  marks it Bound only once the child `NetworkExport` reports `Exported` for the
+  current generation.
+- CSI controller: `CreateVolume` now writes **only** the `ZfsDataset` (lazy
+  share); `ControllerPublish/Unpublish` create/delete the attach request and poll
+  its status (generation-gated) before returning. Advertises
   `PUBLISH_UNPUBLISH_VOLUME`; `CSIDriver.attachRequired: true`.
 - Operator: attach-request aggregation reconciler — ≥1 request ⇒ ensure `ZfsShare`
-  (allow-list = resolved nodes); 0 ⇒ delete it. Readiness bubbles up
+  (NFS allow-list = the requesting nodes' internal IPs; NVMe-oF stays single-node,
+  temporal-only); 0 ⇒ delete it, ref-counted via a finalizer. Readiness bubbles up
   `NetworkExport.status → ZfsShare.status → ZfsShareAttachRequest.status`.
-- Deploy: `external-attacher` sidecar + `volumeattachments` RBAC.
-- Verify: unit tests (nvmeof RWX rejection, aggregation create/GC, status gating);
-  e2e RWO NVMe + RWX NFS attach/detach; static CSI PV for nvmeof.
+- Deploy: `external-attacher` sidecar (`csiController.attacher.*`) +
+  `volumeattachments` RBAC; operator gains `zfsshares` create/delete +
+  `zfsshareattachrequests` + `zfsdatasets`/`nodes` read.
+- Verify: `make manifests` (new CRD), unit tests (nvmeof RWX rejection,
+  publish/unpublish, aggregation create/GC, status gating), `helm template`.
+  e2e RWO NVMe + RWX NFS attach/detach and the static CSI PV for nvmeof remain the
+  manual steps.
 
 ## Verification matrix
 
@@ -202,7 +210,7 @@ node is authorized; forbid NVMe-oF multi-node.
 | 8 expansion ✅ | `vet`+`build`+`helm-template` | controller/node expand unit tests | PVC resize grows fs/zvol |
 | 9 snapshots ✅ | `make manifests`+`build` | snapshot reconcile + CreateSnapshot | `VolumeSnapshot` create/delete |
 | 10 clone/restore ✅ | `make manifests`+`build` | clone spec + CreateVolume source | PVC from snapshot; PVC clone |
-| 11 attach access-control | `make manifests`+`build`+`helm-template` | nvmeof RWX rejection, attach-request aggregation, status gating | RWO NVMe + RWX NFS attach/detach; static CSI PV |
+| 11 attach access-control ✅ | `make manifests`+`build`+`helm-template` | nvmeof RWX rejection, publish/unpublish, attach-request aggregation, status gating | RWO NVMe + RWX NFS attach/detach; static CSI PV |
 
 ## Out of scope (tracked, not now)
 - Backup pod (`ssh-daemon` + `cron-puller`) — separate pod, later; shares the host-exec helper.

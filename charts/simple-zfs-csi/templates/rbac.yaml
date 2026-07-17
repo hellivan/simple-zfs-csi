@@ -120,10 +120,21 @@ rules:
     verbs: ["get", "update", "patch"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfsshares"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfsshares/status"]
     verbs: ["get", "update", "patch"]
+  # Attach-stage access control (ADR-0010): aggregate per-node attach requests
+  # into a lazily-managed ZfsShare; read ZfsDataset + Node to build the allow-list.
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfsshareattachrequests"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfsshareattachrequests/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfsdatasets"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["networkexports"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -194,10 +205,10 @@ metadata:
 rules:
   # --- driver: ZFS-centric CRDs it authors ---
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsdatasets", "zfsshares", "zfssnapshots"]
+    resources: ["zfsdatasets", "zfsshares", "zfssnapshots", "zfsshareattachrequests"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsdatasets/status", "zfsshares/status", "zfssnapshots/status"]
+    resources: ["zfsdatasets/status", "zfsshares/status", "zfssnapshots/status", "zfsshareattachrequests/status"]
     verbs: ["get"]
   # --- driver: PVC annotations for the parameter inheritance layer ---
   - apiGroups: [""]
@@ -221,7 +232,10 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
   # --- external-resizer sidecar ---
   - apiGroups: [""]
     resources: ["persistentvolumeclaims/status"]

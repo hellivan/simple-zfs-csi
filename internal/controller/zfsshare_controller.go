@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -21,6 +22,11 @@ import (
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
+
+// exportReadyRequeue is how often the ZfsShare reconciler re-checks a rendered
+// export that the node has not yet confirmed live, as a fallback to the
+// Owns(NetworkExport) watch.
+const exportReadyRequeue = 5 * time.Second
 
 // ZfsShareReconciler is the cluster-wide translator that compiles a ZFS-centric
 // ZfsShare (keyed on pool GUID + dataset) into a node-pinned NetworkExport. It
@@ -91,6 +97,26 @@ func (r *ZfsShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		logger.Info("rendered NetworkExport", "op", op, "export", export.Name, "node", export.Spec.NodeName, "path", exportPath)
 	}
 
+	// Reflect the child export's readiness into the share status (ADR-0010): the
+	// share is Bound only once the node-local aggregator has confirmed the export
+	// live for the export's current generation. A stale "Exported" from before a
+	// re-render (e.g. an allow-list change) is rejected by the generation gate, so
+	// a consumer never mounts against an export that does not yet reflect its
+	// authorization.
+	fresh := &storagev1alpha1.NetworkExport{}
+	if err := r.Get(ctx, client.ObjectKey{Name: share.Name}, fresh); err != nil {
+		return ctrl.Result{}, r.setStatus(ctx, &share, storagev1alpha1.SharePhaseError, pool.Status.CurrentNode, exportPath,
+			"RenderFailed", err.Error())
+	}
+	exported := fresh.Status.Phase == storagev1alpha1.PhaseExported &&
+		fresh.Status.ObservedGeneration >= fresh.Generation
+	if !exported {
+		// The Owns(NetworkExport) watch re-drives us when the aggregator updates
+		// the export status; requeue as a fallback in case the event is missed.
+		return ctrl.Result{RequeueAfter: exportReadyRequeue}, r.setStatus(ctx, &share, storagev1alpha1.SharePhaseExporting,
+			pool.Status.CurrentNode, exportPath, "ExportNotReady", "waiting for the node to apply the export")
+	}
+
 	return ctrl.Result{}, r.setStatus(ctx, &share, storagev1alpha1.SharePhaseBound, pool.Status.CurrentNode, exportPath,
 		"Bound", fmt.Sprintf("exported %s on %s", exportPath, pool.Status.CurrentNode))
 }
@@ -127,7 +153,7 @@ func (r *ZfsShareReconciler) setStatus(ctx context.Context, share *storagev1alph
 	patched.Status.Path = exportPath
 	patched.Status.ObservedGeneration = share.Generation
 	patched.Status.Message = message
-	if phase == storagev1alpha1.SharePhaseBound {
+	if phase == storagev1alpha1.SharePhaseBound || phase == storagev1alpha1.SharePhaseExporting {
 		patched.Status.NetworkExportName = share.Name
 	}
 

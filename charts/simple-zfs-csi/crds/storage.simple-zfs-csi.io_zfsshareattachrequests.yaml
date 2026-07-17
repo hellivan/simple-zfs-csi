@@ -1,0 +1,175 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: zfsshareattachrequests.storage.simple-zfs-csi.io
+spec:
+  group: storage.simple-zfs-csi.io
+  names:
+    kind: ZfsShareAttachRequest
+    listKind: ZfsShareAttachRequestList
+    plural: zfsshareattachrequests
+    shortNames:
+    - zsar
+    singular: zfsshareattachrequest
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.volumeName
+      name: Volume
+      type: string
+    - jsonPath: .spec.nodeName
+      name: Node
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ZfsShareAttachRequest is the Schema for the zfsshareattachrequests API. It is a
+          cluster-scoped, per-(volume, node) attach ticket created by the CSI controller
+          at ControllerPublishVolume. The operator ref-counts these into a lazily-managed
+          ZfsShare so a volume is exported only to nodes that currently hold an attach
+          request (see design-decisions ADR-0010).
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ZfsShareAttachRequestSpec is a single node's request to attach (gain network
+              access to) a shared volume. The CSI controller creates exactly one per
+              (volume, node) at ControllerPublishVolume and deletes it at
+              ControllerUnpublishVolume. The operator aggregates all requests for a volume
+              into a lazily-managed ZfsShare (see design-decisions ADR-0010): as long as at
+              least one request exists the share is exported to the requesting nodes; when
+              the last request is removed the share (and its child NetworkExport) is torn
+              down. This makes the export zero-trust — it exists only while a node is
+              authorized, and disappears when the last consumer detaches.
+            properties:
+              nodeName:
+                description: |-
+                  NodeName is the Kubernetes node requesting access. The operator resolves it
+                  to a network client identity (for NFS: the node's internal IP) that is
+                  added to the aggregated share's allow-list.
+                minLength: 1
+                type: string
+              volumeName:
+                description: |-
+                  VolumeName is the CSI volume id (the source ZfsDataset metadata.name) the
+                  requesting node wants to attach.
+                minLength: 1
+                type: string
+            required:
+            - nodeName
+            - volumeName
+            type: object
+          status:
+            description: ZfsShareAttachRequestStatus reports whether the export is
+              live for this node.
+            properties:
+              conditions:
+                description: Conditions represents the latest available observations.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              message:
+                description: Message carries human-readable detail about the current
+                  state.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the spec generation last reconciled.
+                format: int64
+                type: integer
+              ready:
+                description: |-
+                  Ready is true once the aggregated ZfsShare is exported for the current
+                  generation, so a subsequent NodePublish will find a live export. The CSI
+                  controller's ControllerPublishVolume waits on this before returning.
+                type: boolean
+              shareName:
+                description: ShareName is the name of the aggregated ZfsShare serving
+                  this request.
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

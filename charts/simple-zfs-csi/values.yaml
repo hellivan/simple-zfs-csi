@@ -238,6 +238,20 @@ csiController:
     extraArgs: []
     # -- Resource requests/limits for the sidecar.
     resources: {}
+  # external-attacher sidecar (attach-stage access control). Drives
+  # ControllerPublish/Unpublish so a volume is exported only to authorized nodes
+  # (ADR-0010). Keep enabled in sync with csiDriver.attachRequired.
+  attacher:
+    # -- Deploy the external-attacher sidecar (enables attach-stage access control).
+    enabled: true
+    # -- external-attacher image repository.
+    image: registry.k8s.io/sig-storage/csi-attacher
+    # -- external-attacher image tag.
+    tag: v4.8.1
+    # -- Extra args for external-attacher.
+    extraArgs: []
+    # -- Resource requests/limits for the sidecar.
+    resources: {}
   # -- Extra CLI args for the csi-controller binary.
   extraArgs: []
   # -- Resource requests/limits for the plugin container.
@@ -301,6 +315,10 @@ csiNode:
 csiDriver:
   # -- Install the CSIDriver object for the driver.
   create: true
+  # -- Require a controller-issued attach step (external-attacher). This drives
+  # -- the zero-trust share lifecycle (ADR-0010): a volume is exported only to
+  # -- nodes that hold an attach request. Keep in sync with csiController.attacher.
+  attachRequired: true
 
 # -------- Example StorageClasses --------
 # -- StorageClasses to install with the chart. Each entry becomes a StorageClass

@@ -32,7 +32,7 @@ func newTestClient(t *testing.T, objs ...client.Object) client.Client {
 	}
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsSnapshot{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsShareAttachRequest{}).
 		WithObjects(objs...).
 		Build()
 }
@@ -118,15 +118,10 @@ func TestCreateVolume_NFSFilesystem(t *testing.T) {
 		t.Errorf("filesystem quota not set to 1Gi: %+v", vol.Spec.Filesystem)
 	}
 
+	// The share is lazy (ADR-0010): CreateVolume must NOT create a ZfsShare.
 	share := &storagev1alpha1.ZfsShare{}
-	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, share); err != nil {
-		t.Fatalf("get ZfsShare: %v", err)
-	}
-	if share.Spec.Protocol != storagev1alpha1.ProtocolNFS || share.Spec.Dataset != "k8s/pvc-1" {
-		t.Errorf("share spec = %+v", share.Spec)
-	}
-	if share.Spec.NFS == nil || len(share.Spec.NFS.Clients) != 1 {
-		t.Errorf("share NFS clients not defaulted: %+v", share.Spec.NFS)
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, share); !apierrors.IsNotFound(err) {
+		t.Errorf("expected no ZfsShare at provision time, got err=%v", err)
 	}
 }
 
@@ -262,6 +257,105 @@ func TestValidateVolumeCapabilities_NVMeoFSingleNodeConfirmed(t *testing.T) {
 	}
 }
 
+// markAttachReadyAsync flips the first attach request for a volume to Ready,
+// simulating the operator's aggregation reconciler.
+func markAttachReadyAsync(cl client.Client, volume string) {
+	go func() {
+		for i := 0; i < 200; i++ {
+			var list storagev1alpha1.ZfsShareAttachRequestList
+			if err := cl.List(context.Background(), &list); err == nil {
+				for j := range list.Items {
+					ar := &list.Items[j]
+					if ar.Spec.VolumeName == volume && !ar.Status.Ready {
+						ar.Status.Ready = true
+						ar.Status.ObservedGeneration = ar.Generation
+						_ = cl.Status().Update(context.Background(), ar)
+						return
+					}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+}
+
+func TestControllerPublishVolume_CreatesAttachRequestAndWaits(t *testing.T) {
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-10"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-10", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	cl := newTestClient(t, ds)
+	cs := newController(cl)
+	markAttachReadyAsync(cl, "pvc-10")
+
+	_, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId:         "pvc-10",
+		NodeId:           "node-a",
+		VolumeCapability: mountCaps()[0],
+	})
+	if err != nil {
+		t.Fatalf("ControllerPublishVolume: %v", err)
+	}
+
+	ar := &storagev1alpha1.ZfsShareAttachRequest{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: attachRequestName("pvc-10", "node-a")}, ar); err != nil {
+		t.Fatalf("expected attach request created: %v", err)
+	}
+	if ar.Spec.VolumeName != "pvc-10" || ar.Spec.NodeName != "node-a" {
+		t.Errorf("attach request spec = %+v", ar.Spec)
+	}
+}
+
+func TestControllerPublishVolume_NVMeoFMultiNodeRejected(t *testing.T) {
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-11"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-11", Type: storagev1alpha1.DatasetTypeVolume},
+	}
+	cs := newController(newTestClient(t, ds))
+	_, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId:         "pvc-11",
+		NodeId:           "node-a",
+		VolumeCapability: multiNodeMountCaps()[0],
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("err = %v, want InvalidArgument", err)
+	}
+}
+
+func TestControllerPublishVolume_MissingVolume(t *testing.T) {
+	cs := newController(newTestClient(t))
+	_, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId:         "nope",
+		NodeId:           "node-a",
+		VolumeCapability: mountCaps()[0],
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("err = %v, want NotFound", err)
+	}
+}
+
+func TestControllerUnpublishVolume_DeletesAttachRequest(t *testing.T) {
+	name := attachRequestName("pvc-12", "node-a")
+	ar := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-12", NodeName: "node-a"},
+	}
+	cl := newTestClient(t, ar)
+	cs := newController(cl)
+
+	if _, err := cs.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{
+		VolumeId: "pvc-12",
+		NodeId:   "node-a",
+	}); err != nil {
+		t.Fatalf("ControllerUnpublishVolume: %v", err)
+	}
+
+	got := &storagev1alpha1.ZfsShareAttachRequest{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: name}, got); !apierrors.IsNotFound(err) {
+		t.Errorf("expected attach request deleted, got err=%v", err)
+	}
+}
+
 func TestCreateVolume_IdempotentSameParams(t *testing.T) {
 	cl := newTestClient(t)
 	cs := newController(cl)
@@ -309,7 +403,7 @@ func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 			Namespace: "team-a",
 			Annotations: map[string]string{
 				// Non-restricted param: honoured.
-				"param.simple-zfs-csi.io/nfsOptions": "rw no_root_squash",
+				"param.simple-zfs-csi.io/property.compression": "lz4",
 				// StorageClass-only params: MUST be ignored.
 				"param.simple-zfs-csi.io/poolGUID":      "annotated-pool",
 				"param.simple-zfs-csi.io/datasetPrefix": "annotated-pfx",
@@ -345,15 +439,12 @@ func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 		t.Errorf("dataset = %q, want sc-pfx/pvc-7 (datasetPrefix is StorageClass-only)", vctx[CtxDataset])
 	}
 	// Non-restricted param from the annotation layer takes effect.
-	share := &storagev1alpha1.ZfsShare{}
-	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-7"}, share); err != nil {
-		t.Fatalf("get ZfsShare: %v", err)
+	vol := &storagev1alpha1.ZfsDataset{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-7"}, vol); err != nil {
+		t.Fatalf("get ZfsDataset: %v", err)
 	}
-	if share.Spec.NFS == nil || len(share.Spec.NFS.Clients) != 1 ||
-		len(share.Spec.NFS.Clients[0].Options) != 2 ||
-		share.Spec.NFS.Clients[0].Options[0] != "rw" ||
-		share.Spec.NFS.Clients[0].Options[1] != "no_root_squash" {
-		t.Errorf("NFS options not overridden by annotation: %+v", share.Spec.NFS)
+	if vol.Spec.Properties["compression"] != "lz4" {
+		t.Errorf("property.compression not overridden by annotation: %+v", vol.Spec.Properties)
 	}
 }
 

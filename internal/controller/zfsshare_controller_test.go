@@ -130,7 +130,7 @@ func TestZfsShareReconcile_RendersNetworkExport(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(pool, share).
-		WithStatusSubresource(&storagev1alpha1.ZfsShare{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.NetworkExport{}).
 		Build()
 
 	r := &ZfsShareReconciler{Client: c, Scheme: scheme}
@@ -156,6 +156,26 @@ func TestZfsShareReconcile_RendersNetworkExport(t *testing.T) {
 	}
 	if len(export.OwnerReferences) != 1 || export.OwnerReferences[0].Name != "pvc-1" || export.OwnerReferences[0].Kind != "ZfsShare" {
 		t.Errorf("owner reference not set to ZfsShare: %+v", export.OwnerReferences)
+	}
+
+	// Before the node-local aggregator confirms the export, the share is only
+	// Exporting (not yet Bound) so consumers do not mount prematurely.
+	var exporting storagev1alpha1.ZfsShare
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &exporting); err != nil {
+		t.Fatalf("get share: %v", err)
+	}
+	if exporting.Status.Phase != storagev1alpha1.SharePhaseExporting {
+		t.Errorf("phase = %q, want Exporting before export confirmed", exporting.Status.Phase)
+	}
+
+	// Simulate the aggregator confirming the export live for its generation.
+	export.Status.Phase = storagev1alpha1.PhaseExported
+	export.Status.ObservedGeneration = export.Generation
+	if err := c.Status().Update(context.Background(), &export); err != nil {
+		t.Fatalf("update export status: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err != nil {
+		t.Fatalf("reconcile (after export ready): %v", err)
 	}
 
 	var got storagev1alpha1.ZfsShare
