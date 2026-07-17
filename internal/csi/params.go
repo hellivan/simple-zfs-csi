@@ -19,13 +19,10 @@ import (
 // datasetPrefix are StorageClass-only (ADR-0002): they are never inherited from
 // the defaults or PVC-annotation layers.
 const (
-	ParamPoolGUID           = "poolGUID"
-	ParamProtocol           = "protocol"
-	ParamDatasetPrefix      = "datasetPrefix"
-	ParamVolblocksize       = "volblocksize"
-	ParamNFSClients         = "nfsClients"
-	ParamNFSOptions         = "nfsOptions"
-	ParamNVMeoFAllowedHosts = "nvmeofAllowedHosts"
+	ParamPoolGUID      = "poolGUID"
+	ParamProtocol      = "protocol"
+	ParamDatasetPrefix = "datasetPrefix"
+	ParamVolblocksize  = "volblocksize"
 
 	// PropertyPrefix marks a pass-through ZFS property, e.g.
 	// "property.compression" -> spec.properties["compression"].
@@ -53,16 +50,14 @@ var storageClassOnlyParams = map[string]struct{}{
 }
 
 // ResolvedParams is the parsed, validated result of the parameter inheritance
-// chain: everything needed to render a ZfsDataset + ZfsShare.
+// chain: everything needed to render a ZfsDataset.
 type ResolvedParams struct {
-	PoolGUID           string
-	Protocol           storagev1alpha1.Protocol
-	DatasetType        storagev1alpha1.DatasetType
-	DatasetPrefix      string
-	Volblocksize       string
-	NFSClients         []storagev1alpha1.NFSClient
-	NVMeoFAllowedHosts []string
-	Properties         map[string]string
+	PoolGUID      string
+	Protocol      storagev1alpha1.Protocol
+	DatasetType   storagev1alpha1.DatasetType
+	DatasetPrefix string
+	Volblocksize  string
+	Properties    map[string]string
 }
 
 // ResolveParameters merges the three inheritance layers into a single flat map,
@@ -131,13 +126,6 @@ func ParseParams(p map[string]string) (*ResolvedParams, error) {
 	rp.DatasetPrefix = strings.Trim(strings.TrimSpace(p[ParamDatasetPrefix]), "/")
 	rp.Volblocksize = strings.TrimSpace(p[ParamVolblocksize])
 
-	switch rp.Protocol {
-	case storagev1alpha1.ProtocolNFS:
-		rp.NFSClients = parseNFSClients(p[ParamNFSClients], p[ParamNFSOptions])
-	case storagev1alpha1.ProtocolNVMeoF:
-		rp.NVMeoFAllowedHosts = splitList(p[ParamNVMeoFAllowedHosts], ",")
-	}
-
 	for k, v := range p {
 		if name := strings.TrimPrefix(k, PropertyPrefix); name != k && name != "" {
 			if rp.Properties == nil {
@@ -158,46 +146,4 @@ func (rp *ResolvedParams) Dataset(volName string) string {
 		return name
 	}
 	return path.Join(rp.DatasetPrefix, name)
-}
-
-// parseNFSClients parses the nfsClients parameter into export client rules.
-// Each comma-separated entry is "host[:opt;opt;...]"; when an entry omits its
-// options the shared nfsOptions (space-separated) apply. An empty clients list
-// defaults to a single "*" rule with the shared options.
-func parseNFSClients(clientsCSV, optionsStr string) []storagev1alpha1.NFSClient {
-	defaultOpts := splitList(optionsStr, " ")
-	entries := splitList(clientsCSV, ",")
-	if len(entries) == 0 {
-		return []storagev1alpha1.NFSClient{{Client: "*", Options: defaultOpts}}
-	}
-
-	var out []storagev1alpha1.NFSClient
-	for _, e := range entries {
-		host := e
-		opts := defaultOpts
-		if i := strings.IndexByte(e, ':'); i >= 0 {
-			host = strings.TrimSpace(e[:i])
-			opts = splitList(e[i+1:], ";")
-		}
-		if host == "" {
-			continue
-		}
-		out = append(out, storagev1alpha1.NFSClient{Client: host, Options: opts})
-	}
-	if len(out) == 0 {
-		return []storagev1alpha1.NFSClient{{Client: "*", Options: defaultOpts}}
-	}
-	return out
-}
-
-// splitList splits s on sep, trims whitespace, and drops empty fields. It
-// returns nil (not an empty slice) when nothing remains.
-func splitList(s, sep string) []string {
-	var out []string
-	for _, part := range strings.Split(s, sep) {
-		if v := strings.TrimSpace(part); v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
 }

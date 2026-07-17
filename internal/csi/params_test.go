@@ -130,18 +130,13 @@ func TestParseParams_NFSDerivesFilesystem(t *testing.T) {
 	if got := rp.Dataset("pvc-1"); got != "k8s/pvc-1" {
 		t.Errorf("Dataset = %q, want k8s/pvc-1", got)
 	}
-	// Default NFS client is "*".
-	if len(rp.NFSClients) != 1 || rp.NFSClients[0].Client != "*" {
-		t.Errorf("NFSClients = %+v, want single '*'", rp.NFSClients)
-	}
 }
 
 func TestParseParams_NVMeoFDerivesVolume(t *testing.T) {
 	rp, err := ParseParams(map[string]string{
-		"poolGUID":           "999",
-		"protocol":           "nvmeof",
-		"volblocksize":       "16k",
-		"nvmeofAllowedHosts": "nqn.host-a, nqn.host-b",
+		"poolGUID":     "999",
+		"protocol":     "nvmeof",
+		"volblocksize": "16k",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -152,35 +147,9 @@ func TestParseParams_NVMeoFDerivesVolume(t *testing.T) {
 	if rp.Volblocksize != "16k" {
 		t.Errorf("volblocksize = %q, want 16k", rp.Volblocksize)
 	}
-	if len(rp.NVMeoFAllowedHosts) != 2 || rp.NVMeoFAllowedHosts[0] != "nqn.host-a" || rp.NVMeoFAllowedHosts[1] != "nqn.host-b" {
-		t.Errorf("allowedHosts = %+v, want [nqn.host-a nqn.host-b]", rp.NVMeoFAllowedHosts)
-	}
 	// No prefix -> dataset is just the volume name.
 	if got := rp.Dataset("pvc-2"); got != "pvc-2" {
 		t.Errorf("Dataset = %q, want pvc-2", got)
-	}
-}
-
-func TestParseParams_NFSClientsWithOptions(t *testing.T) {
-	rp, err := ParseParams(map[string]string{
-		"poolGUID":   "999",
-		"protocol":   "nfs",
-		"nfsClients": "10.0.0.0/8:rw;no_root_squash, 192.168.1.5",
-		"nfsOptions": "ro sync",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(rp.NFSClients) != 2 {
-		t.Fatalf("NFSClients len = %d, want 2", len(rp.NFSClients))
-	}
-	c0 := rp.NFSClients[0]
-	if c0.Client != "10.0.0.0/8" || len(c0.Options) != 2 || c0.Options[0] != "rw" || c0.Options[1] != "no_root_squash" {
-		t.Errorf("client0 = %+v, want 10.0.0.0/8 rw;no_root_squash", c0)
-	}
-	c1 := rp.NFSClients[1]
-	if c1.Client != "192.168.1.5" || len(c1.Options) != 2 || c1.Options[0] != "ro" || c1.Options[1] != "sync" {
-		t.Errorf("client1 = %+v, want 192.168.1.5 with default options ro sync", c1)
 	}
 }
 
