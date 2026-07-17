@@ -6,6 +6,7 @@ NFS_IMG      ?= $(REGISTRY)/zfs-shares-nfs:$(TAG)
 NVMEOF_IMG   ?= $(REGISTRY)/zfs-shares-nvmeof:$(TAG)
 DISCOVERY_IMG ?= $(REGISTRY)/zfs-shares-discovery:$(TAG)
 OPERATOR_IMG  ?= $(REGISTRY)/zfs-shares-operator:$(TAG)
+CSI_CONTROLLER_IMG ?= $(REGISTRY)/zfs-shares-csi-controller:$(TAG)
 
 CONTROLLER_GEN_VERSION ?= v0.16.5
 CHART_DIR ?= charts/zfs-shares
@@ -54,8 +55,12 @@ docker-discovery:
 docker-operator:
 	docker build -f build/operator.Dockerfile -t $(OPERATOR_IMG) .
 
+.PHONY: docker-csi-controller
+docker-csi-controller:
+	docker build -f build/csi-controller.Dockerfile -t $(CSI_CONTROLLER_IMG) .
+
 .PHONY: docker
-docker: docker-nfs docker-nvmeof docker-discovery docker-operator
+docker: docker-nfs docker-nvmeof docker-discovery docker-operator docker-csi-controller
 
 .PHONY: docker-push
 docker-push: docker
@@ -63,6 +68,7 @@ docker-push: docker
 	docker push $(NVMEOF_IMG)
 	docker push $(DISCOVERY_IMG)
 	docker push $(OPERATOR_IMG)
+	docker push $(CSI_CONTROLLER_IMG)
 
 ## Install just the CRD from the chart's Helm-native crds/ directory. Use this to
 ## roll a schema change, since `helm upgrade` never updates crds/ resources.

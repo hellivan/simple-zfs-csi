@@ -5,6 +5,10 @@ nameOverride: ""
 # -- Override the full release name used in resource names.
 fullnameOverride: ""
 
+# -- CSI driver name. Must match the CSIDriver object and the StorageClass
+# `provisioner` field.
+driverName: zfs-shares.io
+
 image:
   # -- Container registry hosting the controller images.
   registry: ghcr.io
@@ -21,7 +25,6 @@ imagePullSecrets: []
 # -- Node selector applied to both DaemonSets. Storage nodes should carry this label.
 nodeSelector:
   zfs-shares.io/storage: "true"
-
 # -- Tolerations applied to both DaemonSets.
 tolerations:
   - operator: Exists
@@ -168,3 +171,67 @@ operator:
   ports:
     metrics: 8086
     health: 8087
+
+# -------- CSI controller (cluster-wide provisioning adapter) --------
+csiController:
+  # -- Deploy the CSI controller Deployment (plugin + external-provisioner sidecar).
+  enabled: true
+  # -- Number of replicas (external-provisioner leader-elects a single active).
+  replicas: 1
+  image:
+    # -- Override the full CSI controller image (registry/repo:tag). Empty derives it from `image.*`.
+    repository: ""
+    tag: ""
+  # -- Directory shared (emptyDir) between the plugin and the provisioner sidecar
+  # -- for the CSI unix socket.
+  socketDir: /csi
+  # -- How long CreateVolume waits for the ZfsVolume to become Ready.
+  createTimeout: 2m
+  # -- How often CreateVolume re-reads the ZfsVolume while waiting.
+  pollInterval: 2s
+  # -- PVC annotation prefix whose keys override parameters (empty disables the
+  # -- PVC inheritance layer).
+  pvcAnnotationPrefix: param.zfs-shares.io/
+  # -- Provisioner default parameters (lowest-precedence inheritance layer).
+  # -- When non-empty they are rendered into a ConfigMap and mounted.
+  defaultParameters: {}
+    # poolGUID: "1234567890"
+    # protocol: nfs
+  # external-provisioner sidecar.
+  provisioner:
+    # -- external-provisioner image repository.
+    image: registry.k8s.io/sig-storage/csi-provisioner
+    # -- external-provisioner image tag.
+    tag: v5.1.0
+    # -- Extra args for external-provisioner.
+    extraArgs: []
+    # -- Resource requests/limits for the sidecar.
+    resources: {}
+  # -- Extra CLI args for the csi-controller binary.
+  extraArgs: []
+  # -- Resource requests/limits for the plugin container.
+  resources: {}
+  # -- Pod annotations.
+  podAnnotations: {}
+  # -- Node selector for the controller pod (runs anywhere; not a storage node).
+  nodeSelector: {}
+  # -- Tolerations for the controller pod.
+  tolerations: []
+
+# -------- CSIDriver object --------
+csiDriver:
+  # -- Install the CSIDriver object for the driver.
+  create: true
+
+# -------- Example StorageClasses --------
+# -- Optional example StorageClasses. Each entry becomes a StorageClass named
+# -- "<fullname>-<key>" with the given parameters. Set to {} to install none.
+storageClasses: {}
+  # nfs:
+  #   isDefault: false
+  #   reclaimPolicy: Delete
+  #   volumeBindingMode: Immediate
+  #   allowVolumeExpansion: false
+  #   parameters:
+  #     poolGUID: "1234567890"
+  #     protocol: nfs

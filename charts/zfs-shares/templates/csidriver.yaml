@@ -1,0 +1,15 @@
+{{- if .Values.csiDriver.create }}
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ .Values.driverName }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+spec:
+  # The controller provisions via CRDs; no attach step is required.
+  attachRequired: false
+  # The node plugin reads the volume_context at publish time.
+  podInfoOnMount: false
+  volumeLifecycleModes:
+    - Persistent
+{{- end }}

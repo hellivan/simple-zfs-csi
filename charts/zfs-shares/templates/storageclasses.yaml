@@ -1,0 +1,26 @@
+{{- range $name, $sc := .Values.storageClasses }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ include "zfs-shares.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "zfs-shares.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: storageclass
+  {{- if $sc.isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: {{ $.Values.driverName }}
+reclaimPolicy: {{ $sc.reclaimPolicy | default "Delete" }}
+volumeBindingMode: {{ $sc.volumeBindingMode | default "Immediate" }}
+allowVolumeExpansion: {{ $sc.allowVolumeExpansion | default false }}
+{{- with $sc.parameters }}
+parameters:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with $sc.mountOptions }}
+mountOptions:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

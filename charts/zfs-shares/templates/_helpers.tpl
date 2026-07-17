@@ -36,19 +36,23 @@ app.kubernetes.io/part-of: zfs-shares
 {{- end -}}
 
 {{/*
-Resolve the image reference for a component ("nfs" or "nvmeof").
+Resolve the image reference for a component ("nfs", "nvmeof", ...).
+The values key is `component`; the derived image suffix is `suffix` (defaults to
+`component`) so camelCase values keys can map to hyphenated image names.
 Usage: {{ include "zfs-shares.image" (dict "root" . "component" "nfs") }}
+       {{ include "zfs-shares.image" (dict "root" . "component" "csiController" "suffix" "csi-controller") }}
 */}}
 {{- define "zfs-shares.image" -}}
 {{- $root := .root -}}
 {{- $component := .component -}}
+{{- $suffix := .suffix | default $component -}}
 {{- $comp := index $root.Values $component -}}
 {{- if $comp.image.repository -}}
 {{- $tag := $comp.image.tag | default $root.Values.image.tag | default $root.Chart.AppVersion -}}
 {{- printf "%s:%s" $comp.image.repository $tag -}}
 {{- else -}}
 {{- $tag := $comp.image.tag | default $root.Values.image.tag | default $root.Chart.AppVersion -}}
-{{- printf "%s/%s-%s:%s" $root.Values.image.registry $root.Values.image.repository $component $tag -}}
+{{- printf "%s/%s-%s:%s" $root.Values.image.registry $root.Values.image.repository $suffix $tag -}}
 {{- end -}}
 {{- end -}}
 

@@ -173,4 +173,94 @@ subjects:
     namespace: {{ .Release.Namespace }}
 {{- end }}
 {{- end }}
+{{- if .Values.csiController.enabled }}
+---
+# CSI controller: writes ZfsVolume/ZfsShare, reads PVCs; the co-located
+# external-provisioner sidecar manages PVs/PVCs/StorageClasses/events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-controller
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-controller
+rules:
+  # --- driver: ZFS-centric CRDs it authors ---
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfsvolumes", "zfsshares"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.zfs-shares.io"]
+    resources: ["zfsvolumes/status", "zfsshares/status"]
+    verbs: ["get"]
+  # --- driver: PVC annotations for the parameter inheritance layer ---
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  # --- external-provisioner sidecar ---
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-controller
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "zfs-shares.fullname" . }}-csi-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "csi-controller") }}
+    namespace: {{ .Release.Namespace }}
+---
+# Namespaced permissions for external-provisioner leader-election.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-controller-leaderelection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-controller
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-controller-leaderelection
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "zfs-shares.fullname" . }}-csi-controller-leaderelection
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "csi-controller") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

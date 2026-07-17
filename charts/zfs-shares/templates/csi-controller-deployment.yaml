@@ -1,0 +1,113 @@
+{{- if .Values.csiController.enabled }}
+{{- if .Values.csiController.defaultParameters }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-controller-defaults
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-controller
+data:
+  parameters.yaml: |
+    {{- toYaml .Values.csiController.defaultParameters | nindent 4 }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "zfs-shares.fullname" . }}-csi-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "zfs-shares.labels" . | nindent 4 }}
+    app.kubernetes.io/component: csi-controller
+spec:
+  replicas: {{ .Values.csiController.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: csi-controller
+  template:
+    metadata:
+      labels:
+        {{- include "zfs-shares.labels" . | nindent 8 }}
+        app.kubernetes.io/component: csi-controller
+      {{- with .Values.csiController.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "csi-controller") }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csiController.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.csiController.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: csi-controller
+          image: {{ include "zfs-shares.image" (dict "root" . "component" "csiController" "suffix" "csi-controller") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --endpoint=unix://{{ .Values.csiController.socketDir }}/csi.sock
+            - --driver-name={{ .Values.driverName }}
+            - --create-timeout={{ .Values.csiController.createTimeout }}
+            - --poll-interval={{ .Values.csiController.pollInterval }}
+            - --pvc-annotation-prefix={{ .Values.csiController.pvcAnnotationPrefix }}
+            {{- if .Values.csiController.defaultParameters }}
+            - --default-parameters-file=/etc/zfs-shares/parameters.yaml
+            {{- end }}
+            {{- with .Values.csiController.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ .Values.csiController.socketDir }}
+            {{- if .Values.csiController.defaultParameters }}
+            - name: default-parameters
+              mountPath: /etc/zfs-shares
+              readOnly: true
+            {{- end }}
+          {{- with .Values.csiController.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: csi-provisioner
+          image: {{ .Values.csiController.provisioner.image }}:{{ .Values.csiController.provisioner.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --csi-address={{ .Values.csiController.socketDir }}/csi.sock
+            - --extra-create-metadata
+            - --leader-election
+            - --leader-election-namespace=$(POD_NAMESPACE)
+            {{- with .Values.csiController.provisioner.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: {{ .Values.csiController.socketDir }}
+          {{- with .Values.csiController.provisioner.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+        {{- if .Values.csiController.defaultParameters }}
+        - name: default-parameters
+          configMap:
+            name: {{ include "zfs-shares.fullname" . }}-csi-controller-defaults
+        {{- end }}
+{{- end }}
