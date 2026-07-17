@@ -8,6 +8,104 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0011 — NVMe-oF zero-trust: host-NQN allow-listing + per-attach DH-CHAP
+
+**Status:** Accepted (2026-07-18) · **Scope:** new `NvmeHost` CRD, csi-node (publish identity + authenticated connect), operator (attach reconciler), nvmeof aggregator + nvmet, `NetworkExport` spec, per-attach `Secret`, Helm · **Extends** ADR-0010; **completes** ADR-0005 for NVMe-oF.
+
+### Context
+
+ADR-0010 made NFS zero-trust by default (temporal + node-IP allow-list) but left
+NVMe-oF **temporal-only**: the subsystem exists only while a node is attached, yet
+`attr_allow_any_host=1` lets *any* initiator on the storage network connect, and
+there is no in-band authentication. The goal is parity — NVMe-oF restricted to the
+authorized node's host NQN **and** password-authenticated with DH-CHAP, on by
+default.
+
+The blocker: the CSI attach call (`ControllerPublishVolume`) carries only the node
+*name*, not its NVMe **host NQN** nor any key. Both NQN allow-listing and DH-CHAP
+need the consuming node's host NQN, and DH-CHAP additionally needs a shared secret
+programmed on both the target and the initiator before the node connects.
+
+### Decisions
+
+1. **Nodes publish their NVMe identity via a new cluster-scoped `NvmeHost` CRD.**
+   One object per node (`metadata.name = <nodeName>`), authored by the csi-node
+   plugin at startup: `spec = { nodeName, hostNQN }`. The host NQN is **derived
+   deterministically from the node name** (a UUIDv5 → `nqn.2014-08.org.nvmexpress:
+   uuid:<uuid>`), so it is stable across restarts with no on-host state — important
+   on Talos (read-only rootfs, no persisted `/etc/nvme/hostnqn`). An explicit
+   `--host-nqn` flag overrides. The node **always** passes `--hostnqn` to
+   `nvme connect`, so the initiator's NQN and the target's allow-list are guaranteed
+   to agree regardless of any host default. This is the node's *stable identity*.
+
+2. **NVMe-oF allow-list = the attached node's host NQN (default-deny).** The
+   operator's attach reconciler resolves each requesting node to its
+   `NvmeHost.hostNQN` and sets `NetworkExport.nvmeof.allowedHosts` to it; the nvmet
+   backend flips `attr_allow_any_host=0` and links `allowed_hosts/<hostNQN>`. If the
+   node's `NvmeHost` is not yet published, the reconciler **refuses** (leaves the
+   attach request not-ready) rather than falling back to allow-any — zero-trust by
+   default. NVMe-oF is single-node (ADR-0010 §5), so there is always exactly one
+   allowed NQN.
+
+3. **The DH-CHAP key is per-attach, operator-generated, and rotates each attach.**
+   The credential is separated from the identity: a fresh key is generated for each
+   `ZfsShareAttachRequest`. Detach + reattach → new request → new key, so keys
+   rotate once per attach session (live re-keying of an open connection is out of
+   scope). This maps cleanly to configfs, where the key lives per
+   `(subsystem, hostNQN)` at `allowed_hosts/<hostNQN>/dhchap_key`; since NVMe-oF is
+   single-node, per-attach == per-`(subsystem, host)`.
+
+4. **The key travels only in a `Secret`, referenced from `NetworkExport`.** The
+   operator generates the key in the NVMe `DHHC-1` format, stores it in a
+   Kubernetes `Secret` (owner-referenced by the attach request for GC), and sets
+   `NetworkExport.nvmeof.dhchapSecretRef`. The raw key never lands in a
+   widely-readable CRD spec/status. Exactly two readers: the **storage-node nvmet
+   aggregator** (writes it to the target's `dhchap_key`) and the **consuming node**
+   (passes it as `nvme connect --dhchap-secret`). Readiness gating (ADR-0010 §4)
+   already guarantees the target is programmed before the node connects.
+
+5. **One-way DH-CHAP first; bidirectional later.** The initiator authenticates to
+   the target (`dhchap_key`). Bidirectional (`dhchap_ctrl_key`, target authenticates
+   back to the host) is an opt-in follow-up, not in this cut.
+
+6. **Enabled by default; degrades safely.** A chart flag
+   `nvmeof.auth.dhchap.enabled` (default `true`) governs key generation and
+   programming. NQN allow-listing is unconditional (it needs no secret). With DH-CHAP
+   off, NVMe-oF is still identity-restricted by NQN, just without the password.
+
+### Consequences
+
+- NVMe-oF becomes zero-trust by default: default-deny by host NQN **and**
+  password-authenticated, matching NFS's posture. Completes ADR-0005 for NVMe-oF.
+- New machinery: the `NvmeHost` CRD + node publisher; operator key generation +
+  `Secret` lifecycle; `NetworkExport.nvmeof.{allowedHosts,dhchapSecretRef}`; nvmet
+  `dhchap_key` programming; node `--hostnqn`/`--dhchap-secret` connect flags; RBAC
+  (node: `nvmehosts` create/update, `secrets` read; operator: `secrets`
+  create/delete + `nvmehosts` read; nvmeof aggregator: `secrets` read).
+- The node plugin now writes one self-scoped CRD (`NvmeHost`), a small, justified
+  departure from ADR-0003's "node writes no CRDs" — it publishes only its own
+  identity, controller-side authorization still happens in the operator.
+- Talos-friendly: deterministic host NQN needs no persisted host state; the key is
+  ephemeral in a `Secret`.
+- Exact `DHHC-1` key bytes (hash marker / optional CRC) are settled in code against
+  a live target; unit tests mock the key. Live `nvme connect` with auth is the
+  manual e2e step.
+
+### Plan (→ [implementation-strategy.md](implementation-strategy.md) Step 12)
+
+1. `NvmeHost` CRD + node publisher (deterministic host NQN, `--host-nqn` override).
+2. Operator attach reconciler: resolve NQN (default-deny), generate per-attach
+   `Secret`, set `NetworkExport.nvmeof.{allowedHosts,dhchapSecretRef}`.
+3. nvmet: program `attr_allow_any_host=0`, `allowed_hosts/<nqn>`, and `dhchap_key`
+   from the referenced `Secret`.
+4. csi-node: pass `--hostnqn` always and `--dhchap-secret` when a secret ref is set.
+5. Chart: CRD, RBAC, `nvmeof.auth.dhchap.enabled`, wiring; `make manifests`.
+6. Verify: unit tests (NQN resolution/default-deny, key gen + Secret lifecycle,
+   nvmet dhchap programming, node connect flags); live authenticated `nvme connect`
+   is manual.
+
+---
+
 ## ADR-0010 — Attach-stage share lifecycle & zero-trust access control
 
 **Status:** Accepted & implemented (2026-07-17) · **Scope:** CSI controller, csi-node (`CSIDriver`), operator, new `ZfsShareAttachRequest` CRD, `NetworkExport`/`ZfsShare` status · **Supersedes** ADR-0001 §2; **implements/extends** ADR-0005.

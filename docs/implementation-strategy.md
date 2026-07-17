@@ -195,6 +195,27 @@ node is authorized; forbid NVMe-oF multi-node.
   e2e RWO NVMe + RWX NFS attach/detach and the static CSI PV for nvmeof remain the
   manual steps.
 
+### Step 12 — NVMe-oF zero-trust: host-NQN allow-listing + per-attach DH-CHAP (ADR-0011)
+Bring NVMe-oF to NFS's posture: default-deny by the attached node's host NQN, plus
+DH-CHAP password auth, on by default.
+- New cluster-scoped `NvmeHost` CRD (`{nodeName, hostNQN}`), authored by csi-node at
+  startup; host NQN derived deterministically from the node name (`--host-nqn`
+  override), always passed to `nvme connect --hostnqn`.
+- Operator attach reconciler: resolve node → `NvmeHost.hostNQN` (default-deny if
+  absent) → `NetworkExport.nvmeof.allowedHosts`; when DH-CHAP on, generate a
+  per-attach key in `DHHC-1` format, store in a `Secret` (owner-ref the attach
+  request), set `NetworkExport.nvmeof.dhchapSecretRef`.
+- nvmet: `attr_allow_any_host=0`, link `allowed_hosts/<nqn>`, write `dhchap_key`
+  from the referenced `Secret`.
+- csi-node: always `--hostnqn`; when a secret ref is present, read the `Secret` and
+  `nvme connect --dhchap-secret`.
+- Deploy: `NvmeHost` CRD; RBAC (node: `nvmehosts` create/update + `secrets` read;
+  operator: `secrets` create/delete + `nvmehosts` read; nvmeof aggregator:
+  `secrets` read); values `nvmeof.auth.dhchap.enabled` (default true).
+- Verify: `make manifests`, unit tests (NQN resolution/default-deny, key gen +
+  Secret lifecycle, nvmet dhchap programming, node connect flags), `helm template`;
+  live authenticated `nvme connect` is the manual e2e step.
+
 ## Verification matrix
 
 | Step | Build | Unit | Cluster/e2e |
@@ -211,6 +232,7 @@ node is authorized; forbid NVMe-oF multi-node.
 | 9 snapshots ✅ | `make manifests`+`build` | snapshot reconcile + CreateSnapshot | `VolumeSnapshot` create/delete |
 | 10 clone/restore ✅ | `make manifests`+`build` | clone spec + CreateVolume source | PVC from snapshot; PVC clone |
 | 11 attach access-control ✅ | `make manifests`+`build`+`helm-template` | nvmeof RWX rejection, publish/unpublish, attach-request aggregation, status gating | RWO NVMe + RWX NFS attach/detach; static CSI PV |
+| 12 nvmeof auth | `make manifests`+`build`+`helm-template` | NQN resolution/default-deny, DH-CHAP key+Secret, nvmet dhchap, node connect flags | authenticated `nvme connect` (NQN + DH-CHAP) |
 
 ## Out of scope (tracked, not now)
 - Backup pod (`ssh-daemon` + `cron-puller`) — separate pod, later; shares the host-exec helper.
