@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: networkexports.storage.zfs-shares.io
+  name: networkexports.storage.simple-zfs-csi.io
 spec:
-  group: storage.zfs-shares.io
+  group: storage.simple-zfs-csi.io
   names:
     kind: NetworkExport
     listKind: NetworkExportList

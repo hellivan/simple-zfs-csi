@@ -20,8 +20,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/controller"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/controller"
 )
 
 var scheme = runtime.NewScheme()
@@ -56,7 +56,7 @@ func main() {
 		Metrics:                 metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress:  probeAddr,
 		LeaderElection:          leaderElect,
-		LeaderElectionID:        "operator.storage.zfs-shares.io",
+		LeaderElectionID:        "operator.storage.simple-zfs-csi.io",
 		LeaderElectionNamespace: leaderElecNS,
 	})
 	if err != nil {

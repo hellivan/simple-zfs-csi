@@ -2,29 +2,29 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-operator
+  name: {{ include "simple-zfs-csi.fullname" . }}-operator
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "zfs-shares.labels" . | nindent 4 }}
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
     app.kubernetes.io/component: operator
 spec:
   replicas: {{ .Values.operator.replicas }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/name: {{ include "simple-zfs-csi.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: operator
   template:
     metadata:
       labels:
-        {{- include "zfs-shares.labels" . | nindent 8 }}
+        {{- include "simple-zfs-csi.labels" . | nindent 8 }}
         app.kubernetes.io/component: operator
       {{- with .Values.operator.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "operator") }}
+      serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "operator") }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -39,7 +39,7 @@ spec:
       {{- end }}
       containers:
         - name: operator
-          image: {{ include "zfs-shares.image" (dict "root" . "component" "operator") }}
+          image: {{ include "simple-zfs-csi.image" (dict "root" . "component" "operator") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --leader-elect={{ .Values.operator.leaderElect }}

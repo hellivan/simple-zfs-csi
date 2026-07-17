@@ -11,8 +11,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/zpool"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 // Default NVMe-oF transport parameters. The port mirrors the nvmeof controller's

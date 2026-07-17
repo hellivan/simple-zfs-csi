@@ -249,7 +249,7 @@ parse into the CRD specs. Deliberately simpler than democratic-csi templating.
 3. **PVC annotations** — `external-provisioner` runs with
    `--extra-create-metadata`, which injects
    `csi.storage.k8s.io/pvc/{name,namespace}`; the controller fetches that PVC and
-   overlays annotations prefixed `param.zfs-shares.io/<key>`.
+   overlays annotations prefixed `param.simple-zfs-csi.io/<key>`.
 
 Resolved keys (all optional except `poolGUID` and `protocol`, which must resolve
 from some layer). `poolGUID` and `datasetPrefix` are **StorageClass-only** — see

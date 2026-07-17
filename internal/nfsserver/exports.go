@@ -37,7 +37,7 @@ func RenderExports(exports []Export) string {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
 
 	var b strings.Builder
-	b.WriteString("# Managed by zfs-shares nfs-controller. DO NOT EDIT.\n")
+	b.WriteString("# Managed by simple-zfs-csi nfs-controller. DO NOT EDIT.\n")
 	for _, e := range sorted {
 		b.WriteString(e.Path)
 		for _, c := range e.Clients {

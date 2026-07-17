@@ -1,4 +1,4 @@
-module github.com/hellivan/zfs-shares
+module github.com/hellivan/simple-zfs-csi
 
 go 1.26.4
 

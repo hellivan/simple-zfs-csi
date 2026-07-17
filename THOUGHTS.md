@@ -306,7 +306,7 @@ env:
 # ZFS Shares on Talos — Design Notes
 
 ## Context
-- Custom Kubernetes operator (`zfs-shares`) that exposes ZFS datasets over **NFS** and ZFS zvols over **NVMe-oF (TCP)** on a Talos cluster.
+- Custom Kubernetes operator (`simple-zfs-csi`) that exposes ZFS datasets over **NFS** and ZFS zvols over **NVMe-oF (TCP)** on a Talos cluster.
 - Architecture: privileged DaemonSet pods run the in-container kernel NFS server / nvmet target. A `ZfsShare` CRD carries "intent to share"; controllers render exports (NFS) or nvmet configfs (NVMe-oF) per node.
 - Pool: classic `tank`, currently `mountpoint=/tank`.
 
@@ -372,7 +372,7 @@ Key point: **for serving NFS, both are identical to nfsd.** The pod has its own 
 # ZFS Shares on Talos — Mount, Propagation & Kubelet Findings
 
 ## Context
-- Custom Kubernetes operator (`zfs-shares`) exposing ZFS datasets over **NFS** and zvols over **NVMe-oF (TCP)** on a Talos cluster.
+- Custom Kubernetes operator (`simple-zfs-csi`) exposing ZFS datasets over **NFS** and zvols over **NVMe-oF (TCP)** on a Talos cluster.
 - Privileged DaemonSet pods run the in-container kernel NFS server / nvmet target. A `ZfsShare` CRD carries "intent to share"; controllers render exports (NFS) or nvmet configfs (NVMe-oF) per node.
 - Pool: classic `tank`. Decision: change pool mountpoint to `/var/mnt/tank`.
 - Helm chart stays **generic** (source `hostPath` + destination `mountPath` kept separate — standard Kubernetes volume semantics). All ZFS/Talos specifics live in node config, not the chart.
@@ -544,11 +544,11 @@ Scraping host-networked pods does not require hardcoding physical Node IPs into 
 apiVersion: v1
 kind: Service
 metadata:
-  name: zfs-shares-metrics
+  name: simple-zfs-csi-metrics
 spec:
   clusterIP: None
   selector:
-    app: zfs-shares
+    app: simple-zfs-csi
   ports:
     - name: metrics-nfs
       port: 9881
@@ -559,11 +559,11 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: zfs-shares-monitor
+  name: simple-zfs-csi-monitor
 spec:
   selector:
     matchLabels:
-      app: zfs-shares
+      app: simple-zfs-csi
   endpoints:
     - port: metrics-nfs
     - port: metrics-nvme
@@ -621,7 +621,7 @@ metadata:
 spec:
   endpointSelector:
     matchLabels:
-      app: zfs-shares  # Targets the storage server DaemonSets
+      app: simple-zfs-csi  # Targets the storage server DaemonSets
   ingress:
     # Option A: Restrict to physical node network CIDR
     - fromCIDR:
@@ -772,7 +772,7 @@ RunCommand(cmd)
 **Result:** The cluster survives node deaths, IP changes, pool renames, and mountpoint shifts without modifying a single Kubernetes PersistentVolume object.
 
 
-# zfs-shares — Architecture Decisions, Findings & Container Inventory
+# simple-zfs-csi — Architecture Decisions, Findings & Container Inventory
 
 ## 1. Core Decision: Build a Standalone CSI (reject extending democratic-csi)
 - democratic-csi is a ~31k-line JS monolith (index.js 4165 lines, controller-zfs 2551 lines), config-file driven, imperative, target/SSH-execution model, stalled maintenance (PRs linger).
@@ -780,8 +780,8 @@ RunCommand(cmd)
 - The CSI surface we actually need is small in Go: CreateVolume/DeleteVolume + NodeStage/NodePublish/NodeUnpublish (+ optional expand/snapshot). We already own the hard parts (in-kernel exports, nvmet configfs, discovery, dead-node override).
 - Use democratic-csi only as a *reference* (volume-context shape, idempotency handling, exact `mount`/`nvme connect` invocations) — not as a dependency/fork.
 
-### democratic-csi vs zfs-shares
-| Dimension | democratic-csi | zfs-shares |
+### democratic-csi vs simple-zfs-csi
+| Dimension | democratic-csi | simple-zfs-csi |
 |---|---|---|
 | Model | config-file + imperative driver | CRD + reconcile |
 | Source of truth | driver process state | etcd (ZfsShare/ZfsPool) |
@@ -830,7 +830,7 @@ RunCommand(cmd)
 
 ## Container Inventory
 
-### Serving pod — DaemonSet on storage nodes (label zfs-shares.io/storage=true)
+### Serving pod — DaemonSet on storage nodes (label simple-zfs-csi.io/storage=true)
 | Container | Purpose |
 |---|---|
 | `agent` | Only ZFS-mutating process. Reconciles allocation CRDs (zfs create [-V], quotas, destroy, snapshots) AND discovers pools (zpool/zfs get), publishing ZfsPool status (name, node, IP, mountpoint, health). Holds /dev/zfs + Bidirectional mount propagation. |
@@ -874,7 +874,7 @@ RunCommand(cmd)
 - **Static/pre-existing datasets:** bypass the CSI storage plane; admin applies a static ZfsShare (agent exports it) + native NFS PV with Retain. Note: a PV can't be shared by multiple PVCs — need a PV+PVC per namespace that mounts the share.
 
 
-# zfs-shares — CRD Model & GUID Routing Decisions
+# simple-zfs-csi — CRD Model & GUID Routing Decisions
 
 ## 7. Two-CRD Share Model (generic executor + ZFS-centric sugar)
 The current `ZfsShare` implementation is actually **ZFS-agnostic** — it just exports a
@@ -950,7 +950,7 @@ reconciler — the same shape as the existing node-death watcher.
 
 ### Decision: promote `zpool-watcher` → `operator`
 Rename the `zpool-watcher` Deployment to **`operator`** (`cmd/operator`, image
-`zfs-shares-operator`) and make it the cluster-scoped controller-manager that hosts **all**
+`simple-zfs-csi-operator`) and make it the cluster-scoped controller-manager that hosts **all**
 unprivileged, cluster-wide, leader-elected reconcilers:
 - node death → `ZfsPool` health (the former watcher)
 - `ZfsShare → NetworkExport` translation

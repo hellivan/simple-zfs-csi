@@ -1,6 +1,6 @@
 # Implementation Strategy
 
-This document is the actionable plan for completing the `zfs-shares` storage system:
+This document is the actionable plan for completing the `simple-zfs-csi` storage system:
 the CSI plane (controller + node plugin), the allocation CRD, and the two-layer share
 model. It complements the design rationale in [../THOUGHTS.md](../THOUGHTS.md); this file
 tracks **what to build, in what order, and how to verify each step.**
@@ -40,6 +40,7 @@ tracks **what to build, in what order, and how to verify each step.**
 | `ZfsVolume` | Cluster | `spec.poolGUID` | CSI controller (creates), agent (reconciles) | dataset/zvol allocation intent |
 | `ZfsShare` | Cluster | `spec.poolGUID` + `spec.dataset` | CSI controller (creates), operator (ZfsShare reconciler) | ZFS-centric "intent to share"; renders a child `NetworkExport` |
 | `NetworkExport` | Cluster | `spec.nodeName` + `spec.path` | operator (ZfsShare reconciler, owns) or admin (standalone) | generic, ZFS-agnostic node-local export executor contract |
+| `ZfsSnapshot` *(Step 9, pending model decision)* | Cluster | `spec.poolGUID` + source dataset | CSI controller (creates), agent (reconciles) | point-in-time `dataset@snap`; source for clone/restore |
 
 Key rule: **ZfsShare compiles down to NetworkExport.** Only `NetworkExport` controllers
 touch `/etc/exports` / nvmet `configfs` — exactly one aggregator per node per protocol.
@@ -65,7 +66,7 @@ CSI controller stays a thin, replaceable adapter.
 Promote the cluster-wide watcher into the operator/controller-manager that will also host the
 `ZfsShare` reconciler (Step 3).
 - `cmd/zpool-watcher` -> `cmd/operator`; keep the existing watcher reconciler registered.
-- Image `zfs-shares-watcher` -> `zfs-shares-operator`; update `build/watcher.Dockerfile`,
+- Image `simple-zfs-csi-watcher` -> `simple-zfs-csi-operator`; update `build/watcher.Dockerfile`,
   Makefile targets, chart (`watcher-deployment.yaml` -> `operator-deployment.yaml`, values,
   serviceaccounts, RBAC), `README.md`.
 - Enable leader election on the manager (single active; safe to scale to 2 for HA).
@@ -126,6 +127,40 @@ generic executor.
 - Deploy: DaemonSet on all nodes + `node-driver-registrar`; ship a `CSIDriver` object.
 - Verify: `csi-sanity` node tests; e2e pod mounts PVC over NFS and NVMe-oF.
 
+## Phase 2 — parity capabilities (layered on the core path)
+
+These match the democratic-csi feature surface (expansion, snapshots, clone). Each is an
+optional CSI capability advertised only when its sidecar/RBAC is deployed.
+
+### Step 8 — Volume expansion  ✅ done (ADR-0004)
+Spec-driven size convergence, online grow.
+- Agent: `ZfsVolume` reconcile calls `ensureSize` — filesystem grows `refquota`, zvol grows
+  `volsize` (align up to `volblocksize`, never shrink).
+- CSI controller: `ControllerExpandVolume` bumps `ZfsVolume` spec size (retry-on-conflict),
+  waits for `observedGeneration`, returns `NodeExpansionRequired` (false for NFS/filesystem,
+  true for zvol). Advertises `EXPAND_VOLUME`.
+- CSI node: `NodeExpandVolume` — NFS no-op; NVMe-oF `ns-rescan` + `resize2fs`/`xfs_growfs`
+  (skipped for block volumeMode). Advertises node `EXPAND_VOLUME`; plugin cap `ONLINE`.
+- Deploy: `csi-resizer` sidecar; RBAC for `persistentvolumeclaims/status`;
+  `allowVolumeExpansion: true` on StorageClasses.
+- Verify: unit tests (controller expand fs/zvol, node expand nvme/nfs); `helm template`.
+
+### Step 9 — Snapshots
+**Model decision pending:** dedicated `ZfsSnapshot` CRD *vs.* `ZfsVolume{type: snapshot}`.
+- Agent: `zfs snapshot pool/ds@snap` (create), `zfs destroy pool/ds@snap` (finalizer);
+  status `readyToUse`, `creationTime`, `restoreSize` (referenced/used bytes).
+- CSI controller: `CreateSnapshot`/`DeleteSnapshot`/`ListSnapshots`; advertise
+  `CREATE_DELETE_SNAPSHOT` + `LIST_SNAPSHOTS`.
+- Deploy: `csi-snapshotter` sidecar + `VolumeSnapshotClass` + RBAC; snapshot CRDs.
+- Verify: `make manifests` (new CRD/field), unit tests, e2e `VolumeSnapshot`.
+
+### Step 10 — Volume from snapshot / clone
+- CSI controller: `CreateVolume` honours `VolumeContentSource` (snapshot or volume) →
+  writes a `ZfsVolume` whose spec references the source; advertise `CLONE_VOLUME`.
+- Agent: `zfs clone pool/ds@snap pool/newds` (from snapshot) or
+  `zfs snapshot`+`zfs clone` (from volume) instead of `zfs create`.
+- Verify: `make manifests` if spec grows a source ref; unit tests; e2e restore + clone.
+
 ## Verification matrix
 
 | Step | Build | Unit | Cluster/e2e |
@@ -138,11 +173,13 @@ generic executor.
 | 5 agent | `build` | reconcile idempotency | `kubectl apply` ZfsVolume creates dataset |
 | 6 controller | `build` | — | csi-sanity + PVC provisions |
 | 7 node | `build` | — | csi-sanity + pod mounts (NFS + NVMe-oF) |
+| 8 expansion ✅ | `vet`+`build`+`helm-template` | controller/node expand unit tests | PVC resize grows fs/zvol |
+| 9 snapshots | `make manifests`+`build` | snapshot reconcile + CreateSnapshot | `VolumeSnapshot` create/delete |
+| 10 clone/restore | `make manifests`+`build` | clone spec + CreateVolume source | PVC from snapshot; PVC clone |
 
 ## Out of scope (tracked, not now)
 - Backup pod (`ssh-daemon` + `cron-puller`) — separate pod, later; shares the host-exec helper.
 - gRPC ZFS daemon — deferred; only if a second in-pod control-plane ZFS consumer appears.
-- Snapshots / volume expansion — optional CSI capabilities layered after the core path works.
 
 ## Cross-references
 - Design rationale, container inventory, invariants: [../THOUGHTS.md](../THOUGHTS.md)

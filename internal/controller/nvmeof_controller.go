@@ -10,8 +10,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/nvmet"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/nvmet"
 )
 
 // NVMeoFReconciler reconciles nvmeof-protocol NetworkExports for a single node into
@@ -23,8 +23,8 @@ type NVMeoFReconciler struct {
 	NQNPrefix string
 }
 
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=networkexports,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=networkexports/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=networkexports,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=networkexports/status,verbs=get;update;patch
 
 // Reconcile rebuilds the nvmet target from all nvmeof exports owned by this node.
 func (r *NVMeoFReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

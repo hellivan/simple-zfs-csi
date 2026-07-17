@@ -3,10 +3,10 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-csi-controller-defaults
+  name: {{ include "simple-zfs-csi.fullname" . }}-csi-controller-defaults
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "zfs-shares.labels" . | nindent 4 }}
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
     app.kubernetes.io/component: csi-controller
 data:
   parameters.yaml: |
@@ -16,29 +16,29 @@ data:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-csi-controller
+  name: {{ include "simple-zfs-csi.fullname" . }}-csi-controller
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "zfs-shares.labels" . | nindent 4 }}
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
     app.kubernetes.io/component: csi-controller
 spec:
   replicas: {{ .Values.csiController.replicas }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/name: {{ include "simple-zfs-csi.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: csi-controller
   template:
     metadata:
       labels:
-        {{- include "zfs-shares.labels" . | nindent 8 }}
+        {{- include "simple-zfs-csi.labels" . | nindent 8 }}
         app.kubernetes.io/component: csi-controller
       {{- with .Values.csiController.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "csi-controller") }}
+      serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "csi-controller") }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -53,7 +53,7 @@ spec:
       {{- end }}
       containers:
         - name: csi-controller
-          image: {{ include "zfs-shares.image" (dict "root" . "component" "csiController" "suffix" "csi-controller") }}
+          image: {{ include "simple-zfs-csi.image" (dict "root" . "component" "csiController" "suffix" "csi-controller") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --endpoint=unix://{{ .Values.csiController.socketDir }}/csi.sock
@@ -62,7 +62,7 @@ spec:
             - --poll-interval={{ .Values.csiController.pollInterval }}
             - --pvc-annotation-prefix={{ .Values.csiController.pvcAnnotationPrefix }}
             {{- if .Values.csiController.defaultParameters }}
-            - --default-parameters-file=/etc/zfs-shares/parameters.yaml
+            - --default-parameters-file=/etc/simple-zfs-csi/parameters.yaml
             {{- end }}
             {{- with .Values.csiController.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -72,7 +72,7 @@ spec:
               mountPath: {{ .Values.csiController.socketDir }}
             {{- if .Values.csiController.defaultParameters }}
             - name: default-parameters
-              mountPath: /etc/zfs-shares
+              mountPath: /etc/simple-zfs-csi
               readOnly: true
             {{- end }}
           {{- with .Values.csiController.resources }}
@@ -132,6 +132,6 @@ spec:
         {{- if .Values.csiController.defaultParameters }}
         - name: default-parameters
           configMap:
-            name: {{ include "zfs-shares.fullname" . }}-csi-controller-defaults
+            name: {{ include "simple-zfs-csi.fullname" . }}-csi-controller-defaults
         {{- end }}
 {{- end }}

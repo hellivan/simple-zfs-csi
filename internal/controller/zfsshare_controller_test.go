@@ -11,7 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
 func TestDerivePath(t *testing.T) {

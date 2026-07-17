@@ -1,17 +1,17 @@
-zfs-shares {{ .Chart.AppVersion }} installed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+simple-zfs-csi {{ .Chart.AppVersion }} installed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
 Enabled controllers:
 {{- if .Values.nfs.enabled }}
-  - NFS       (DaemonSet {{ include "zfs-shares.fullname" . }}-nfs)
+  - NFS       (DaemonSet {{ include "simple-zfs-csi.fullname" . }}-nfs)
 {{- end }}
 {{- if .Values.nvmeof.enabled }}
-  - NVMe-oF   (DaemonSet {{ include "zfs-shares.fullname" . }}-nvmeof)
+  - NVMe-oF   (DaemonSet {{ include "simple-zfs-csi.fullname" . }}-nvmeof)
 {{- end }}
 {{- if .Values.discovery.enabled }}
-  - Discovery (DaemonSet {{ include "zfs-shares.fullname" . }}-discovery, Tier 1 ZfsPool health)
+  - Discovery (DaemonSet {{ include "simple-zfs-csi.fullname" . }}-discovery, Tier 1 ZfsPool health)
 {{- end }}
 {{- if .Values.operator.enabled }}
-  - Operator  (Deployment {{ include "zfs-shares.fullname" . }}-operator, cluster-wide control plane: node-death detection)
+  - Operator  (Deployment {{ include "simple-zfs-csi.fullname" . }}-operator, cluster-wide control plane: node-death detection)
 {{- end }}
 
 Next steps:
@@ -41,5 +41,5 @@ NOTE ON UPGRADES: the NetworkExport and ZfsPool CRDs are installed from the char
 crds/ directory. `helm upgrade` does NOT update them (no Helm flag does). After
 upgrading to a release that changes a CRD schema, apply the CRDs manually first:
 
-     kubectl apply -f charts/zfs-shares/crds/     # local checkout; or `make install-crd`
-     # published chart: helm pull ... --untar && kubectl apply -f zfs-shares/crds/
+     kubectl apply -f charts/simple-zfs-csi/crds/     # local checkout; or `make install-crd`
+     # published chart: helm pull ... --untar && kubectl apply -f simple-zfs-csi/crds/

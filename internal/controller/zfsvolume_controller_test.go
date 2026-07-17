@@ -14,8 +14,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/zpool"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 // fakeZFS is an in-memory zpool.ZFS used to assert the reconciler's create,

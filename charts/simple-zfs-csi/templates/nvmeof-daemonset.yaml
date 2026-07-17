@@ -2,28 +2,28 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-nvmeof
+  name: {{ include "simple-zfs-csi.fullname" . }}-nvmeof
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "zfs-shares.labels" . | nindent 4 }}
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
     app.kubernetes.io/component: nvmeof
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/name: {{ include "simple-zfs-csi.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: nvmeof
   template:
     metadata:
       labels:
-        {{- include "zfs-shares.labels" . | nindent 8 }}
+        {{- include "simple-zfs-csi.labels" . | nindent 8 }}
         app.kubernetes.io/component: nvmeof
       {{- with .Values.nvmeof.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "nvmeof") }}
+      serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "nvmeof") }}
       # hostNetwork so initiators reach the NVMe/TCP port on the node IP.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -41,7 +41,7 @@ spec:
       {{- end }}
       containers:
         - name: nvmeof-controller
-          image: {{ include "zfs-shares.image" (dict "root" . "component" "nvmeof") }}
+          image: {{ include "simple-zfs-csi.image" (dict "root" . "component" "nvmeof") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --node-name=$(NODE_NAME)

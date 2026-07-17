@@ -20,15 +20,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/zpool"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 // zfsVolumeFinalizer guards a ZfsVolume so the agent hosting its pool can run
 // `zfs destroy` before the object is removed. Unlike ZfsShare (whose child
 // NetworkExport is garbage-collected via owner references), destroying a dataset
 // is a real external side-effect that must complete before we release the object.
-const zfsVolumeFinalizer = "storage.zfs-shares.io/zfsvolume"
+const zfsVolumeFinalizer = "storage.simple-zfs-csi.io/zfsvolume"
 
 // ZfsVolumeReconciler is the per-node agent that fulfils ZfsVolume allocations.
 // It runs inside the privileged storage DaemonSet (one manager per node, no
@@ -48,9 +48,9 @@ type ZfsVolumeReconciler struct {
 	ZFS zpool.ZFS
 }
 
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfsvolumes,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfsvolumes/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfspools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsvolumes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsvolumes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools,verbs=get;list;watch
 
 // Reconcile creates or destroys the ZFS object backing a ZfsVolume, but only on
 // the node that currently hosts its pool.

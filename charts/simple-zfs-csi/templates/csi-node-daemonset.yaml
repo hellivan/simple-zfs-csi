@@ -4,28 +4,28 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "zfs-shares.fullname" . }}-csi-node
+  name: {{ include "simple-zfs-csi.fullname" . }}-csi-node
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "zfs-shares.labels" . | nindent 4 }}
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
     app.kubernetes.io/component: csi-node
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+      app.kubernetes.io/name: {{ include "simple-zfs-csi.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: csi-node
   template:
     metadata:
       labels:
-        {{- include "zfs-shares.labels" . | nindent 8 }}
+        {{- include "simple-zfs-csi.labels" . | nindent 8 }}
         app.kubernetes.io/component: csi-node
       {{- with .Values.csiNode.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      serviceAccountName: {{ include "zfs-shares.serviceAccountName" (dict "root" . "component" "csi-node") }}
+      serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "csi-node") }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- if and .Values.csiNode.hostExec.enabled (eq .Values.csiNode.hostExec.mode "nsenter") }}
@@ -45,7 +45,7 @@ spec:
       {{- end }}
       containers:
         - name: csi-node
-          image: {{ include "zfs-shares.image" (dict "root" . "component" "csiNode" "suffix" "csi-node") }}
+          image: {{ include "simple-zfs-csi.image" (dict "root" . "component" "csiNode" "suffix" "csi-node") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --endpoint=unix:///csi/csi.sock

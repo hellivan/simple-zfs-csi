@@ -1,6 +1,6 @@
 # API & CRD Conventions
 
-Conventions for the `storage.zfs-shares.io` CRD types. These are the rules we
+Conventions for the `storage.simple-zfs-csi.io` CRD types. These are the rules we
 settled on while shaping `ZfsVolume`, `ZfsShare` and `NetworkExport`; follow them
 for any new type or field.
 

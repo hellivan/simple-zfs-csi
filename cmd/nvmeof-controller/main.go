@@ -13,9 +13,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/controller"
-	"github.com/hellivan/zfs-shares/internal/nvmet"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/controller"
+	"github.com/hellivan/simple-zfs-csi/internal/nvmet"
 )
 
 var scheme = runtime.NewScheme()
@@ -40,7 +40,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe binds to.")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Node this controller manages (defaults to $NODE_NAME).")
 	flag.StringVar(&configfsRoot, "nvmet-configfs-root", nvmet.DefaultRoot, "Root of the nvmet configfs tree.")
-	flag.StringVar(&nqnPrefix, "nqn-prefix", "nqn.2025-01.io.zfs-shares", "Prefix for derived subsystem NQNs.")
+	flag.StringVar(&nqnPrefix, "nqn-prefix", "nqn.2025-01.io.simple-zfs-csi", "Prefix for derived subsystem NQNs.")
 	flag.StringVar(&portID, "port-id", "1", "nvmet port directory id.")
 	flag.StringVar(&trAddr, "transport-address", "0.0.0.0", "NVMe-oF TCP listen address.")
 	flag.StringVar(&trSvcID, "transport-service-id", "4420", "NVMe-oF TCP listen port.")

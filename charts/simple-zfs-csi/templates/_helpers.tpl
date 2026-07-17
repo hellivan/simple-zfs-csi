@@ -1,14 +1,14 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "zfs-shares.name" -}}
+{{- define "simple-zfs-csi.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/*
 Full release name.
 */}}
-{{- define "zfs-shares.fullname" -}}
+{{- define "simple-zfs-csi.fullname" -}}
 {{- if .Values.fullnameOverride -}}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
@@ -24,25 +24,25 @@ Full release name.
 {{/*
 Common labels.
 */}}
-{{- define "zfs-shares.labels" -}}
+{{- define "simple-zfs-csi.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
-app.kubernetes.io/name: {{ include "zfs-shares.name" . }}
+app.kubernetes.io/name: {{ include "simple-zfs-csi.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app.kubernetes.io/part-of: zfs-shares
+app.kubernetes.io/part-of: simple-zfs-csi
 {{- end -}}
 
 {{/*
 Resolve the image reference for a component ("nfs", "nvmeof", ...).
 The values key is `component`; the derived image suffix is `suffix` (defaults to
 `component`) so camelCase values keys can map to hyphenated image names.
-Usage: {{ include "zfs-shares.image" (dict "root" . "component" "nfs") }}
-       {{ include "zfs-shares.image" (dict "root" . "component" "csiController" "suffix" "csi-controller") }}
+Usage: {{ include "simple-zfs-csi.image" (dict "root" . "component" "nfs") }}
+       {{ include "simple-zfs-csi.image" (dict "root" . "component" "csiController" "suffix" "csi-controller") }}
 */}}
-{{- define "zfs-shares.image" -}}
+{{- define "simple-zfs-csi.image" -}}
 {{- $root := .root -}}
 {{- $component := .component -}}
 {{- $suffix := .suffix | default $component -}}
@@ -59,6 +59,6 @@ Usage: {{ include "zfs-shares.image" (dict "root" . "component" "nfs") }}
 {{/*
 ServiceAccount name for a component.
 */}}
-{{- define "zfs-shares.serviceAccountName" -}}
-{{- printf "%s-%s" (include "zfs-shares.fullname" .root) .component | trunc 63 | trimSuffix "-" -}}
+{{- define "simple-zfs-csi.serviceAccountName" -}}
+{{- printf "%s-%s" (include "simple-zfs-csi.fullname" .root) .component | trunc 63 | trimSuffix "-" -}}
 {{- end -}}

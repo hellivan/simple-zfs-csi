@@ -1,7 +1,7 @@
 ---
 # Export an already-mounted filesystem path over NFS (RWX). The path must already
 # be provisioned/mounted on the node by the storage plane.
-apiVersion: storage.zfs-shares.io/v1alpha1
+apiVersion: storage.simple-zfs-csi.io/v1alpha1
 kind: NetworkExport
 metadata:
   name: pvc-media-movies
@@ -16,7 +16,7 @@ spec:
 ---
 # Export an already-existing block device over NVMe-oF (TCP). The device must
 # already exist.
-apiVersion: storage.zfs-shares.io/v1alpha1
+apiVersion: storage.simple-zfs-csi.io/v1alpha1
 kind: NetworkExport
 metadata:
   name: pvc-postgres-data
@@ -25,7 +25,7 @@ spec:
   protocol: nvmeof
   path: /dev/zvol/tank/pvc-postgres-data
   nvmeof:
-    # nqn omitted -> derived as nqn.2025-01.io.zfs-shares:talos-node-01:pvc-postgres-data
+    # nqn omitted -> derived as nqn.2025-01.io.simple-zfs-csi:talos-node-01:pvc-postgres-data
     allowedHosts:
       - "nqn.2014-08.org.nvmexpress:uuid:worker-01"
 ---
@@ -33,7 +33,7 @@ spec:
 # creates one per imported pool (name = "zpool-<GUID>") and continuously writes
 # status. The Tier 2 watcher overrides status.health with NODE_OFFLINE when the
 # owning node dies. This is only an illustration of the resulting object.
-apiVersion: storage.zfs-shares.io/v1alpha1
+apiVersion: storage.simple-zfs-csi.io/v1alpha1
 kind: ZfsPool
 metadata:
   name: zpool-12140134988506841113   # immutable ZFS pool GUID

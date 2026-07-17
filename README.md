@@ -1,4 +1,4 @@
-# zfs-shares
+# simple-zfs-csi
 
 Cloud-native, dynamically-provisioned ZFS storage for Kubernetes on Talos Linux
 (no SSH, no systemd-in-a-pod). A PersistentVolumeClaim becomes a ZFS dataset or
@@ -12,12 +12,12 @@ node-pinned *exports*, and per-node aggregators execute those exports.
 
 | Component | Image | Kind | Reconciles | Mechanism |
 |-----------|-------|------|------------|-----------|
-| `csi-controller` | `zfs-shares-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` | thin gRPC adapter: writes `ZfsVolume` (+ `ZfsShare`), returns a routing-only volume context |
-| `csi-node` | `zfs-shares-csi-node` | DaemonSet (all nodes) | CSI `NodePublishVolume` | resolves `ZfsPool.status`, `mount -t nfs` / `nvme connect`; refuses `NODE_OFFLINE` |
-| `zpool-discovery` (agent) | `zfs-shares-discovery` | DaemonSet (storage nodes) | local pools (Tier 1) + `ZfsVolume` | polls `zpool`/`zfs` into `ZfsPool`; `zfs create/destroy` for datasets/zvols |
-| `operator` | `zfs-shares-operator` | Deployment (x1, leader-elected) | `Node` (Tier 2) + `ZfsShare` | forces dead nodes' `ZfsPool` to `NODE_OFFLINE`; compiles `ZfsShare` → `NetworkExport` |
-| `nfs-controller` | `zfs-shares-nfs` | DaemonSet (storage nodes) | `protocol: nfs` `NetworkExport` | writes `/etc/exports`, runs `exportfs -ra`, supervises the NFS server |
-| `nvmeof-controller` | `zfs-shares-nvmeof` | DaemonSet (storage nodes) | `protocol: nvmeof` `NetworkExport` | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
+| `csi-controller` | `simple-zfs-csi-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` | thin gRPC adapter: writes `ZfsVolume` (+ `ZfsShare`), returns a routing-only volume context |
+| `csi-node` | `simple-zfs-csi-csi-node` | DaemonSet (all nodes) | CSI `NodePublishVolume` | resolves `ZfsPool.status`, `mount -t nfs` / `nvme connect`; refuses `NODE_OFFLINE` |
+| `zpool-discovery` (agent) | `simple-zfs-csi-discovery` | DaemonSet (storage nodes) | local pools (Tier 1) + `ZfsVolume` | polls `zpool`/`zfs` into `ZfsPool`; `zfs create/destroy` for datasets/zvols |
+| `operator` | `simple-zfs-csi-operator` | Deployment (x1, leader-elected) | `Node` (Tier 2) + `ZfsShare` | forces dead nodes' `ZfsPool` to `NODE_OFFLINE`; compiles `ZfsShare` → `NetworkExport` |
+| `nfs-controller` | `simple-zfs-csi-nfs` | DaemonSet (storage nodes) | `protocol: nfs` `NetworkExport` | writes `/etc/exports`, runs `exportfs -ra`, supervises the NFS server |
+| `nvmeof-controller` | `simple-zfs-csi-nvmeof` | DaemonSet (storage nodes) | `protocol: nvmeof` `NetworkExport` | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
 
 The four CRDs form a compile-down chain — a PVC turns into a `ZfsVolume` +
 `ZfsShare`, and the `ZfsShare` renders a `NetworkExport`:
@@ -102,7 +102,7 @@ container exits non-zero and Kubernetes restarts the pod.
 ## The `NetworkExport` resource
 
 ```yaml
-apiVersion: storage.zfs-shares.io/v1alpha1
+apiVersion: storage.simple-zfs-csi.io/v1alpha1
 kind: NetworkExport
 metadata:
   name: pvc-media-movies
@@ -117,7 +117,7 @@ spec:
 ```
 
 ```yaml
-apiVersion: storage.zfs-shares.io/v1alpha1
+apiVersion: storage.simple-zfs-csi.io/v1alpha1
 kind: NetworkExport
 metadata:
   name: pvc-postgres-data
@@ -126,7 +126,7 @@ spec:
   protocol: nvmeof
   path: /dev/zvol/tank/pvc-postgres-data
   nvmeof:
-    # nqn omitted -> derived: nqn.2025-01.io.zfs-shares:talos-node-01:pvc-postgres-data
+    # nqn omitted -> derived: nqn.2025-01.io.simple-zfs-csi:talos-node-01:pvc-postgres-data
     allowedHosts:
       - "nqn.2014-08.org.nvmexpress:uuid:worker-01"
 ```
@@ -156,7 +156,7 @@ in sync so CSI clients never route to a dead target:
   self-report, so this override is what prevents a stale `ONLINE` at a dead IP.
 
 ```yaml
-apiVersion: storage.zfs-shares.io/v1alpha1
+apiVersion: storage.simple-zfs-csi.io/v1alpha1
 kind: ZfsPool
 metadata:
   name: zpool-12140134988506841113   # immutable ZFS pool GUID
@@ -176,13 +176,13 @@ shifts never require editing a PersistentVolume.
 
 ## Dynamic provisioning (CSI)
 
-The CSI driver (`zfs-shares.io`) turns a PVC into a ZFS dataset (NFS) or zvol
+The CSI driver (`simple-zfs-csi.io`) turns a PVC into a ZFS dataset (NFS) or zvol
 (NVMe-oF). Provisioning is driven by **StorageClass parameters**, merged in three
 flat layers (later wins):
 
 ```
 chart defaultParameters  <  StorageClass.parameters  <  PVC annotations
-                                                        (param.zfs-shares.io/<key>)
+                                                        (param.simple-zfs-csi.io/<key>)
 ```
 
 | Parameter | Where | Meaning |
@@ -233,10 +233,10 @@ kind: PersistentVolumeClaim
 metadata:
   name: media-movies
   annotations:
-    param.zfs-shares.io/nfsOptions: "rw,sync,no_root_squash"
+    param.simple-zfs-csi.io/nfsOptions: "rw,sync,no_root_squash"
 spec:
   accessModes: ["ReadWriteMany"]
-  storageClassName: zfs-shares-nfs
+  storageClassName: simple-zfs-csi-nfs
   resources:
     requests:
       storage: 100Gi
@@ -270,31 +270,31 @@ make helm-template  # render the chart
 
 The chart and all images are published to GHCR by the release pipeline:
 
-- `oci://ghcr.io/hellivan/charts/zfs-shares` (chart)
-- `ghcr.io/hellivan/zfs-shares-{csi-controller,csi-node,discovery,operator,nfs,nvmeof}` (images)
+- `oci://ghcr.io/hellivan/charts/simple-zfs-csi` (chart)
+- `ghcr.io/hellivan/simple-zfs-csi-{csi-controller,csi-node,discovery,operator,nfs,nvmeof}` (images)
 
 ```sh
 # Label your storage node(s) first:
-kubectl label node talos-node-01 zfs-shares.io/storage=true
+kubectl label node talos-node-01 simple-zfs-csi.io/storage=true
 
 # Install a published version:
-helm install zfs-shares oci://ghcr.io/hellivan/charts/zfs-shares \
+helm install simple-zfs-csi oci://ghcr.io/hellivan/charts/simple-zfs-csi \
   --version 0.1.0 \
-  --namespace zfs-shares --create-namespace \
+  --namespace simple-zfs-csi --create-namespace \
   --set nfs.pool.hostPath=/tank --set nfs.pool.mountPath=/tank
 ```
 
 Or from the local checkout:
 
 ```sh
-make helm-install    # helm upgrade --install into namespace zfs-shares
+make helm-install    # helm upgrade --install into namespace simple-zfs-csi
 ```
 
-Common values (see [charts/zfs-shares/values.yaml](charts/zfs-shares/values.yaml)):
+Common values (see [charts/simple-zfs-csi/values.yaml](charts/simple-zfs-csi/values.yaml)):
 
 | Value | Default | Purpose |
 |-------|---------|---------|
-| `driverName` | `zfs-shares.io` | CSI driver / StorageClass provisioner name |
+| `driverName` | `simple-zfs-csi.io` | CSI driver / StorageClass provisioner name |
 | `storageClasses` | `{}` | map of StorageClasses to create (see above; none by default) |
 | `csiController.enabled` | `true` | provisioner Deployment (+ external-provisioner sidecar) |
 | `csiController.defaultParameters` | `{}` | lowest-priority parameter layer (`poolGUID`/`datasetPrefix` ignored here) |
@@ -304,15 +304,15 @@ Common values (see [charts/zfs-shares/values.yaml](charts/zfs-shares/values.yaml
 | `nfs.pool.hostPath` / `mountPath` | `/tank` | ZFS pool root visible to the NFS pod |
 | `nfs.v4Only` | `false` | NFSv4-only mode (drops rpcbind) |
 | `nvmeof.transport.serviceId` | `"4420"` | NVMe/TCP port |
-| `nvmeof.nqnPrefix` | `nqn.2025-01.io.zfs-shares` | derived subsystem NQN prefix |
-| `nodeSelector` | `zfs-shares.io/storage: "true"` | where the storage-node DaemonSets run |
+| `nvmeof.nqnPrefix` | `nqn.2025-01.io.simple-zfs-csi` | derived subsystem NQN prefix |
+| `nodeSelector` | `simple-zfs-csi.io/storage: "true"` | where the storage-node DaemonSets run |
 | `image.tag` | chart `appVersion` | image tag override |
 
 ### CRD management & upgrades
 
 The four CRDs (`ZfsPool`, `ZfsVolume`, `ZfsShare`, `NetworkExport`) are generated
 from the Go types (`make manifests`) and shipped in the chart's Helm-native
-[charts/zfs-shares/crds](charts/zfs-shares/crds) directory. Helm treats `crds/`
+[charts/simple-zfs-csi/crds](charts/simple-zfs-csi/crds) directory. Helm treats `crds/`
 specially:
 
 - **Install:** `helm install` applies the CRD automatically. Skip it (e.g. when
@@ -323,14 +323,14 @@ specially:
 
   ```sh
   # from a local checkout:
-  make install-crd            # kubectl apply -f charts/zfs-shares/crds/
+  make install-crd            # kubectl apply -f charts/simple-zfs-csi/crds/
 
   # or from a published chart version:
-  helm pull oci://ghcr.io/hellivan/charts/zfs-shares --version <v> --untar
-  kubectl apply -f zfs-shares/crds/
+  helm pull oci://ghcr.io/hellivan/charts/simple-zfs-csi --version <v> --untar
+  kubectl apply -f simple-zfs-csi/crds/
 
   # then upgrade the workload:
-  helm upgrade zfs-shares oci://ghcr.io/hellivan/charts/zfs-shares --version <v> ...
+  helm upgrade simple-zfs-csi oci://ghcr.io/hellivan/charts/simple-zfs-csi --version <v> ...
   ```
 
   `kubectl apply` on a CRD is additive and safe for the schema changes this
@@ -392,7 +392,7 @@ internal/nfsserver/      /etc/exports rendering + NFS daemon supervisor
 internal/nvmet/          nvmet configfs backend
 internal/zpool/          zpool/zfs CLI wrappers + host-exec
 config/samples/          example CRD objects
-charts/zfs-shares/       Helm chart (canonical deploy path; CRDs live here)
+charts/simple-zfs-csi/       Helm chart (canonical deploy path; CRDs live here)
 build/                   Dockerfiles (multi-arch)
 .github/workflows/       CI + release pipelines
 ```

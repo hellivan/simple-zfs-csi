@@ -4,7 +4,7 @@ kind: CSIDriver
 metadata:
   name: {{ .Values.driverName }}
   labels:
-    {{- include "zfs-shares.labels" . | nindent 4 }}
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
 spec:
   # The controller provisions via CRDs; no attach step is required.
   attachRequired: false

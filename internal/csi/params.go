@@ -1,4 +1,4 @@
-// Package csi implements the zfs-shares CSI controller plugin: a thin,
+// Package csi implements the simple-zfs-csi CSI controller plugin: a thin,
 // unprivileged gRPC adapter that translates CSI CreateVolume/DeleteVolume calls
 // into the ZFS-centric CRDs (ZfsVolume + ZfsShare) and returns a routing-only
 // volume_context. It contains no reconcile loops; the agent and operator do the
@@ -10,7 +10,7 @@ import (
 	"path"
 	"strings"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
 // Parameter keys understood by the driver. They resolve through a three-layer

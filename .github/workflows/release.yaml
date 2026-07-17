@@ -51,7 +51,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/zfs-shares-${{ matrix.component }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/simple-zfs-csi-${{ matrix.component }}
           tags: |
             type=raw,value=${{ steps.version.outputs.value }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.value }}
@@ -89,7 +89,7 @@ jobs:
 
       - name: Package chart
         run: |
-          helm package charts/zfs-shares \
+          helm package charts/simple-zfs-csi \
             --version "${{ steps.version.outputs.value }}" \
             --app-version "${{ steps.version.outputs.value }}" \
             --destination dist
@@ -101,5 +101,5 @@ jobs:
 
       - name: Push chart (OCI)
         run: |
-          helm push dist/zfs-shares-${{ steps.version.outputs.value }}.tgz \
+          helm push dist/simple-zfs-csi-${{ steps.version.outputs.value }}.tgz \
             oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts

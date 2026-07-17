@@ -15,7 +15,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
 // Volume context keys returned to the node plugin. The controller never returns
@@ -36,7 +36,7 @@ type ControllerServer struct {
 	Client        client.Client
 	DefaultParams map[string]string
 	// AnnotationPrefix selects which PVC annotations override parameters, e.g.
-	// "param.zfs-shares.io/". Empty disables the PVC-annotation layer.
+	// "param.simple-zfs-csi.io/". Empty disables the PVC-annotation layer.
 	AnnotationPrefix string
 	// CreateTimeout bounds how long CreateVolume waits for the ZfsVolume to reach
 	// Ready before returning DeadlineExceeded (external-provisioner retries).

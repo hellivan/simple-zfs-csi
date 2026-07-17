@@ -11,7 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
 // PoolWatcher is the Tier 2 (cluster-wide) monitoring component. It runs as a
@@ -30,8 +30,8 @@ type PoolWatcher struct {
 }
 
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfspools,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfspools/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools/status,verbs=get;update;patch
 
 // Reconcile checks a Node's readiness and offlines its pools when it is down.
 func (r *PoolWatcher) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

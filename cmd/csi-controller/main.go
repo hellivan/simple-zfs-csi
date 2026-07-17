@@ -1,4 +1,4 @@
-// Command csi-controller is the zfs-shares CSI controller plugin. It runs as an
+// Command csi-controller is the simple-zfs-csi CSI controller plugin. It runs as an
 // unprivileged cluster-wide Deployment alongside the external-provisioner
 // sidecar and implements the CSI Identity + Controller services by writing the
 // ZFS-centric CRDs (ZfsVolume + ZfsShare). It hosts no reconcile loops: the node
@@ -18,8 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	zfscsi "github.com/hellivan/zfs-shares/internal/csi"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	zfscsi "github.com/hellivan/simple-zfs-csi/internal/csi"
 )
 
 // version is overridable at build time via -ldflags.
@@ -42,9 +42,9 @@ func main() {
 		pollInterval     time.Duration
 	)
 	flag.StringVar(&endpoint, "endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint the plugin listens on.")
-	flag.StringVar(&driverName, "driver-name", "zfs-shares.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
+	flag.StringVar(&driverName, "driver-name", "simple-zfs-csi.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
 	flag.StringVar(&defaultsFile, "default-parameters-file", "", "Optional YAML file with provisioner default parameters (lowest precedence).")
-	flag.StringVar(&annotationPrefix, "pvc-annotation-prefix", "param.zfs-shares.io/", "PVC annotation prefix whose keys override parameters (empty disables the PVC layer).")
+	flag.StringVar(&annotationPrefix, "pvc-annotation-prefix", "param.simple-zfs-csi.io/", "PVC annotation prefix whose keys override parameters (empty disables the PVC layer).")
 	flag.DurationVar(&createTimeout, "create-timeout", 2*time.Minute, "How long CreateVolume waits for a ZfsVolume to become Ready.")
 	flag.DurationVar(&pollInterval, "poll-interval", 2*time.Second, "How often CreateVolume re-reads a ZfsVolume while waiting for Ready.")
 

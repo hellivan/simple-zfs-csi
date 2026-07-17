@@ -18,9 +18,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/controller"
-	"github.com/hellivan/zfs-shares/internal/zpool"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/controller"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 var scheme = runtime.NewScheme()

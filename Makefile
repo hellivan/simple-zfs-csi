@@ -1,16 +1,16 @@
-# zfs-shares Makefile
+# simple-zfs-csi Makefile
 
 REGISTRY ?= ghcr.io/hellivan
 TAG      ?= latest
-NFS_IMG      ?= $(REGISTRY)/zfs-shares-nfs:$(TAG)
-NVMEOF_IMG   ?= $(REGISTRY)/zfs-shares-nvmeof:$(TAG)
-DISCOVERY_IMG ?= $(REGISTRY)/zfs-shares-discovery:$(TAG)
-OPERATOR_IMG  ?= $(REGISTRY)/zfs-shares-operator:$(TAG)
-CSI_CONTROLLER_IMG ?= $(REGISTRY)/zfs-shares-csi-controller:$(TAG)
-CSI_NODE_IMG ?= $(REGISTRY)/zfs-shares-csi-node:$(TAG)
+NFS_IMG      ?= $(REGISTRY)/simple-zfs-csi-nfs:$(TAG)
+NVMEOF_IMG   ?= $(REGISTRY)/simple-zfs-csi-nvmeof:$(TAG)
+DISCOVERY_IMG ?= $(REGISTRY)/simple-zfs-csi-discovery:$(TAG)
+OPERATOR_IMG  ?= $(REGISTRY)/simple-zfs-csi-operator:$(TAG)
+CSI_CONTROLLER_IMG ?= $(REGISTRY)/simple-zfs-csi-csi-controller:$(TAG)
+CSI_NODE_IMG ?= $(REGISTRY)/simple-zfs-csi-csi-node:$(TAG)
 
 CONTROLLER_GEN_VERSION ?= v0.16.5
-CHART_DIR ?= charts/zfs-shares
+CHART_DIR ?= charts/simple-zfs-csi
 
 .PHONY: all
 all: build
@@ -89,7 +89,7 @@ helm-lint:
 
 .PHONY: helm-template
 helm-template:
-	helm template rel $(CHART_DIR) --namespace zfs-shares
+	helm template rel $(CHART_DIR) --namespace simple-zfs-csi
 
 .PHONY: helm-package
 helm-package:
@@ -98,12 +98,12 @@ helm-package:
 ## Install the chart into the current kube-context.
 .PHONY: helm-install
 helm-install:
-	helm upgrade --install zfs-shares $(CHART_DIR) \
-		--namespace zfs-shares --create-namespace
+	helm upgrade --install simple-zfs-csi $(CHART_DIR) \
+		--namespace simple-zfs-csi --create-namespace
 
 ## Uninstall the chart. Helm never deletes CRDs installed from crds/, so the
 ## NetworkExport CRD (and any NetworkExport objects) are retained.
 .PHONY: helm-uninstall
 helm-uninstall:
-	helm uninstall zfs-shares --namespace zfs-shares
+	helm uninstall simple-zfs-csi --namespace simple-zfs-csi
 

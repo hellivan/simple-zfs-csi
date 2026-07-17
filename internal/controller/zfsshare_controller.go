@@ -18,8 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/zpool"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 // ZfsShareReconciler is the cluster-wide translator that compiles a ZFS-centric
@@ -33,10 +33,10 @@ type ZfsShareReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfsshares,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfsshares/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=zfspools,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.zfs-shares.io,resources=networkexports,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsshares,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsshares/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=networkexports,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile resolves the share's pool and renders its child NetworkExport.
 func (r *ZfsShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

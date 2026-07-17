@@ -18,7 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
 func newTestClient(t *testing.T, objs ...client.Object) client.Client {
@@ -221,16 +221,16 @@ func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 			Namespace: "team-a",
 			Annotations: map[string]string{
 				// Non-restricted param: honoured.
-				"param.zfs-shares.io/nfsOptions": "rw no_root_squash",
+				"param.simple-zfs-csi.io/nfsOptions": "rw no_root_squash",
 				// StorageClass-only params: MUST be ignored.
-				"param.zfs-shares.io/poolGUID":      "annotated-pool",
-				"param.zfs-shares.io/datasetPrefix": "annotated-pfx",
+				"param.simple-zfs-csi.io/poolGUID":      "annotated-pool",
+				"param.simple-zfs-csi.io/datasetPrefix": "annotated-pfx",
 			},
 		},
 	}
 	cl := newTestClient(t, pvc)
 	cs := newController(cl)
-	cs.AnnotationPrefix = "param.zfs-shares.io/"
+	cs.AnnotationPrefix = "param.simple-zfs-csi.io/"
 	markReadyAsync(cl, "pvc-7")
 
 	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{

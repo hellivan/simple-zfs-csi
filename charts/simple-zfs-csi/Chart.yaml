@@ -1,5 +1,5 @@
 apiVersion: v2
-name: zfs-shares
+name: simple-zfs-csi
 description: Cloud-native network sharing of pre-provisioned ZFS storage on Talos (NFS + NVMe-oF controllers driven by the NetworkExport CRD).
 type: application
 # version is the chart version; appVersion tracks the container image tag.
@@ -7,9 +7,9 @@ type: application
 version: 0.1.0
 appVersion: "0.1.0"
 kubeVersion: ">=1.25.0-0"
-home: https://github.com/hellivan/zfs-shares
+home: https://github.com/hellivan/simple-zfs-csi
 sources:
-  - https://github.com/hellivan/zfs-shares
+  - https://github.com/hellivan/simple-zfs-csi
 keywords:
   - zfs
   - nfs

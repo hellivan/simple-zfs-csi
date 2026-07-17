@@ -4,16 +4,16 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: zfsshares.storage.zfs-shares.io
+  name: zfsvolumes.storage.simple-zfs-csi.io
 spec:
-  group: storage.zfs-shares.io
+  group: storage.simple-zfs-csi.io
   names:
-    kind: ZfsShare
-    listKind: ZfsShareList
-    plural: zfsshares
+    kind: ZfsVolume
+    listKind: ZfsVolumeList
+    plural: zfsvolumes
     shortNames:
-    - zshare
-    singular: zfsshare
+    - zvol
+    singular: zfsvolume
   scope: Cluster
   versions:
   - additionalPrinterColumns:
@@ -23,14 +23,14 @@ spec:
     - jsonPath: .spec.dataset
       name: Dataset
       type: string
-    - jsonPath: .spec.protocol
-      name: Protocol
-      type: string
-    - jsonPath: .status.nodeName
-      name: Node
+    - jsonPath: .spec.type
+      name: Type
       type: string
     - jsonPath: .status.phase
       name: Phase
+      type: string
+    - jsonPath: .status.path
+      name: Path
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -39,9 +39,10 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          ZfsShare is the Schema for the zfsshares API. It is a ZFS-centric, pool-GUID-
-          keyed "intent to share" that the operator compiles down into a node-pinned
-          NetworkExport, re-targeting it automatically when the pool moves nodes.
+          ZfsVolume is the Schema for the zfsvolumes API. It is a cluster-scoped
+          "intent to allocate" a ZFS dataset or zvol on a specific pool (by GUID). The
+          CSI controller creates it; the node agent currently hosting the pool creates
+          the underlying ZFS object and reports the result in the status.
         properties:
           apiVersion:
             description: |-
@@ -62,95 +63,96 @@ spec:
             type: object
           spec:
             description: |-
-              ZfsShareSpec is the ZFS-centric intent to share an already-provisioned dataset
-              or zvol over the network. It is keyed on the immutable pool GUID plus the
-              logical dataset path, so it survives pool takeover: the operator resolves the
-              GUID to the pool's current node and mount root, derives the node-local path,
-              and compiles this down into a node-pinned NetworkExport. Consumers never
-              author NetworkExports directly for ZFS-backed volumes.
+              ZfsVolumeSpec is the desired allocation of a ZFS dataset on the pool identified
+              by PoolGUID. It expresses storage intent only (create/size); the network
+              export of the resulting path is a separate concern (ZfsShare -> NetworkExport).
+              The agent on the node currently hosting the pool reconciles it.
+
+              Type-specific options live in a nested discriminated union: exactly the arm
+              matching Type is honoured. Use Filesystem for type=filesystem and Volume for
+              type=volume; the other arm must be absent.
             properties:
               dataset:
                 description: |-
                   Dataset is the logical dataset path relative to the pool root, e.g.
-                  "k8s/pvc-123". Combined with the resolved pool it yields the export path:
-                  NFS uses <baseMountPath>/<dataset>; NVMe-oF uses /dev/zvol/<poolName>/<dataset>.
+                  "k8s/pvc-123". It names the ZFS object (filesystem or volume) and is
+                  immutable for the lifetime of the volume.
                 minLength: 1
                 type: string
-              nfs:
-                description: NFS holds NFS-specific export configuration. Required
-                  when protocol is nfs.
+              filesystem:
+                description: |-
+                  Filesystem holds filesystem-only options. Set it when (and only when)
+                  type=filesystem.
                 properties:
-                  clients:
+                  quota:
+                    anyOf:
+                    - type: integer
+                    - type: string
                     description: |-
-                      Clients is the set of client match specs allowed to mount the export.
-                      Each entry maps to one line fragment in /etc/exports.
-                    items:
-                      description: NFSClient is a single NFS export client rule.
-                      properties:
-                        client:
-                          description: 'Client is the host match: "*", a CIDR (10.0.0.0/24),
-                            an IP, or a hostname.'
-                          minLength: 1
-                          type: string
-                        options:
-                          description: |-
-                            Options are raw NFS export options for this client, e.g.
-                            ["rw", "no_root_squash", "no_subtree_check", "sync"].
-                            When empty a safe default set is applied by the controller.
-                          items:
-                            type: string
-                          type: array
-                      required:
-                      - client
-                      type: object
-                    minItems: 1
-                    type: array
-                required:
-                - clients
-                type: object
-              nvmeof:
-                description: NVMeoF holds NVMe-oF specific configuration. Required
-                  when protocol is nvmeof.
-                properties:
-                  allowedHosts:
-                    description: |-
-                      AllowedHosts is the list of host NQNs permitted to connect. When empty the
-                      subsystem allows any host (allow_any_host=1).
-                    items:
-                      type: string
-                    type: array
-                  nqn:
-                    description: |-
-                      NQN is the subsystem NQN clients use to connect. When empty the controller
-                      derives a deterministic NQN from the resource metadata.
-                    type: string
+                      Quota caps the dataset's referenced space (ZFS "refquota"). When omitted or
+                      zero the dataset is unlimited.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                 type: object
               poolGUID:
                 description: |-
-                  PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name without
-                  the "zpool-" prefix) that hosts the dataset. The operator resolves it to
-                  the pool's current node, name and mount root via ZfsPool.status.
+                  PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name, without
+                  the "zpool-" prefix) that this volume is allocated on. The agent derives the
+                  concrete pool name and mount root from the matching ZfsPool.status.
                 minLength: 1
                 type: string
-              protocol:
-                description: Protocol selects the sharing backend.
+              properties:
+                additionalProperties:
+                  type: string
+                description: |-
+                  Properties are extra ZFS properties applied verbatim at creation, e.g.
+                  {"compression": "lz4", "recordsize": "1M"}. Keys are ZFS property names.
+                  They apply to both filesystem and volume datasets.
+                type: object
+              type:
+                description: |-
+                  Type selects a filesystem or a volume/zvol and determines which of the
+                  Filesystem/Volume option arms is honoured.
                 enum:
-                - nfs
-                - nvmeof
+                - filesystem
+                - volume
                 type: string
+              volume:
+                description: |-
+                  Volume holds volume/zvol-only options. Set it when (and only when)
+                  type=volume.
+                properties:
+                  size:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: Size is the logical volume size of the zvol. It is
+                      required.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  volblocksize:
+                    description: |-
+                      Volblocksize sets the zvol's block size (ZFS "volblocksize"), e.g. "16k". It
+                      is fixed at creation; empty means the ZFS default.
+                    type: string
+                required:
+                - size
+                type: object
             required:
             - dataset
             - poolGUID
-            - protocol
+            - type
             type: object
             x-kubernetes-validations:
-            - message: spec.nfs is required when protocol is nfs
-              rule: self.protocol != 'nfs' || has(self.nfs)
-            - message: spec.nvmeof is required when protocol is nvmeof
-              rule: self.protocol != 'nvmeof' || has(self.nvmeof)
+            - message: spec.volume is required when type is volume
+              rule: self.type != 'volume' || has(self.volume)
+            - message: spec.filesystem is only valid when type is filesystem
+              rule: self.type != 'volume' || !has(self.filesystem)
+            - message: spec.volume is only valid when type is volume
+              rule: self.type != 'filesystem' || !has(self.volume)
           status:
-            description: ZfsShareStatus reports the resolution result and the rendered
-              child export.
+            description: ZfsVolumeStatus reports the observed allocation state on
+              the node.
             properties:
               conditions:
                 description: Conditions represents the latest available observations.
@@ -216,22 +218,15 @@ spec:
                 description: Message carries human-readable detail about the current
                   phase.
                 type: string
-              networkExportName:
-                description: NetworkExportName is the name of the child NetworkExport
-                  this share owns.
-                type: string
-              nodeName:
-                description: |-
-                  NodeName is the storage node the share currently resolves to (the pool's
-                  current host). It changes on pool takeover.
-                type: string
               observedGeneration:
                 description: ObservedGeneration is the spec generation last reconciled.
                 format: int64
                 type: integer
               path:
-                description: Path is the node-local export path derived from the resolved
-                  pool.
+                description: |-
+                  Path is the node-local path of the created volume once Ready: the dataset
+                  mountpoint (type=dataset) or the zvol device node (type=zvol). Consumers
+                  should still resolve routing via ZfsPool.status rather than pinning this.
                 type: string
               phase:
                 description: Phase is a coarse summary of the current state.

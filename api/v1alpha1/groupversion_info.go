@@ -1,6 +1,6 @@
-// Package v1alpha1 contains the API types for the storage.zfs-shares.io group.
+// Package v1alpha1 contains the API types for the storage.simple-zfs-csi.io group.
 // +kubebuilder:object:generate=true
-// +groupName=storage.zfs-shares.io
+// +groupName=storage.simple-zfs-csi.io
 package v1alpha1
 
 import (
@@ -10,7 +10,7 @@ import (
 
 var (
 	// GroupVersion is the group/version used to register these objects.
-	GroupVersion = schema.GroupVersion{Group: "storage.zfs-shares.io", Version: "v1alpha1"}
+	GroupVersion = schema.GroupVersion{Group: "storage.simple-zfs-csi.io", Version: "v1alpha1"}
 
 	// SchemeBuilder registers the API types with a runtime.Scheme.
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}

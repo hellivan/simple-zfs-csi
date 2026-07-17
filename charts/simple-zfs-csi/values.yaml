@@ -1,4 +1,4 @@
-# Default values for the zfs-shares chart.
+# Default values for the simple-zfs-csi chart.
 
 # -- Override the chart name used in resource names.
 nameOverride: ""
@@ -7,13 +7,13 @@ fullnameOverride: ""
 
 # -- CSI driver name. Must match the CSIDriver object and the StorageClass
 # `provisioner` field.
-driverName: zfs-shares.io
+driverName: simple-zfs-csi.io
 
 image:
   # -- Container registry hosting the controller images.
   registry: ghcr.io
   # -- Image repository prefix; the `-nfs` / `-nvmeof` suffix is appended.
-  repository: hellivan/zfs-shares
+  repository: hellivan/simple-zfs-csi
   # -- Image tag. Defaults to the chart appVersion when empty.
   tag: ""
   # -- Image pull policy.
@@ -24,7 +24,7 @@ imagePullSecrets: []
 
 # -- Node selector applied to both DaemonSets. Storage nodes should carry this label.
 nodeSelector:
-  zfs-shares.io/storage: "true"
+  simple-zfs-csi.io/storage: "true"
 # -- Tolerations applied to both DaemonSets.
 tolerations:
   - operator: Exists
@@ -79,7 +79,7 @@ nvmeof:
     repository: ""
     tag: ""
   # -- Prefix for deterministically derived subsystem NQNs.
-  nqnPrefix: nqn.2025-01.io.zfs-shares
+  nqnPrefix: nqn.2025-01.io.simple-zfs-csi
   # -- Host mount point of the configfs filesystem. The nvmet target subtree
   # lives at `<configfsRoot>/nvmet`, which is what the controller manages.
   configfsRoot: /sys/kernel/config
@@ -191,7 +191,7 @@ csiController:
   pollInterval: 2s
   # -- PVC annotation prefix whose keys override parameters (empty disables the
   # -- PVC inheritance layer).
-  pvcAnnotationPrefix: param.zfs-shares.io/
+  pvcAnnotationPrefix: param.simple-zfs-csi.io/
   # -- Provisioner default parameters (lowest-precedence inheritance layer).
   # -- When non-empty they are rendered into a ConfigMap and mounted. NOTE:
   # -- `poolGUID` and `datasetPrefix` are StorageClass-only and are ignored here

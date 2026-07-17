@@ -1,4 +1,4 @@
-// Command csi-node is the zfs-shares CSI node plugin. It runs as a privileged
+// Command csi-node is the simple-zfs-csi CSI node plugin. It runs as a privileged
 // DaemonSet on every node alongside the node-driver-registrar sidecar and
 // implements the CSI Identity + Node services. NodePublishVolume resolves the
 // routing-only volume_context to the pool's current node/IP/mount root via
@@ -16,9 +16,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	zfscsi "github.com/hellivan/zfs-shares/internal/csi"
-	"github.com/hellivan/zfs-shares/internal/zpool"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	zfscsi "github.com/hellivan/simple-zfs-csi/internal/csi"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 // version is overridable at build time via -ldflags.
@@ -43,7 +43,7 @@ func main() {
 		nsenterPID    int
 	)
 	flag.StringVar(&endpoint, "endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint the plugin listens on.")
-	flag.StringVar(&driverName, "driver-name", "zfs-shares.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
+	flag.StringVar(&driverName, "driver-name", "simple-zfs-csi.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Node this plugin runs on (defaults to $NODE_NAME).")
 	flag.StringVar(&nvmeTransport, "nvme-transport", "tcp", "NVMe-oF transport used to connect to the storage node.")
 	flag.StringVar(&nvmePort, "nvme-port", "4420", "NVMe-oF service port on the storage node (must match the nvmeof controller).")

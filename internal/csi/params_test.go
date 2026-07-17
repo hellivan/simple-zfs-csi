@@ -3,7 +3,7 @@ package csi
 import (
 	"testing"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
 func TestResolveParameters_Inheritance(t *testing.T) {
@@ -24,13 +24,13 @@ func TestResolveParameters_Inheritance(t *testing.T) {
 		"csi.storage.k8s.io/pvc/namespace": "team-a",
 	}
 	pvcAnnotations := map[string]string{
-		"param.zfs-shares.io/poolGUID":      "pvc-pool", // StorageClass-only: must be dropped
-		"param.zfs-shares.io/datasetPrefix": "pvc/pfx",  // StorageClass-only: must be dropped
-		"param.zfs-shares.io/nfsOptions":    "rw",
-		"unrelated/annotation":              "ignored",
+		"param.simple-zfs-csi.io/poolGUID":      "pvc-pool", // StorageClass-only: must be dropped
+		"param.simple-zfs-csi.io/datasetPrefix": "pvc/pfx",  // StorageClass-only: must be dropped
+		"param.simple-zfs-csi.io/nfsOptions":    "rw",
+		"unrelated/annotation":                  "ignored",
 	}
 
-	merged := ResolveParameters(defaults, scParams, pvcAnnotations, "param.zfs-shares.io/")
+	merged := ResolveParameters(defaults, scParams, pvcAnnotations, "param.simple-zfs-csi.io/")
 
 	// poolGUID is StorageClass-only: neither defaults nor PVC annotations win.
 	if merged["poolGUID"] != "sc-pool" {
@@ -71,7 +71,7 @@ func TestResolveParameters_NoAnnotationLayer(t *testing.T) {
 	merged := ResolveParameters(
 		map[string]string{"nfsOptions": "ro"},
 		map[string]string{"poolGUID": "sc-pool", "protocol": "nfs"},
-		map[string]string{"param.zfs-shares.io/nfsOptions": "should-be-ignored"},
+		map[string]string{"param.simple-zfs-csi.io/nfsOptions": "should-be-ignored"},
 		"", // disabled
 	)
 	if merged["nfsOptions"] != "ro" {
@@ -89,10 +89,10 @@ func TestResolveParameters_StorageClassOnly(t *testing.T) {
 		map[string]string{"poolGUID": "from-default", "datasetPrefix": "from-default"},
 		map[string]string{"protocol": "nfs"},
 		map[string]string{
-			"param.zfs-shares.io/poolGUID":      "from-pvc",
-			"param.zfs-shares.io/datasetPrefix": "from-pvc",
+			"param.simple-zfs-csi.io/poolGUID":      "from-pvc",
+			"param.simple-zfs-csi.io/datasetPrefix": "from-pvc",
 		},
-		"param.zfs-shares.io/",
+		"param.simple-zfs-csi.io/",
 	)
 	if _, ok := merged["poolGUID"]; ok {
 		t.Errorf("poolGUID leaked from non-StorageClass layer: %q", merged["poolGUID"])

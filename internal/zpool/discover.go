@@ -10,7 +10,7 @@ import (
 	"os/exec"
 	"strings"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
 // Pool is a single ZFS pool observed on the local node.

@@ -11,8 +11,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
-	"github.com/hellivan/zfs-shares/internal/zpool"
+	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 // fakeMounter records operations and lets tests script mount state.
@@ -146,7 +146,7 @@ func TestNodePublish_NFS(t *testing.T) {
 func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 	m := newFakeMounter()
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"}}
-	export.Status.NQN = "nqn.2025-01.io.zfs-shares:pvc-2"
+	export.Status.NQN = "nqn.2025-01.io.simple-zfs-csi:pvc-2"
 	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export)
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
@@ -158,7 +158,7 @@ func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NodePublishVolume: %v", err)
 	}
-	if m.connectedNQN != "nqn.2025-01.io.zfs-shares:pvc-2" {
+	if m.connectedNQN != "nqn.2025-01.io.simple-zfs-csi:pvc-2" {
 		t.Errorf("connected NQN = %q", m.connectedNQN)
 	}
 	if m.fsMounts["/target/fs"] != "/dev/nvme1n1" {
