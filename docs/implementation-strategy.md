@@ -10,7 +10,7 @@ tracks **what to build, in what order, and how to verify each step.**
 ```
                          ┌──────────────────────────────────────────┐
  PVC ──> csi-provisioner │ CSI Controller (Deployment, unprivileged) │
-                         │  CreateVolume -> writes ZfsVolume(+ZfsShare)│
+                         │  CreateVolume -> writes ZfsDataset(+ZfsShare)│
                          │  waits Ready -> returns volume_context      │
                          └───────────────┬──────────────────────────┘
                                          │ (CRDs in etcd)
@@ -20,7 +20,7 @@ tracks **what to build, in what order, and how to verify each step.**
  │ agent       │  │ nfs          │  │ nvmeof        │   │ operator (Deployment x1,   │
  │ zfs create  │  │ exportfs     │  │ configfs      │   │ cluster-wide, leader-elect)│
  │ + discovery │  │ (NetworkExport)  (NetworkExport)│   │  - zpool-watcher:          │
- │ ZfsVolume   │  └──────────────┘  └───────────────┘   │    node death -> NODE_OFFLINE│
+ │ ZfsDataset   │  └──────────────┘  └───────────────┘   │    node death -> NODE_OFFLINE│
  │ (allocation)│                                        │  - ZfsShare -> NetworkExport │
  └─────────────┘                                        └────────────────────────────┘
                                          ▲
@@ -37,10 +37,10 @@ tracks **what to build, in what order, and how to verify each step.**
 | CRD | Scope | Keyed on | Written by | Purpose |
 |-----|-------|----------|------------|---------|
 | `ZfsPool` | Cluster | pool GUID (`metadata.name`) | agent (discovery) + operator (watcher) | routing + health (exists today) |
-| `ZfsVolume` | Cluster | `spec.poolGUID` | CSI controller (creates), agent (reconciles) | dataset/zvol allocation intent |
+| `ZfsDataset` | Cluster | `spec.poolGUID` | CSI controller (creates), agent (reconciles) | dataset/zvol allocation intent |
 | `ZfsShare` | Cluster | `spec.poolGUID` + `spec.dataset` | CSI controller (creates), operator (ZfsShare reconciler) | ZFS-centric "intent to share"; renders a child `NetworkExport` |
 | `NetworkExport` | Cluster | `spec.nodeName` + `spec.path` | operator (ZfsShare reconciler, owns) or admin (standalone) | generic, ZFS-agnostic node-local export executor contract |
-| `ZfsSnapshot` *(Step 9, pending model decision)* | Cluster | `spec.poolGUID` + source dataset | CSI controller (creates), agent (reconciles) | point-in-time `dataset@snap`; source for clone/restore |
+| `ZfsSnapshot` *(Step 9)* | Cluster | `spec.poolGUID` + source dataset | CSI controller (creates), agent (reconciles) | point-in-time `dataset@snap`; source for clone/restore (separate CRD per ADR-0006) |
 
 Key rule: **ZfsShare compiles down to NetworkExport.** Only `NetworkExport` controllers
 touch `/etc/exports` / nvmet `configfs` — exactly one aggregator per node per protocol.
@@ -49,10 +49,10 @@ touch `/etc/exports` / nvmet `configfs` — exactly one aggregator per node per 
 
 | Component | Kind | Scope | Privilege | Hosts |
 |-----------|------|-------|-----------|-------|
-| `agent` | DaemonSet | per storage node | privileged (`/dev/zfs`) | discovery + `ZfsVolume` allocation |
+| `agent` | DaemonSet | per storage node | privileged (`/dev/zfs`) | discovery + `ZfsDataset` allocation |
 | `nfs` / `nvmeof` | containers in the storage DaemonSet | per storage node | privileged | `NetworkExport` aggregators (exportfs / configfs) |
 | **`operator`** | Deployment (x1, leader-elected) | cluster-wide | unprivileged | `zpool-watcher` (node death → `ZfsPool` health) **+** `ZfsShare → NetworkExport` translator |
-| `csi-controller` | Deployment | cluster-wide | unprivileged | thin gRPC adapter: creates `ZfsVolume`/`ZfsShare`, returns context (no reconcile loops) |
+| `csi-controller` | Deployment | cluster-wide | unprivileged | thin gRPC adapter: creates `ZfsDataset`/`ZfsShare`, returns context (no reconcile loops) |
 | `csi-node` | DaemonSet | all nodes | privileged (mount) | NodePublish: mount / `nvme connect` |
 
 `operator` is the promoted `zpool-watcher`: the cluster-scoped controller-manager for all
@@ -80,8 +80,8 @@ generic executor.
 - Update `config/samples/`, chart CRDs/templates, `README.md` references.
 - Verify: `make manifests` (regenerate deepcopy + CRDs), `make vet`, `make build`.
 
-### Step 2 — `ZfsVolume` allocation CRD
-- New `api/v1alpha1/zfsvolume_types.go`.
+### Step 2 — `ZfsDataset` allocation CRD
+- New `api/v1alpha1/zfsdataset_types.go`.
 - Spec: `{ poolGUID, dataset, type: dataset|zvol, quota (dataset), size (zvol), volblocksize? (zvol), properties? map }`.
 - Status: `{ phase, path, observedGeneration, conditions }`.
 - Verify: `make manifests`, `make vet`.
@@ -104,15 +104,15 @@ generic executor.
 - Verify: `make vet`, unit tests with a fake exec.
 
 ### Step 5 — Agent allocation reconciler (fold into discovery = `agent`)
-- Reconcile `ZfsVolume` where the pool GUID is currently hosted by this node.
+- Reconcile `ZfsDataset` where the pool GUID is currently hosted by this node.
 - Create: `zfs create [-V]` idempotently; set `status.path` + `Ready`.
 - Delete: finalizer -> `zfs destroy`.
 - Merge with the existing discovery loop so one binary/container = `agent`.
-- Verify: `make build`; manual `kubectl apply` of a `ZfsVolume` on a test node.
+- Verify: `make build`; manual `kubectl apply` of a `ZfsDataset` on a test node.
 
 ### Step 6 — CSI controller (`cmd/csi-controller`)
 - Identity + Controller gRPC services (grpc + csi spec proto).
-- `CreateVolume`: write `ZfsVolume` (+ `ZfsShare`), wait for Ready, return volume_context
+- `CreateVolume`: write `ZfsDataset` (+ `ZfsShare`), wait for Ready, return volume_context
   `{ pool_guid, dataset, protocol }` (never an absolute path).
 - `DeleteVolume`: delete the CRDs (finalizers drive teardown).
 - Optional: `ControllerExpandVolume`, snapshots.
@@ -134,9 +134,9 @@ optional CSI capability advertised only when its sidecar/RBAC is deployed.
 
 ### Step 8 — Volume expansion  ✅ done (ADR-0004)
 Spec-driven size convergence, online grow.
-- Agent: `ZfsVolume` reconcile calls `ensureSize` — filesystem grows `refquota`, zvol grows
+- Agent: `ZfsDataset` reconcile calls `ensureSize` — filesystem grows `refquota`, zvol grows
   `volsize` (align up to `volblocksize`, never shrink).
-- CSI controller: `ControllerExpandVolume` bumps `ZfsVolume` spec size (retry-on-conflict),
+- CSI controller: `ControllerExpandVolume` bumps `ZfsDataset` spec size (retry-on-conflict),
   waits for `observedGeneration`, returns `NodeExpansionRequired` (false for NFS/filesystem,
   true for zvol). Advertises `EXPAND_VOLUME`.
 - CSI node: `NodeExpandVolume` — NFS no-op; NVMe-oF `ns-rescan` + `resize2fs`/`xfs_growfs`
@@ -146,7 +146,7 @@ Spec-driven size convergence, online grow.
 - Verify: unit tests (controller expand fs/zvol, node expand nvme/nfs); `helm template`.
 
 ### Step 9 — Snapshots
-**Model decision pending:** dedicated `ZfsSnapshot` CRD *vs.* `ZfsVolume{type: snapshot}`.
+Dedicated `ZfsSnapshot` CRD (grouped by lifecycle, not ZFS taxonomy — ADR-0006).
 - Agent: `zfs snapshot pool/ds@snap` (create), `zfs destroy pool/ds@snap` (finalizer);
   status `readyToUse`, `creationTime`, `restoreSize` (referenced/used bytes).
 - CSI controller: `CreateSnapshot`/`DeleteSnapshot`/`ListSnapshots`; advertise
@@ -156,7 +156,7 @@ Spec-driven size convergence, online grow.
 
 ### Step 10 — Volume from snapshot / clone
 - CSI controller: `CreateVolume` honours `VolumeContentSource` (snapshot or volume) →
-  writes a `ZfsVolume` whose spec references the source; advertise `CLONE_VOLUME`.
+  writes a `ZfsDataset` whose spec references the source; advertise `CLONE_VOLUME`.
 - Agent: `zfs clone pool/ds@snap pool/newds` (from snapshot) or
   `zfs snapshot`+`zfs clone` (from volume) instead of `zfs create`.
 - Verify: `make manifests` if spec grows a source ref; unit tests; e2e restore + clone.
@@ -167,10 +167,10 @@ Spec-driven size convergence, online grow.
 |------|-------|------|-------------|
 | 0 operator rename | `vet`+`build`+`helm-lint`+`helm-template` | existing watcher tests pass | watcher still sets NODE_OFFLINE |
 | 1 rename | `make manifests`+`vet`+`build` | existing tests pass | — |
-| 2 ZfsVolume | `make manifests`+`vet` | — | — |
+| 2 ZfsDataset | `make manifests`+`vet` | — | — |
 | 3 ZfsShare | `make manifests`+`vet` | path derivation, child render | — |
 | 4 ZFS iface | `vet` | fake-exec unit tests | — |
-| 5 agent | `build` | reconcile idempotency | `kubectl apply` ZfsVolume creates dataset |
+| 5 agent | `build` | reconcile idempotency | `kubectl apply` ZfsDataset creates dataset |
 | 6 controller | `build` | — | csi-sanity + PVC provisions |
 | 7 node | `build` | — | csi-sanity + pod mounts (NFS + NVMe-oF) |
 | 8 expansion ✅ | `vet`+`build`+`helm-template` | controller/node expand unit tests | PVC resize grows fs/zvol |

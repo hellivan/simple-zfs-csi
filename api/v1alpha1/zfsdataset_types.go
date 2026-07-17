@@ -5,33 +5,33 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// VolumeType selects which kind of ZFS dataset a ZfsVolume provisions: a POSIX
+// DatasetType selects which kind of ZFS dataset a ZfsDataset provisions: a POSIX
 // filesystem (shared over NFS) or a raw block volume/zvol (shared over NVMe-oF).
 // Both are "datasets" in ZFS terms; this is the dataset's type.
 // +kubebuilder:validation:Enum=filesystem;volume
-type VolumeType string
+type DatasetType string
 
 const (
-	// VolumeTypeFilesystem provisions a ZFS filesystem dataset, sized by quota.
-	VolumeTypeFilesystem VolumeType = "filesystem"
-	// VolumeTypeVolume provisions a ZFS volume (zvol / block device), sized by size.
-	VolumeTypeVolume VolumeType = "volume"
+	// DatasetTypeFilesystem provisions a ZFS filesystem dataset, sized by quota.
+	DatasetTypeFilesystem DatasetType = "filesystem"
+	// DatasetTypeVolume provisions a ZFS volume (zvol / block device), sized by size.
+	DatasetTypeVolume DatasetType = "volume"
 )
 
-// ZfsVolumePhase is a high-level summary of the allocation state.
-type ZfsVolumePhase string
+// ZfsDatasetPhase is a high-level summary of the allocation state.
+type ZfsDatasetPhase string
 
 const (
-	// VolumePhasePending means the dataset/zvol has not been created yet.
-	VolumePhasePending ZfsVolumePhase = "Pending"
-	// VolumePhaseReady means the dataset/zvol exists and is usable.
-	VolumePhaseReady ZfsVolumePhase = "Ready"
-	// VolumePhaseError means the last reconcile attempt failed.
-	VolumePhaseError ZfsVolumePhase = "Error"
+	// DatasetPhasePending means the dataset/zvol has not been created yet.
+	DatasetPhasePending ZfsDatasetPhase = "Pending"
+	// DatasetPhaseReady means the dataset/zvol exists and is usable.
+	DatasetPhaseReady ZfsDatasetPhase = "Ready"
+	// DatasetPhaseError means the last reconcile attempt failed.
+	DatasetPhaseError ZfsDatasetPhase = "Error"
 )
 
 // FilesystemConfig holds the options that apply only to a filesystem dataset
-// (type=filesystem). It is a discriminated-union arm of ZfsVolumeSpec: it must
+// (type=filesystem). It is a discriminated-union arm of ZfsDatasetSpec: it must
 // be set when (and only when) type is filesystem.
 type FilesystemConfig struct {
 	// Quota caps the dataset's referenced space (ZFS "refquota"). When omitted or
@@ -41,7 +41,7 @@ type FilesystemConfig struct {
 }
 
 // VolumeConfig holds the options that apply only to a volume/zvol (type=volume).
-// It is a discriminated-union arm of ZfsVolumeSpec: it must be set when (and
+// It is a discriminated-union arm of ZfsDatasetSpec: it must be set when (and
 // only when) type is volume.
 type VolumeConfig struct {
 	// Size is the logical volume size of the zvol. It is required.
@@ -53,7 +53,7 @@ type VolumeConfig struct {
 	Volblocksize string `json:"volblocksize,omitempty"`
 }
 
-// ZfsVolumeSpec is the desired allocation of a ZFS dataset on the pool identified
+// ZfsDatasetSpec is the desired allocation of a ZFS dataset on the pool identified
 // by PoolGUID. It expresses storage intent only (create/size); the network
 // export of the resulting path is a separate concern (ZfsShare -> NetworkExport).
 // The agent on the node currently hosting the pool reconciles it.
@@ -64,7 +64,7 @@ type VolumeConfig struct {
 // +kubebuilder:validation:XValidation:rule="self.type != 'volume' || has(self.volume)",message="spec.volume is required when type is volume"
 // +kubebuilder:validation:XValidation:rule="self.type != 'volume' || !has(self.filesystem)",message="spec.filesystem is only valid when type is filesystem"
 // +kubebuilder:validation:XValidation:rule="self.type != 'filesystem' || !has(self.volume)",message="spec.volume is only valid when type is volume"
-type ZfsVolumeSpec struct {
+type ZfsDatasetSpec struct {
 	// PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name, without
 	// the "zpool-" prefix) that this volume is allocated on. The agent derives the
 	// concrete pool name and mount root from the matching ZfsPool.status.
@@ -79,7 +79,7 @@ type ZfsVolumeSpec struct {
 
 	// Type selects a filesystem or a volume/zvol and determines which of the
 	// Filesystem/Volume option arms is honoured.
-	Type VolumeType `json:"type"`
+	Type DatasetType `json:"type"`
 
 	// Properties are extra ZFS properties applied verbatim at creation, e.g.
 	// {"compression": "lz4", "recordsize": "1M"}. Keys are ZFS property names.
@@ -98,11 +98,11 @@ type ZfsVolumeSpec struct {
 	Volume *VolumeConfig `json:"volume,omitempty"`
 }
 
-// ZfsVolumeStatus reports the observed allocation state on the node.
-type ZfsVolumeStatus struct {
+// ZfsDatasetStatus reports the observed allocation state on the node.
+type ZfsDatasetStatus struct {
 	// Phase is a coarse summary of the current state.
 	// +optional
-	Phase ZfsVolumePhase `json:"phase,omitempty"`
+	Phase ZfsDatasetPhase `json:"phase,omitempty"`
 
 	// Path is the node-local path of the created volume once Ready: the dataset
 	// mountpoint (type=dataset) or the zvol device node (type=zvol). Consumers
@@ -127,7 +127,7 @@ type ZfsVolumeStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster,shortName=zvol
+// +kubebuilder:resource:scope=Cluster,shortName=zds
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.poolGUID`
 // +kubebuilder:printcolumn:name="Dataset",type=string,JSONPath=`.spec.dataset`
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
@@ -135,27 +135,27 @@ type ZfsVolumeStatus struct {
 // +kubebuilder:printcolumn:name="Path",type=string,JSONPath=`.status.path`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// ZfsVolume is the Schema for the zfsvolumes API. It is a cluster-scoped
+// ZfsDataset is the Schema for the zfsdatasets API. It is a cluster-scoped
 // "intent to allocate" a ZFS dataset or zvol on a specific pool (by GUID). The
 // CSI controller creates it; the node agent currently hosting the pool creates
 // the underlying ZFS object and reports the result in the status.
-type ZfsVolume struct {
+type ZfsDataset struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ZfsVolumeSpec   `json:"spec,omitempty"`
-	Status ZfsVolumeStatus `json:"status,omitempty"`
+	Spec   ZfsDatasetSpec   `json:"spec,omitempty"`
+	Status ZfsDatasetStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// ZfsVolumeList contains a list of ZfsVolume.
-type ZfsVolumeList struct {
+// ZfsDatasetList contains a list of ZfsDataset.
+type ZfsDatasetList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ZfsVolume `json:"items"`
+	Items           []ZfsDataset `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&ZfsVolume{}, &ZfsVolumeList{})
+	SchemeBuilder.Register(&ZfsDataset{}, &ZfsDatasetList{})
 }

@@ -53,7 +53,7 @@ spec:
       {{- end }}
       containers:
         - name: csi-controller
-          image: {{ include "simple-zfs-csi.image" (dict "root" . "component" "csiController" "suffix" "csi-controller") }}
+          image: {{ include "simple-zfs-csi.image" (dict "root" . "component" "csiController" "suffix" "controller") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --endpoint=unix://{{ .Values.csiController.socketDir }}/csi.sock

@@ -144,18 +144,18 @@ func TestDatasetName(t *testing.T) {
 func TestDeriveVolumePath(t *testing.T) {
 	tests := []struct {
 		name          string
-		volType       storagev1alpha1.VolumeType
+		volType       storagev1alpha1.DatasetType
 		baseMountPath string
 		poolName      string
 		dataset       string
 		want          string
 		wantErr       bool
 	}{
-		{name: "filesystem joins base mount path", volType: storagev1alpha1.VolumeTypeFilesystem, baseMountPath: "/mnt/tank", dataset: "k8s/pvc-1", want: "/mnt/tank/k8s/pvc-1"},
-		{name: "volume device node", volType: storagev1alpha1.VolumeTypeVolume, poolName: "tank", dataset: "k8s/pvc-1", want: "/dev/zvol/tank/k8s/pvc-1"},
-		{name: "filesystem without mount path errors", volType: storagev1alpha1.VolumeTypeFilesystem, dataset: "x", wantErr: true},
-		{name: "volume without pool name errors", volType: storagev1alpha1.VolumeTypeVolume, dataset: "x", wantErr: true},
-		{name: "empty dataset errors", volType: storagev1alpha1.VolumeTypeFilesystem, baseMountPath: "/tank", dataset: "/", wantErr: true},
+		{name: "filesystem joins base mount path", volType: storagev1alpha1.DatasetTypeFilesystem, baseMountPath: "/mnt/tank", dataset: "k8s/pvc-1", want: "/mnt/tank/k8s/pvc-1"},
+		{name: "volume device node", volType: storagev1alpha1.DatasetTypeVolume, poolName: "tank", dataset: "k8s/pvc-1", want: "/dev/zvol/tank/k8s/pvc-1"},
+		{name: "filesystem without mount path errors", volType: storagev1alpha1.DatasetTypeFilesystem, dataset: "x", wantErr: true},
+		{name: "volume without pool name errors", volType: storagev1alpha1.DatasetTypeVolume, dataset: "x", wantErr: true},
+		{name: "empty dataset errors", volType: storagev1alpha1.DatasetTypeFilesystem, baseMountPath: "/tank", dataset: "/", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -176,15 +176,15 @@ func TestDeriveVolumePath(t *testing.T) {
 	}
 }
 
-func TestZfsVolumeReconcile_CreatesDatasetAndSetsReady(t *testing.T) {
+func TestZfsDatasetReconcile_CreatesDatasetAndSetsReady(t *testing.T) {
 	scheme := newTestScheme(t)
 	quota := resource.MustParse("1Gi")
-	vol := &storagev1alpha1.ZfsVolume{
+	vol := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID:   "999",
 			Dataset:    "k8s/pvc-1",
-			Type:       storagev1alpha1.VolumeTypeFilesystem,
+			Type:       storagev1alpha1.DatasetTypeFilesystem,
 			Properties: map[string]string{"compression": "lz4"},
 			Filesystem: &storagev1alpha1.FilesystemConfig{Quota: &quota},
 		},
@@ -193,11 +193,11 @@ func TestZfsVolumeReconcile_CreatesDatasetAndSetsReady(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(onlinePool(), vol).
-		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS()
-	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
 
 	// First pass installs the finalizer; second pass provisions and reports Ready.
@@ -218,14 +218,14 @@ func TestZfsVolumeReconcile_CreatesDatasetAndSetsReady(t *testing.T) {
 		t.Errorf("refquota not derived from quota: %v", z.lastDSProps)
 	}
 
-	var got storagev1alpha1.ZfsVolume
+	var got storagev1alpha1.ZfsDataset
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &got); err != nil {
 		t.Fatalf("get volume: %v", err)
 	}
-	if !controllerutil.ContainsFinalizer(&got, zfsVolumeFinalizer) {
+	if !controllerutil.ContainsFinalizer(&got, zfsDatasetFinalizer) {
 		t.Errorf("finalizer not set")
 	}
-	if got.Status.Phase != storagev1alpha1.VolumePhaseReady {
+	if got.Status.Phase != storagev1alpha1.DatasetPhaseReady {
 		t.Errorf("phase = %q, want Ready", got.Status.Phase)
 	}
 	if got.Status.Path != "/mnt/tank/k8s/pvc-1" {
@@ -233,15 +233,15 @@ func TestZfsVolumeReconcile_CreatesDatasetAndSetsReady(t *testing.T) {
 	}
 }
 
-func TestZfsVolumeReconcile_ZvolUsesSize(t *testing.T) {
+func TestZfsDatasetReconcile_ZvolUsesSize(t *testing.T) {
 	scheme := newTestScheme(t)
 	size := resource.MustParse("10Gi")
-	vol := &storagev1alpha1.ZfsVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-blk", Finalizers: []string{zfsVolumeFinalizer}},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-blk", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-blk",
-			Type:     storagev1alpha1.VolumeTypeVolume,
+			Type:     storagev1alpha1.DatasetTypeVolume,
 			Volume:   &storagev1alpha1.VolumeConfig{Size: size, Volblocksize: "16k"},
 		},
 	}
@@ -249,11 +249,11 @@ func TestZfsVolumeReconcile_ZvolUsesSize(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(onlinePool(), vol).
-		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS()
-	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-blk"}}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestZfsVolumeReconcile_ZvolUsesSize(t *testing.T) {
 		t.Errorf("volblocksize not passed: %v", z.lastZvProps)
 	}
 
-	var got storagev1alpha1.ZfsVolume
+	var got storagev1alpha1.ZfsDataset
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-blk"}, &got); err != nil {
 		t.Fatalf("get volume: %v", err)
 	}
@@ -274,15 +274,15 @@ func TestZfsVolumeReconcile_ZvolUsesSize(t *testing.T) {
 	}
 }
 
-func TestZfsVolumeReconcile_ExpandsFilesystemQuota(t *testing.T) {
+func TestZfsDatasetReconcile_ExpandsFilesystemQuota(t *testing.T) {
 	scheme := newTestScheme(t)
 	small := resource.MustParse("1Gi")
-	vol := &storagev1alpha1.ZfsVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-fs", Finalizers: []string{zfsVolumeFinalizer}},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-fs", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID:   "999",
 			Dataset:    "k8s/pvc-fs",
-			Type:       storagev1alpha1.VolumeTypeFilesystem,
+			Type:       storagev1alpha1.DatasetTypeFilesystem,
 			Filesystem: &storagev1alpha1.FilesystemConfig{Quota: &small},
 		},
 	}
@@ -290,18 +290,18 @@ func TestZfsVolumeReconcile_ExpandsFilesystemQuota(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(onlinePool(), vol).
-		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS()
-	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-fs"}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("reconcile create: %v", err)
 	}
 
 	// Grow the quota and reconcile: the agent must apply refquota via SetProperty.
-	var cur storagev1alpha1.ZfsVolume
+	var cur storagev1alpha1.ZfsDataset
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-fs"}, &cur); err != nil {
 		t.Fatalf("get volume: %v", err)
 	}
@@ -320,15 +320,15 @@ func TestZfsVolumeReconcile_ExpandsFilesystemQuota(t *testing.T) {
 	}
 }
 
-func TestZfsVolumeReconcile_GrowsZvolVolsize(t *testing.T) {
+func TestZfsDatasetReconcile_GrowsZvolVolsize(t *testing.T) {
 	scheme := newTestScheme(t)
 	small := resource.MustParse("1Gi")
-	vol := &storagev1alpha1.ZfsVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-blk", Finalizers: []string{zfsVolumeFinalizer}},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-blk", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-blk",
-			Type:     storagev1alpha1.VolumeTypeVolume,
+			Type:     storagev1alpha1.DatasetTypeVolume,
 			Volume:   &storagev1alpha1.VolumeConfig{Size: small, Volblocksize: "16k"},
 		},
 	}
@@ -336,17 +336,17 @@ func TestZfsVolumeReconcile_GrowsZvolVolsize(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(onlinePool(), vol).
-		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS()
-	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-blk"}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("reconcile create: %v", err)
 	}
 
-	var cur storagev1alpha1.ZfsVolume
+	var cur storagev1alpha1.ZfsDataset
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-blk"}, &cur); err != nil {
 		t.Fatalf("get volume: %v", err)
 	}
@@ -374,25 +374,25 @@ func containsString(list []string, want string) bool {
 	return false
 }
 
-func TestZfsVolumeReconcile_IdempotentWhenExists(t *testing.T) {
+func TestZfsDatasetReconcile_IdempotentWhenExists(t *testing.T) {
 	scheme := newTestScheme(t)
-	vol := &storagev1alpha1.ZfsVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsVolumeFinalizer}},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-1",
-			Type:     storagev1alpha1.VolumeTypeFilesystem,
+			Type:     storagev1alpha1.DatasetTypeFilesystem,
 		},
 	}
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(onlinePool(), vol).
-		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS("tank/k8s/pvc-1")
-	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -400,35 +400,35 @@ func TestZfsVolumeReconcile_IdempotentWhenExists(t *testing.T) {
 	if len(z.createdDS) != 0 {
 		t.Fatalf("expected no create when dataset already exists, got %v", z.createdDS)
 	}
-	var got storagev1alpha1.ZfsVolume
+	var got storagev1alpha1.ZfsDataset
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &got); err != nil {
 		t.Fatalf("get volume: %v", err)
 	}
-	if got.Status.Phase != storagev1alpha1.VolumePhaseReady {
+	if got.Status.Phase != storagev1alpha1.DatasetPhaseReady {
 		t.Errorf("phase = %q, want Ready", got.Status.Phase)
 	}
 }
 
-func TestZfsVolumeReconcile_IgnoresVolumeOnOtherNode(t *testing.T) {
+func TestZfsDatasetReconcile_IgnoresVolumeOnOtherNode(t *testing.T) {
 	scheme := newTestScheme(t)
-	vol := &storagev1alpha1.ZfsVolume{
+	vol := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-1",
-			Type:     storagev1alpha1.VolumeTypeFilesystem,
+			Type:     storagev1alpha1.DatasetTypeFilesystem,
 		},
 	}
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(onlinePool(), vol).
-		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS()
 	// This agent runs on node-b, but the pool is hosted on node-a.
-	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-b", ZFS: z}
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-b", ZFS: z}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -436,11 +436,11 @@ func TestZfsVolumeReconcile_IgnoresVolumeOnOtherNode(t *testing.T) {
 	if len(z.createdDS) != 0 {
 		t.Fatalf("expected no create on non-hosting node, got %v", z.createdDS)
 	}
-	var got storagev1alpha1.ZfsVolume
+	var got storagev1alpha1.ZfsDataset
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &got); err != nil {
 		t.Fatalf("get volume: %v", err)
 	}
-	if controllerutil.ContainsFinalizer(&got, zfsVolumeFinalizer) {
+	if controllerutil.ContainsFinalizer(&got, zfsDatasetFinalizer) {
 		t.Errorf("non-hosting node should not add finalizer")
 	}
 	if got.Status.Phase != "" {
@@ -448,30 +448,30 @@ func TestZfsVolumeReconcile_IgnoresVolumeOnOtherNode(t *testing.T) {
 	}
 }
 
-func TestZfsVolumeReconcile_DeleteDestroysAndReleases(t *testing.T) {
+func TestZfsDatasetReconcile_DeleteDestroysAndReleases(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
-	vol := &storagev1alpha1.ZfsVolume{
+	vol := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "pvc-1",
-			Finalizers:        []string{zfsVolumeFinalizer},
+			Finalizers:        []string{zfsDatasetFinalizer},
 			DeletionTimestamp: &now,
 		},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-1",
-			Type:     storagev1alpha1.VolumeTypeFilesystem,
+			Type:     storagev1alpha1.DatasetTypeFilesystem,
 		},
 	}
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(onlinePool(), vol).
-		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS("tank/k8s/pvc-1")
-	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestZfsVolumeReconcile_DeleteDestroysAndReleases(t *testing.T) {
 		t.Fatalf("expected destroy of tank/k8s/pvc-1, got %v", z.destroyed)
 	}
 
-	var got storagev1alpha1.ZfsVolume
+	var got storagev1alpha1.ZfsDataset
 	err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &got)
 	if err == nil {
 		t.Fatalf("expected volume to be removed after finalizer release")

@@ -185,9 +185,9 @@ csiController:
   # -- Directory shared (emptyDir) between the plugin and the provisioner sidecar
   # -- for the CSI unix socket.
   socketDir: /csi
-  # -- How long CreateVolume waits for the ZfsVolume to become Ready.
+  # -- How long CreateVolume waits for the ZfsDataset to become Ready.
   createTimeout: 2m
-  # -- How often CreateVolume re-reads the ZfsVolume while waiting.
+  # -- How often CreateVolume re-reads the ZfsDataset while waiting.
   pollInterval: 2s
   # -- PVC annotation prefix whose keys override parameters (empty disables the
   # -- PVC inheritance layer).

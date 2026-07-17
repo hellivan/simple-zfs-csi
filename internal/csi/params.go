@@ -1,6 +1,6 @@
 // Package csi implements the simple-zfs-csi CSI controller plugin: a thin,
 // unprivileged gRPC adapter that translates CSI CreateVolume/DeleteVolume calls
-// into the ZFS-centric CRDs (ZfsVolume + ZfsShare) and returns a routing-only
+// into the ZFS-centric CRDs (ZfsDataset + ZfsShare) and returns a routing-only
 // volume_context. It contains no reconcile loops; the agent and operator do the
 // actual work.
 package csi
@@ -53,11 +53,11 @@ var storageClassOnlyParams = map[string]struct{}{
 }
 
 // ResolvedParams is the parsed, validated result of the parameter inheritance
-// chain: everything needed to render a ZfsVolume + ZfsShare.
+// chain: everything needed to render a ZfsDataset + ZfsShare.
 type ResolvedParams struct {
 	PoolGUID           string
 	Protocol           storagev1alpha1.Protocol
-	VolumeType         storagev1alpha1.VolumeType
+	DatasetType        storagev1alpha1.DatasetType
 	DatasetPrefix      string
 	Volblocksize       string
 	NFSClients         []storagev1alpha1.NFSClient
@@ -117,10 +117,10 @@ func ParseParams(p map[string]string) (*ResolvedParams, error) {
 	switch storagev1alpha1.Protocol(strings.TrimSpace(p[ParamProtocol])) {
 	case storagev1alpha1.ProtocolNFS:
 		rp.Protocol = storagev1alpha1.ProtocolNFS
-		rp.VolumeType = storagev1alpha1.VolumeTypeFilesystem
+		rp.DatasetType = storagev1alpha1.DatasetTypeFilesystem
 	case storagev1alpha1.ProtocolNVMeoF:
 		rp.Protocol = storagev1alpha1.ProtocolNVMeoF
-		rp.VolumeType = storagev1alpha1.VolumeTypeVolume
+		rp.DatasetType = storagev1alpha1.DatasetTypeVolume
 	case "":
 		return nil, fmt.Errorf("parameter %q is required", ParamProtocol)
 	default:

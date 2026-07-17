@@ -1,7 +1,7 @@
 # API & CRD Conventions
 
 Conventions for the `storage.simple-zfs-csi.io` CRD types. These are the rules we
-settled on while shaping `ZfsVolume`, `ZfsShare` and `NetworkExport`; follow them
+settled on while shaping `ZfsDataset`, `ZfsShare` and `NetworkExport`; follow them
 for any new type or field.
 
 ## 1. Type-discriminated specs use a nested discriminated union
@@ -14,8 +14,8 @@ top-level fields.
 **Avoid** (flat optionals — unclear which field applies to which type):
 
 ```go
-type ZfsVolumeSpec struct {
-    Type         VolumeType         `json:"type"`
+type ZfsDatasetSpec struct {
+    Type         DatasetType         `json:"type"`
     Quota        *resource.Quantity `json:"quota,omitempty"`         // only type=filesystem
     Size         *resource.Quantity `json:"size,omitempty"`          // only type=volume
     Volblocksize string             `json:"volblocksize,omitempty"`  // only type=volume
@@ -25,8 +25,8 @@ type ZfsVolumeSpec struct {
 **Prefer** (nested arms — each block is self-evidently scoped to one type):
 
 ```go
-type ZfsVolumeSpec struct {
-    Type       VolumeType        `json:"type"`
+type ZfsDatasetSpec struct {
+    Type       DatasetType        `json:"type"`
     Filesystem *FilesystemConfig `json:"filesystem,omitempty"` // honoured iff type=filesystem
     Volume     *VolumeConfig     `json:"volume,omitempty"`     // honoured iff type=volume
 }
@@ -56,7 +56,7 @@ Ingress backends). The arms are necessarily optional pointers gated by CEL — y
 cannot make an arm structurally required when only one applies at a time.
 
 `NetworkExport` and `ZfsShare` already follow this via their `nfs` / `nvmeof`
-arms under the `protocol` discriminator; `ZfsVolume` was migrated to match.
+arms under the `protocol` discriminator; `ZfsDataset` was migrated to match.
 
 ## 2. Shared identity stays OUTSIDE the union
 
@@ -98,7 +98,7 @@ dataset (generic ZFS object)
 Consequences for our API:
 
 - **`dataset` is the correct name for the shared path field** in both
-  `ZfsVolume` and `ZfsShare` — a zvol *is* a dataset, so it is accurate for the
+  `ZfsDataset` and `ZfsShare` — a zvol *is* a dataset, so it is accurate for the
   NVMe-oF/zvol case too, not just filesystems.
 - **The `type` discriminator uses ZFS's real type names**: `filesystem` and
   `volume` (not the earlier `dataset`/`zvol`, where `dataset` was imprecise since
@@ -108,7 +108,7 @@ Consequences for our API:
 ## 4. Naming consistency across sibling CRDs
 
 The same concept must use the same field name across related types. The logical
-ZFS object path is `spec.dataset` in **both** `ZfsVolume` and `ZfsShare`. When a
+ZFS object path is `spec.dataset` in **both** `ZfsDataset` and `ZfsShare`. When a
 nested arm would collide with a shared field name, rename the *arm/discriminator*
 (per §3), not the shared field — keep the shared field's name stable across the
 family.
@@ -117,6 +117,6 @@ family.
 
 | CRD | Discriminator | Arms (only the matching one is honoured) | Shared identity fields |
 |-----|---------------|------------------------------------------|------------------------|
-| `ZfsVolume` | `type: filesystem\|volume` | `filesystem{quota}` / `volume{size, volblocksize}` | `poolGUID`, `dataset`, `properties` |
+| `ZfsDataset` | `type: filesystem\|volume` | `filesystem{quota}` / `volume{size, volblocksize}` | `poolGUID`, `dataset`, `properties` |
 | `ZfsShare` | `protocol: nfs\|nvmeof` | `nfs{clients}` / `nvmeof{nqn, allowedHosts}` | `poolGUID`, `dataset` |
 | `NetworkExport` | `protocol: nfs\|nvmeof` | `nfs{clients}` / `nvmeof{nqn, allowedHosts}` | `nodeName`, `path` |

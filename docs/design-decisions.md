@@ -8,6 +8,151 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0007 — Project identity: renamed to `simple-zfs-csi`
+
+**Status:** Accepted (2026-07-17) · **Scope:** module path, API group, CSI driver name, PVC annotation prefix, Helm chart, image names
+
+### Context
+
+The project began as `zfs-shares`, a name that described only the original plane
+(network-sharing pre-provisioned ZFS over NFS/NVMe-oF via the `NetworkExport`
+CRD). It has since grown a full CSI plane (dynamic provisioning, expansion, and
+soon snapshots/clone). "zfs-shares" no longer describes what it is — a
+self-contained **CSI driver** for ZFS — and the "simple" qualifier positions it
+against the heavier alternatives it replaces (democratic-csi + TrueNAS, Ceph).
+
+### Decisions
+
+1. **Rename the project to `simple-zfs-csi`,** sweeping every name domain uniformly
+   (`zfs-shares` → `simple-zfs-csi`):
+   - Go module: `github.com/hellivan/simple-zfs-csi`
+   - API group: `storage.simple-zfs-csi.io` (all four CRDs, finalizers,
+     `LeaderElectionID`)
+   - CSI driver name: `simple-zfs-csi.io` (`CSIDriver` object + StorageClass
+     `provisioner` + `--driver-name` default)
+   - PVC annotation prefix: `param.simple-zfs-csi.io/`
+   - Helm chart: `charts/simple-zfs-csi`
+   - Container images: `simple-zfs-csi-<component>`.
+
+2. **Collapse the two CSI image names.** A uniform `<prefix>-<component>` scheme
+   would yield `simple-zfs-csi-csi-controller` / `simple-zfs-csi-csi-node` (double
+   `csi`), so those two use `simple-zfs-csi-controller` / `simple-zfs-csi-node`
+   (the Helm image helper takes an explicit `suffix` of `controller`/`node`). The
+   `cmd/` dirs and `build/*.Dockerfile` names stay `csi-controller`/`csi-node`
+   (unambiguous internally).
+
+### Consequences
+
+- Breaking: the CRD API group and CSI driver name change, so this is not
+  upgrade-compatible with any `zfs-shares` install — acceptable pre-1.0 (no
+  production deployments).
+- The on-disk repository directory is intentionally **not** renamed here (left to
+  the maintainer to avoid breaking the active workspace path); it has no code
+  impact.
+- CRD manifests were regenerated (`make manifests`) so the group rename is
+  authoritative in the generated YAML, not just hand-edited.
+
+---
+
+## ADR-0006 — CRD taxonomy: `ZfsDataset` (fs+zvol) vs a separate `ZfsSnapshot`
+
+**Status:** Accepted (2026-07-17) · **Scope:** API types, CSI controller, agent
+
+### Context
+
+The allocation CRD was originally named `ZfsVolume` with `type: filesystem|volume`.
+That overloads "volume": in CSI it means any PV, but in ZFS it means specifically
+a *zvol*, so `ZfsVolume{type: volume}` reads as "a ZFS volume of type volume." It
+also made the upcoming snapshot object look arbitrary — why does one CRD unify
+filesystem+volume while a snapshot is a different CRD?
+
+### Decisions
+
+1. **Rename `ZfsVolume` → `ZfsDataset`** with `type: filesystem | volume`. "Dataset"
+   is ZFS's own umbrella term ([api-conventions.md](api-conventions.md) §3), and it
+   makes `type: volume` unambiguously a zvol. `shortName` changes `zvol` → `zds`.
+
+2. **Group CRDs by lifecycle, not by ZFS taxonomy.** Taxonomically a snapshot *is*
+   a kind of dataset, but `filesystem` and `volume` share one lifecycle (allocate →
+   size/quota → share → expand → destroy), while a snapshot has a different one
+   (derive-from-source → read-only → restore/clone, never shared/published). So the
+   live allocation is `ZfsDataset`; a snapshot is a separate `ZfsSnapshot` (Step 9).
+
+3. **The consumer model mirrors the `zfs` verbs:** `zfs create` a **dataset** →
+   `zfs snapshot` it → `zfs clone` a snapshot into a new **dataset**. A snapshot
+   never carries a filesystem/volume arm, an export, or an expand path, so folding
+   it into `ZfsDataset` would mean an inert third `type` and `if type==snapshot`
+   guards in every consumer — a separate CRD keeps each type's invariants clean.
+
+### Consequences
+
+- Breaking API rename (type, CRD `zfsdatasets`, finalizer
+  `storage.simple-zfs-csi.io/zfsdataset`, CSI code, tests) — acceptable pre-1.0.
+- `ZfsPool` stays as-is: Kubernetes names observed-infrastructure objects with
+  plain nouns (`Node`, `CSINode`, `CSIStorageCapacity`); its empty spec already
+  signals "discovered, not authored," so no rename is warranted.
+
+---
+
+## ADR-0005 — Access control and the CSI attach stage (direction)
+
+**Status:** Accepted direction (2026-07-17), not yet implemented · **Scope:** CSIDriver, csi-controller, csi-node, `NetworkExport`
+
+### Context
+
+Today every share is effectively **public**: an NFS `NetworkExport` is exported
+to the whole reachable network, and an NVMe-oF subsystem accepts any host NQN.
+That is acceptable for the initial single-tenant bring-up but is **not** the end
+state — we do not want any pod on any node able to mount any volume.
+
+The driver currently sets `attachRequired: false` (ADR-0001/0003): there is no
+controller-mediated attach step, because the node plugin does all reachability
+work itself (`mount -t nfs` for NFS, `nvme connect` for NVMe-oF) and node-death
+fencing comes from `ZfsPool.status.health == NODE_OFFLINE`, not from
+`VolumeAttachment`. Ceph-RBD sets `attachRequired: true` for a genuine
+map/lock/fence reason; our reason to (eventually) enable it is different but
+compatible: **per-node access programming**.
+
+The CSI attach stage — `ControllerPublishVolume(volume_id, node_id)` /
+`ControllerUnpublishVolume`, tracked by `VolumeAttachment` objects and driven by
+the `external-attacher` sidecar — is *controller-issued and node-parameterized*.
+That is exactly the shape of "grant this specific node access to this volume,"
+which is what access restriction needs.
+
+### Decisions
+
+1. **Keep `attachRequired: false` now.** No `ControllerPublishVolume`, no
+   attacher, no `VolumeAttachment`. Simplicity while shares are trusted.
+
+2. **NVMe-oF host allow-listing will move to the attach stage.** When we restrict
+   NVMe-oF to specific consumers, we flip `attachRequired: true` and implement
+   `ControllerPublishVolume` to add the consumer node's host NQN to the target
+   subsystem's `allowed_hosts` (and `ControllerUnpublishVolume` to remove it),
+   gated *before* `NodePublish`. This is the idiomatic CSI location for
+   node-scoped access and gives us serialization + clean revoke for free.
+
+3. **NFS allowed-clients live in the `NetworkExport` contract.** `NetworkExport`
+   gains an allowed-clients field (NFS: CIDRs/IPs rendered into `/etc/exports`;
+   NVMe-oF: host NQNs). Two ways to populate it, from coarse to fine:
+   (a) **static policy** — allow the cluster node/pod CIDR, sourced from
+   StorageClass/PVC params (simple, ship first); (b) **attach-driven** — the
+   attach stage adds the specific consumer node's IP/NQN per publish (tightest,
+   layered later). The executor (`nfs`/`nvmeof` controllers) stays generic; it
+   only renders whatever allow-list the contract carries.
+
+### Consequences
+
+- Current simplicity is retained; access control is purely additive.
+- Enabling attach later requires the `external-attacher` sidecar,
+  `VolumeAttachment` RBAC, and `ControllerPublish/Unpublish` implementations —
+  none of which exist today.
+- `NetworkExport` grows an `allowedClients` field; it remains a ZFS-agnostic,
+  node-local executor contract (an admin can still author one directly).
+- Fencing semantics are unchanged: `NODE_OFFLINE` remains the availability gate;
+  the attach stage would add an *authorization* gate, not replace fencing.
+
+---
+
 ## ADR-0004 — Volume expansion: spec-driven size convergence, online grow
 
 **Status:** Accepted (2026-07-17) · **Scope:** CSI controller + node, agent reconciler, Helm chart
@@ -17,14 +162,14 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 democratic-csi-class parity starts with online volume expansion. A PVC edit that
 requests more capacity flows through `external-resizer` →
 `ControllerExpandVolume` → (for block) `NodeExpandVolume`. The backing size lives
-in the `ZfsVolume` spec (`filesystem.quota` → ZFS `refquota`, `volume.size` → ZFS
+in the `ZfsDataset` spec (`filesystem.quota` → ZFS `refquota`, `volume.size` → ZFS
 `volsize`), which the per-node agent already owns. Expansion should reuse that
 ownership rather than have the CSI plane touch ZFS directly.
 
 ### Decisions
 
 1. **Expansion is spec convergence, not a special path.** `ControllerExpandVolume`
-   only bumps the `ZfsVolume` spec size (retrying on conflict with the agent's
+   only bumps the `ZfsDataset` spec size (retrying on conflict with the agent's
    status writes) and waits for the agent to observe it
    (`status.observedGeneration >= target`). The agent's reconciler gained an
    `ensureSize` step that runs on every reconcile: filesystem → `zfs set refquota`
@@ -53,7 +198,7 @@ ownership rather than have the CSI plane touch ZFS directly.
 
 ### Consequences
 
-- No new CRD; expansion rides the existing `ZfsVolume` ownership boundary — the
+- No new CRD; expansion rides the existing `ZfsDataset` ownership boundary — the
   CSI plane stays a thin CRD adapter and only the agent runs ZFS.
 - Shrinking is intentionally unsupported for zvols (and Kubernetes forbids PVC
   shrink anyway); filesystem `refquota` can still be lowered by editing the spec.
@@ -189,7 +334,7 @@ or, worse, from a PVC annotation, then:
 
 The CSI controller is a thin, unprivileged gRPC adapter driven by
 `external-provisioner`. It must turn a PVC into the ZFS-centric CRDs
-(`ZfsVolume` + `ZfsShare`) and never returns an absolute path — only a
+(`ZfsDataset` + `ZfsShare`) and never returns an absolute path — only a
 `volume_context`. Several forks needed pinning before implementation.
 
 ### Decisions
@@ -204,9 +349,9 @@ free-space picking and no CSI topology awareness in this step.
   model already in place. Scheduling across a pool set can be layered later
   without changing the CRD contract.
 
-#### 2. `CreateVolume` creates **both** `ZfsVolume` and `ZfsShare` (provision-time share)
+#### 2. `CreateVolume` creates **both** `ZfsDataset` and `ZfsShare` (provision-time share)
 
-`CreateVolume` writes the `ZfsVolume`, waits for it to reach `Ready`, writes the
+`CreateVolume` writes the `ZfsDataset`, waits for it to reach `Ready`, writes the
 `ZfsShare`, and returns `volume_context = { poolGUID, dataset, protocol }`.
 
 - CSI does **not** require creating an export in `CreateVolume`; its only hard
@@ -257,20 +402,20 @@ from some layer). `poolGUID` and `datasetPrefix` are **StorageClass-only** — s
 
 | Key | Applies to | Notes |
 |-----|-----------|-------|
-| `poolGUID` | ZfsVolume/ZfsShare | required; **StorageClass-only**; fixed per StorageClass |
+| `poolGUID` | ZfsDataset/ZfsShare | required; **StorageClass-only**; fixed per StorageClass |
 | `protocol` | both | `nfs`\|`nvmeof` → derives ZFS `type` |
-| `datasetPrefix` | ZfsVolume | **StorageClass-only**; final `dataset = <prefix>/<pv-name>` |
+| `datasetPrefix` | ZfsDataset | **StorageClass-only**; final `dataset = <prefix>/<pv-name>` |
 | `volblocksize` | zvol only | |
 | `nfsClients` | ZfsShare | comma list, e.g. `10.0.0.0/8:rw` |
 | `nvmeofAllowedHosts` | ZfsShare | comma list of host NQNs (empty = allow-all) |
-| `property.<zfsprop>` | ZfsVolume | pass-through to `spec.properties` |
+| `property.<zfsprop>` | ZfsDataset | pass-through to `spec.properties` |
 
 Capacity: `CreateVolumeRequest.capacity_range` maps to the zvol `spec.volume.size`
 and to the filesystem `spec.filesystem.quota`.
 
 #### 5. `DeleteVolume`
 
-Deletes the `ZfsShare` and `ZfsVolume` CRDs; finalizers on the agent/operator
+Deletes the `ZfsShare` and `ZfsDataset` CRDs; finalizers on the agent/operator
 drive the actual teardown (`zfs destroy`, export removal). The controller does no
 direct ZFS or export work.
 
@@ -280,4 +425,4 @@ direct ZFS or export work.
   never writes CRDs and never learns an absolute path from the controller.
 - `ControllerExpandVolume` and snapshots remain optional, layered later.
 - The controller stays a replaceable adapter: all reconciliation lives in the
-  agent (`ZfsVolume`) and operator (`ZfsShare → NetworkExport`).
+  agent (`ZfsDataset`) and operator (`ZfsShare → NetworkExport`).

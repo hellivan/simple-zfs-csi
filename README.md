@@ -12,20 +12,20 @@ node-pinned *exports*, and per-node aggregators execute those exports.
 
 | Component | Image | Kind | Reconciles | Mechanism |
 |-----------|-------|------|------------|-----------|
-| `csi-controller` | `simple-zfs-csi-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` | thin gRPC adapter: writes `ZfsVolume` (+ `ZfsShare`), returns a routing-only volume context |
-| `csi-node` | `simple-zfs-csi-csi-node` | DaemonSet (all nodes) | CSI `NodePublishVolume` | resolves `ZfsPool.status`, `mount -t nfs` / `nvme connect`; refuses `NODE_OFFLINE` |
-| `zpool-discovery` (agent) | `simple-zfs-csi-discovery` | DaemonSet (storage nodes) | local pools (Tier 1) + `ZfsVolume` | polls `zpool`/`zfs` into `ZfsPool`; `zfs create/destroy` for datasets/zvols |
+| `csi-controller` | `simple-zfs-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` | thin gRPC adapter: writes `ZfsDataset` (+ `ZfsShare`), returns a routing-only volume context |
+| `csi-node` | `simple-zfs-csi-node` | DaemonSet (all nodes) | CSI `NodePublishVolume` | resolves `ZfsPool.status`, `mount -t nfs` / `nvme connect`; refuses `NODE_OFFLINE` |
+| `zpool-discovery` (agent) | `simple-zfs-csi-discovery` | DaemonSet (storage nodes) | local pools (Tier 1) + `ZfsDataset` | polls `zpool`/`zfs` into `ZfsPool`; `zfs create/destroy` for datasets/zvols |
 | `operator` | `simple-zfs-csi-operator` | Deployment (x1, leader-elected) | `Node` (Tier 2) + `ZfsShare` | forces dead nodes' `ZfsPool` to `NODE_OFFLINE`; compiles `ZfsShare` → `NetworkExport` |
 | `nfs-controller` | `simple-zfs-csi-nfs` | DaemonSet (storage nodes) | `protocol: nfs` `NetworkExport` | writes `/etc/exports`, runs `exportfs -ra`, supervises the NFS server |
 | `nvmeof-controller` | `simple-zfs-csi-nvmeof` | DaemonSet (storage nodes) | `protocol: nvmeof` `NetworkExport` | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
 
-The four CRDs form a compile-down chain — a PVC turns into a `ZfsVolume` +
+The four CRDs form a compile-down chain — a PVC turns into a `ZfsDataset` +
 `ZfsShare`, and the `ZfsShare` renders a `NetworkExport`:
 
 | CRD | Scope | Keyed on | Written by | Purpose |
 |-----|-------|----------|------------|---------|
 | `ZfsPool` | Cluster | pool GUID (`metadata.name`) | discovery + operator | routing + health of a physical pool |
-| `ZfsVolume` | Cluster | `spec.poolGUID` | csi-controller (creates), agent (reconciles) | dataset/zvol allocation intent |
+| `ZfsDataset` | Cluster | `spec.poolGUID` | csi-controller (creates), agent (reconciles) | dataset/zvol allocation intent |
 | `ZfsShare` | Cluster | `spec.poolGUID` + `spec.dataset` | csi-controller (creates), operator (reconciles) | ZFS-centric "intent to share"; renders a `NetworkExport` |
 | `NetworkExport` | Cluster | `spec.nodeName` + `spec.path` | operator (owns) or admin (standalone) | generic, ZFS-agnostic node-local export executor contract |
 
@@ -39,7 +39,7 @@ it can still be authored by hand for non-ZFS paths.
 ### Provisioning flow (PVC → mounted pod)
 
 ```
-kubelet ──► csi-controller ──► ZfsVolume  ──► agent: zfs create dataset/zvol
+kubelet ──► csi-controller ──► ZfsDataset  ──► agent: zfs create dataset/zvol
 (CreateVolume)   (writes CRDs)  └► ZfsShare ──► operator ──► NetworkExport
                                                                    │
                                               ┌────────────────────┴───────────┐
@@ -52,7 +52,7 @@ kubelet ──► csi-node (NodePublishVolume) ──► reads ZfsPool.status (c
 ```
 
 The CSI plane is deliberately **thin**: `csi-controller` performs no ZFS work —
-it only records intent as `ZfsVolume` + `ZfsShare` and returns a routing-only
+it only records intent as `ZfsDataset` + `ZfsShare` and returns a routing-only
 volume context (`poolGUID`, `dataset`, `protocol`). All ZFS allocation happens in
 the per-node agent; all export execution happens in the `NetworkExport`
 aggregators; `csi-node` only resolves the live `ZfsPool.status` and mounts.
@@ -271,7 +271,7 @@ make helm-template  # render the chart
 The chart and all images are published to GHCR by the release pipeline:
 
 - `oci://ghcr.io/hellivan/charts/simple-zfs-csi` (chart)
-- `ghcr.io/hellivan/simple-zfs-csi-{csi-controller,csi-node,discovery,operator,nfs,nvmeof}` (images)
+- `ghcr.io/hellivan/simple-zfs-csi-{controller,node,discovery,operator,nfs,nvmeof}` (images)
 
 ```sh
 # Label your storage node(s) first:
@@ -310,7 +310,7 @@ Common values (see [charts/simple-zfs-csi/values.yaml](charts/simple-zfs-csi/val
 
 ### CRD management & upgrades
 
-The four CRDs (`ZfsPool`, `ZfsVolume`, `ZfsShare`, `NetworkExport`) are generated
+The four CRDs (`ZfsPool`, `ZfsDataset`, `ZfsShare`, `NetworkExport`) are generated
 from the Go types (`make manifests`) and shipped in the chart's Helm-native
 [charts/simple-zfs-csi/crds](charts/simple-zfs-csi/crds) directory. Helm treats `crds/`
 specially:
@@ -379,15 +379,15 @@ version at package time, so `helm install --version 0.1.0` pulls the matching
 ## Repository layout
 
 ```
-api/v1alpha1/            CRD types (ZfsPool, ZfsVolume, ZfsShare, NetworkExport) + deepcopy
+api/v1alpha1/            CRD types (ZfsPool, ZfsDataset, ZfsShare, NetworkExport) + deepcopy
 cmd/csi-controller/      CSI controller (provisioner) entrypoint
 cmd/csi-node/            CSI node plugin entrypoint
 cmd/nfs-controller/      NFS export controller entrypoint
 cmd/nvmeof-controller/   NVMe-oF export controller entrypoint
 cmd/operator/            cluster operator (node health + ZfsShare) entrypoint
-cmd/zpool-discovery/     per-node agent (ZfsPool discovery + ZfsVolume) entrypoint
+cmd/zpool-discovery/     per-node agent (ZfsPool discovery + ZfsDataset) entrypoint
 internal/csi/            CSI identity/controller/node servers + params + mount backend
-internal/controller/     reconcilers (nfs, nvmeof, zfsshare, zfsvolume, discovery) + helpers
+internal/controller/     reconcilers (nfs, nvmeof, zfsshare, zfsdataset, discovery) + helpers
 internal/nfsserver/      /etc/exports rendering + NFS daemon supervisor
 internal/nvmet/          nvmet configfs backend
 internal/zpool/          zpool/zfs CLI wrappers + host-exec

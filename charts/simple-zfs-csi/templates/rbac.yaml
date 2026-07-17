@@ -65,13 +65,13 @@ rules:
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfspools/status"]
     verbs: ["get", "update", "patch"]
-  # ZfsVolume allocation: the agent creates/destroys datasets and zvols for
+  # ZfsDataset allocation: the agent creates/destroys datasets and zvols for
   # volumes whose pool is currently hosted on this node.
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsvolumes"]
+    resources: ["zfsdatasets"]
     verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsvolumes/status"]
+    resources: ["zfsdatasets/status"]
     verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -175,7 +175,7 @@ subjects:
 {{- end }}
 {{- if .Values.csiController.enabled }}
 ---
-# CSI controller: writes ZfsVolume/ZfsShare, reads PVCs; the co-located
+# CSI controller: writes ZfsDataset/ZfsShare, reads PVCs; the co-located
 # external-provisioner sidecar manages PVs/PVCs/StorageClasses/events.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -187,10 +187,10 @@ metadata:
 rules:
   # --- driver: ZFS-centric CRDs it authors ---
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsvolumes", "zfsshares"]
+    resources: ["zfsdatasets", "zfsshares"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsvolumes/status", "zfsshares/status"]
+    resources: ["zfsdatasets/status", "zfsshares/status"]
     verbs: ["get"]
   # --- driver: PVC annotations for the parameter inheritance layer ---
   - apiGroups: [""]

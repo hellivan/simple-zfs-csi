@@ -24,20 +24,20 @@ import (
 	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
-// zfsVolumeFinalizer guards a ZfsVolume so the agent hosting its pool can run
+// zfsDatasetFinalizer guards a ZfsDataset so the agent hosting its pool can run
 // `zfs destroy` before the object is removed. Unlike ZfsShare (whose child
 // NetworkExport is garbage-collected via owner references), destroying a dataset
 // is a real external side-effect that must complete before we release the object.
-const zfsVolumeFinalizer = "storage.simple-zfs-csi.io/zfsvolume"
+const zfsDatasetFinalizer = "storage.simple-zfs-csi.io/zfsdataset"
 
-// ZfsVolumeReconciler is the per-node agent that fulfils ZfsVolume allocations.
+// ZfsDatasetReconciler is the per-node agent that fulfils ZfsDataset allocations.
 // It runs inside the privileged storage DaemonSet (one manager per node, no
 // leader election) alongside pool discovery. Each agent reconciles every
-// ZfsVolume but only acts on those whose pool GUID is currently hosted by its
+// ZfsDataset but only acts on those whose pool GUID is currently hosted by its
 // own node (ZfsPool.status.currentNode == NodeName): it creates the dataset/zvol
 // idempotently, reports status.path + Ready, and on deletion runs `zfs destroy`
 // before removing the finalizer. Watching ZfsPool re-drives volumes on takeover.
-type ZfsVolumeReconciler struct {
+type ZfsDatasetReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
@@ -48,16 +48,16 @@ type ZfsVolumeReconciler struct {
 	ZFS zpool.ZFS
 }
 
-// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsvolumes,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsvolumes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools,verbs=get;list;watch
 
-// Reconcile creates or destroys the ZFS object backing a ZfsVolume, but only on
+// Reconcile creates or destroys the ZFS object backing a ZfsDataset, but only on
 // the node that currently hosts its pool.
-func (r *ZfsVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	var vol storagev1alpha1.ZfsVolume
+	var vol storagev1alpha1.ZfsDataset
 	if err := r.Get(ctx, req.NamespacedName, &vol); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -77,7 +77,7 @@ func (r *ZfsVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// finalizer. Other nodes ignore it; if the pool CRD is gone entirely there is
 	// nothing to destroy, so any agent may release the object.
 	if !vol.DeletionTimestamp.IsZero() {
-		if !controllerutil.ContainsFinalizer(&vol, zfsVolumeFinalizer) {
+		if !controllerutil.ContainsFinalizer(&vol, zfsDatasetFinalizer) {
 			return ctrl.Result{}, nil
 		}
 		switch {
@@ -105,8 +105,8 @@ func (r *ZfsVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	if !controllerutil.ContainsFinalizer(&vol, zfsVolumeFinalizer) {
-		controllerutil.AddFinalizer(&vol, zfsVolumeFinalizer)
+	if !controllerutil.ContainsFinalizer(&vol, zfsDatasetFinalizer) {
+		controllerutil.AddFinalizer(&vol, zfsDatasetFinalizer)
 		if err := r.Update(ctx, &vol); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -116,18 +116,18 @@ func (r *ZfsVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	full, err := datasetName(pool.Status.PoolName, vol.Spec.Dataset)
 	if err != nil {
-		return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.VolumePhaseError, "",
+		return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 			"InvalidDataset", err.Error())
 	}
 
 	// Idempotent create: only create when the object is absent.
 	if _, err := r.ZFS.Get(ctx, full, "type"); err != nil {
 		if !errors.Is(err, zpool.ErrNotExist) {
-			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.VolumePhaseError, "",
+			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 				"LookupFailed", err.Error())
 		}
 		if err := r.create(ctx, &vol, full); err != nil {
-			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.VolumePhaseError, "",
+			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 				"CreateFailed", err.Error())
 		}
 		logger.Info("created ZFS object", "dataset", full, "type", vol.Spec.Type)
@@ -137,33 +137,33 @@ func (r *ZfsVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// controller bumps spec.filesystem.quota / spec.volume.size; the agent applies
 	// it here on the next reconcile.
 	if err := r.ensureSize(ctx, &vol, full); err != nil {
-		return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.VolumePhaseError, "",
+		return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 			"ResizeFailed", err.Error())
 	}
 
 	volPath, err := deriveVolumePath(vol.Spec.Type, pool.Status.BaseMountPath, pool.Status.PoolName, vol.Spec.Dataset)
 	if err != nil {
-		return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.VolumePhaseError, "",
+		return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 			"PathDeriveFailed", err.Error())
 	}
 
-	return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.VolumePhaseReady, volPath,
+	return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseReady, volPath,
 		"Ready", fmt.Sprintf("provisioned %s on %s", full, r.NodeName))
 }
 
 // releaseFinalizer removes the agent finalizer, allowing the API server to
 // complete deletion.
-func (r *ZfsVolumeReconciler) releaseFinalizer(ctx context.Context, vol *storagev1alpha1.ZfsVolume) error {
-	controllerutil.RemoveFinalizer(vol, zfsVolumeFinalizer)
+func (r *ZfsDatasetReconciler) releaseFinalizer(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
+	controllerutil.RemoveFinalizer(vol, zfsDatasetFinalizer)
 	return r.Update(ctx, vol)
 }
 
 // create provisions the filesystem or volume described by the volume spec.
-func (r *ZfsVolumeReconciler) create(ctx context.Context, vol *storagev1alpha1.ZfsVolume, full string) error {
+func (r *ZfsDatasetReconciler) create(ctx context.Context, vol *storagev1alpha1.ZfsDataset, full string) error {
 	switch vol.Spec.Type {
-	case storagev1alpha1.VolumeTypeFilesystem:
+	case storagev1alpha1.DatasetTypeFilesystem:
 		return r.ZFS.CreateDataset(ctx, full, filesystemProps(vol))
-	case storagev1alpha1.VolumeTypeVolume:
+	case storagev1alpha1.DatasetTypeVolume:
 		if vol.Spec.Volume == nil {
 			return fmt.Errorf("spec.volume is required for volume")
 		}
@@ -176,9 +176,9 @@ func (r *ZfsVolumeReconciler) create(ctx context.Context, vol *storagev1alpha1.Z
 // ensureSize converges the on-disk size of an existing object toward the spec:
 // filesystem refquota (up or down) and zvol volsize (grow only, never shrink).
 // This is what makes volume expansion work end to end.
-func (r *ZfsVolumeReconciler) ensureSize(ctx context.Context, vol *storagev1alpha1.ZfsVolume, full string) error {
+func (r *ZfsDatasetReconciler) ensureSize(ctx context.Context, vol *storagev1alpha1.ZfsDataset, full string) error {
 	switch vol.Spec.Type {
-	case storagev1alpha1.VolumeTypeFilesystem:
+	case storagev1alpha1.DatasetTypeFilesystem:
 		desired := "none"
 		if cfg := vol.Spec.Filesystem; cfg != nil && cfg.Quota != nil && !cfg.Quota.IsZero() {
 			desired = strconv.FormatInt(cfg.Quota.Value(), 10)
@@ -191,7 +191,7 @@ func (r *ZfsVolumeReconciler) ensureSize(ctx context.Context, vol *storagev1alph
 			return r.ZFS.SetProperty(ctx, full, "refquota", desired)
 		}
 		return nil
-	case storagev1alpha1.VolumeTypeVolume:
+	case storagev1alpha1.DatasetTypeVolume:
 		if vol.Spec.Volume == nil {
 			return nil
 		}
@@ -262,7 +262,7 @@ func volblockBytes(s string) int64 {
 
 // filesystemProps renders the ZFS properties for a filesystem dataset: the user
 // properties, plus refquota derived from the filesystem quota when set.
-func filesystemProps(vol *storagev1alpha1.ZfsVolume) map[string]string {
+func filesystemProps(vol *storagev1alpha1.ZfsDataset) map[string]string {
 	props := copyProps(vol.Spec.Properties)
 	if cfg := vol.Spec.Filesystem; cfg != nil && cfg.Quota != nil && !cfg.Quota.IsZero() {
 		props["refquota"] = strconv.FormatInt(cfg.Quota.Value(), 10)
@@ -272,7 +272,7 @@ func filesystemProps(vol *storagev1alpha1.ZfsVolume) map[string]string {
 
 // volumeProps renders the ZFS properties for a volume/zvol: the user properties,
 // plus volblocksize when set.
-func volumeProps(vol *storagev1alpha1.ZfsVolume) map[string]string {
+func volumeProps(vol *storagev1alpha1.ZfsDataset) map[string]string {
 	props := copyProps(vol.Spec.Properties)
 	if cfg := vol.Spec.Volume; cfg != nil && cfg.Volblocksize != "" {
 		props["volblocksize"] = cfg.Volblocksize
@@ -306,18 +306,18 @@ func datasetName(poolName, dataset string) (string, error) {
 // deriveVolumePath computes the node-local path reported in status.path: a
 // dataset's mountpoint under the pool base mount path, or a zvol's device node
 // under /dev/zvol.
-func deriveVolumePath(volType storagev1alpha1.VolumeType, baseMountPath, poolName, dataset string) (string, error) {
+func deriveVolumePath(volType storagev1alpha1.DatasetType, baseMountPath, poolName, dataset string) (string, error) {
 	ds := strings.Trim(dataset, "/")
 	if ds == "" {
 		return "", fmt.Errorf("dataset is empty")
 	}
 	switch volType {
-	case storagev1alpha1.VolumeTypeFilesystem:
+	case storagev1alpha1.DatasetTypeFilesystem:
 		if baseMountPath == "" {
 			return "", fmt.Errorf("pool baseMountPath is unknown")
 		}
 		return path.Join(baseMountPath, ds), nil
-	case storagev1alpha1.VolumeTypeVolume:
+	case storagev1alpha1.DatasetTypeVolume:
 		if poolName == "" {
 			return "", fmt.Errorf("pool name is unknown")
 		}
@@ -328,7 +328,7 @@ func deriveVolumePath(volType storagev1alpha1.VolumeType, baseMountPath, poolNam
 }
 
 // setStatus patches the volume's status subresource.
-func (r *ZfsVolumeReconciler) setStatus(ctx context.Context, vol *storagev1alpha1.ZfsVolume, phase storagev1alpha1.ZfsVolumePhase, volPath, reason, message string) error {
+func (r *ZfsDatasetReconciler) setStatus(ctx context.Context, vol *storagev1alpha1.ZfsDataset, phase storagev1alpha1.ZfsDatasetPhase, volPath, reason, message string) error {
 	patched := vol.DeepCopy()
 	patched.Status.Phase = phase
 	patched.Status.Path = volPath
@@ -336,7 +336,7 @@ func (r *ZfsVolumeReconciler) setStatus(ctx context.Context, vol *storagev1alpha
 	patched.Status.Message = message
 
 	condStatus := metav1.ConditionTrue
-	if phase != storagev1alpha1.VolumePhaseReady {
+	if phase != storagev1alpha1.DatasetPhaseReady {
 		condStatus = metav1.ConditionFalse
 	}
 	meta.SetStatusCondition(&patched.Status.Conditions, metav1.Condition{
@@ -350,10 +350,10 @@ func (r *ZfsVolumeReconciler) setStatus(ctx context.Context, vol *storagev1alpha
 	return r.Status().Patch(ctx, patched, client.MergeFrom(vol))
 }
 
-// volumesForPool maps a ZfsPool event to reconcile requests for every ZfsVolume
+// volumesForPool maps a ZfsPool event to reconcile requests for every ZfsDataset
 // that references its GUID, so volumes are re-driven when a pool moves nodes or
 // changes health (e.g. this node takes over hosting).
-func (r *ZfsVolumeReconciler) volumesForPool(ctx context.Context, obj client.Object) []reconcile.Request {
+func (r *ZfsDatasetReconciler) volumesForPool(ctx context.Context, obj client.Object) []reconcile.Request {
 	pool, ok := obj.(*storagev1alpha1.ZfsPool)
 	if !ok {
 		return nil
@@ -363,7 +363,7 @@ func (r *ZfsVolumeReconciler) volumesForPool(ctx context.Context, obj client.Obj
 		guid = strings.TrimPrefix(pool.Name, "zpool-")
 	}
 
-	var volumes storagev1alpha1.ZfsVolumeList
+	var volumes storagev1alpha1.ZfsDatasetList
 	if err := r.List(ctx, &volumes); err != nil {
 		return nil
 	}
@@ -377,11 +377,11 @@ func (r *ZfsVolumeReconciler) volumesForPool(ctx context.Context, obj client.Obj
 }
 
 // SetupWithManager wires the reconciler into the manager.
-func (r *ZfsVolumeReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *ZfsDatasetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&storagev1alpha1.ZfsVolume{}).
+		For(&storagev1alpha1.ZfsDataset{}).
 		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.volumesForPool)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Named("zfsvolume").
+		Named("zfsdataset").
 		Complete(r)
 }

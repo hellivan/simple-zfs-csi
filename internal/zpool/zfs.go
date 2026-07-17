@@ -37,7 +37,7 @@ type Dataset struct {
 }
 
 // ZFS is the subset of ZFS operations the storage agent needs to fulfil
-// ZfsVolume allocations. It is an interface so the agent reconciler can be
+// ZfsDataset allocations. It is an interface so the agent reconciler can be
 // unit-tested against a fake, while the real implementation shells out to the
 // host `zfs` binary through the same HostExec redirection as pool discovery.
 type ZFS interface {

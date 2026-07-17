@@ -1,7 +1,7 @@
 // Command csi-controller is the simple-zfs-csi CSI controller plugin. It runs as an
 // unprivileged cluster-wide Deployment alongside the external-provisioner
 // sidecar and implements the CSI Identity + Controller services by writing the
-// ZFS-centric CRDs (ZfsVolume + ZfsShare). It hosts no reconcile loops: the node
+// ZFS-centric CRDs (ZfsDataset + ZfsShare). It hosts no reconcile loops: the node
 // agent creates the datasets and the operator renders the exports.
 package main
 
@@ -45,8 +45,8 @@ func main() {
 	flag.StringVar(&driverName, "driver-name", "simple-zfs-csi.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
 	flag.StringVar(&defaultsFile, "default-parameters-file", "", "Optional YAML file with provisioner default parameters (lowest precedence).")
 	flag.StringVar(&annotationPrefix, "pvc-annotation-prefix", "param.simple-zfs-csi.io/", "PVC annotation prefix whose keys override parameters (empty disables the PVC layer).")
-	flag.DurationVar(&createTimeout, "create-timeout", 2*time.Minute, "How long CreateVolume waits for a ZfsVolume to become Ready.")
-	flag.DurationVar(&pollInterval, "poll-interval", 2*time.Second, "How often CreateVolume re-reads a ZfsVolume while waiting for Ready.")
+	flag.DurationVar(&createTimeout, "create-timeout", 2*time.Minute, "How long CreateVolume waits for a ZfsDataset to become Ready.")
+	flag.DurationVar(&pollInterval, "poll-interval", 2*time.Second, "How often CreateVolume re-reads a ZfsDataset while waiting for Ready.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)

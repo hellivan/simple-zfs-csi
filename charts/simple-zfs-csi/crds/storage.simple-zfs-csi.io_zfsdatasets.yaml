@@ -4,16 +4,16 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: zfsvolumes.storage.simple-zfs-csi.io
+  name: zfsdatasets.storage.simple-zfs-csi.io
 spec:
   group: storage.simple-zfs-csi.io
   names:
-    kind: ZfsVolume
-    listKind: ZfsVolumeList
-    plural: zfsvolumes
+    kind: ZfsDataset
+    listKind: ZfsDatasetList
+    plural: zfsdatasets
     shortNames:
-    - zvol
-    singular: zfsvolume
+    - zds
+    singular: zfsdataset
   scope: Cluster
   versions:
   - additionalPrinterColumns:
@@ -39,7 +39,7 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          ZfsVolume is the Schema for the zfsvolumes API. It is a cluster-scoped
+          ZfsDataset is the Schema for the zfsdatasets API. It is a cluster-scoped
           "intent to allocate" a ZFS dataset or zvol on a specific pool (by GUID). The
           CSI controller creates it; the node agent currently hosting the pool creates
           the underlying ZFS object and reports the result in the status.
@@ -63,7 +63,7 @@ spec:
             type: object
           spec:
             description: |-
-              ZfsVolumeSpec is the desired allocation of a ZFS dataset on the pool identified
+              ZfsDatasetSpec is the desired allocation of a ZFS dataset on the pool identified
               by PoolGUID. It expresses storage intent only (create/size); the network
               export of the resulting path is a separate concern (ZfsShare -> NetworkExport).
               The agent on the node currently hosting the pool reconciles it.
@@ -151,7 +151,7 @@ spec:
             - message: spec.volume is only valid when type is volume
               rule: self.type != 'filesystem' || !has(self.volume)
           status:
-            description: ZfsVolumeStatus reports the observed allocation state on
+            description: ZfsDatasetStatus reports the observed allocation state on
               the node.
             properties:
               conditions:

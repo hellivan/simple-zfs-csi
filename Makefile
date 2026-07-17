@@ -6,8 +6,8 @@ NFS_IMG      ?= $(REGISTRY)/simple-zfs-csi-nfs:$(TAG)
 NVMEOF_IMG   ?= $(REGISTRY)/simple-zfs-csi-nvmeof:$(TAG)
 DISCOVERY_IMG ?= $(REGISTRY)/simple-zfs-csi-discovery:$(TAG)
 OPERATOR_IMG  ?= $(REGISTRY)/simple-zfs-csi-operator:$(TAG)
-CSI_CONTROLLER_IMG ?= $(REGISTRY)/simple-zfs-csi-csi-controller:$(TAG)
-CSI_NODE_IMG ?= $(REGISTRY)/simple-zfs-csi-csi-node:$(TAG)
+CSI_CONTROLLER_IMG ?= $(REGISTRY)/simple-zfs-csi-controller:$(TAG)
+CSI_NODE_IMG ?= $(REGISTRY)/simple-zfs-csi-node:$(TAG)
 
 CONTROLLER_GEN_VERSION ?= v0.16.5
 CHART_DIR ?= charts/simple-zfs-csi

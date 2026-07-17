@@ -27,7 +27,7 @@ const (
 )
 
 // ControllerServer implements the CSI Controller service by writing the ZFS
-// CRDs. CreateVolume writes a ZfsVolume, waits for it to become Ready, writes a
+// CRDs. CreateVolume writes a ZfsDataset, waits for it to become Ready, writes a
 // ZfsShare, and returns a routing-only volume_context. DeleteVolume deletes both
 // CRDs; finalizers on the agent/operator drive the actual teardown.
 type ControllerServer struct {
@@ -38,15 +38,15 @@ type ControllerServer struct {
 	// AnnotationPrefix selects which PVC annotations override parameters, e.g.
 	// "param.simple-zfs-csi.io/". Empty disables the PVC-annotation layer.
 	AnnotationPrefix string
-	// CreateTimeout bounds how long CreateVolume waits for the ZfsVolume to reach
+	// CreateTimeout bounds how long CreateVolume waits for the ZfsDataset to reach
 	// Ready before returning DeadlineExceeded (external-provisioner retries).
 	CreateTimeout time.Duration
-	// PollInterval is how often the readiness wait re-reads the ZfsVolume.
+	// PollInterval is how often the readiness wait re-reads the ZfsDataset.
 	PollInterval time.Duration
 	Log          logr.Logger
 }
 
-// CreateVolume provisions a ZfsVolume (+ ZfsShare) and returns the volume context.
+// CreateVolume provisions a ZfsDataset (+ ZfsShare) and returns the volume context.
 func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	name := req.GetName()
 	if name == "" {
@@ -72,7 +72,7 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	}
 
 	sizeBytes := capacityBytes(req.GetCapacityRange())
-	if rp.VolumeType == storagev1alpha1.VolumeTypeVolume && sizeBytes <= 0 {
+	if rp.DatasetType == storagev1alpha1.DatasetTypeVolume && sizeBytes <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "capacity is required for nvmeof (zvol) volumes")
 	}
 
@@ -104,7 +104,7 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	}, nil
 }
 
-// DeleteVolume removes the ZfsShare and ZfsVolume; finalizers drive teardown.
+// DeleteVolume removes the ZfsShare and ZfsDataset; finalizers drive teardown.
 func (c *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
 	id := req.GetVolumeId()
 	if id == "" {
@@ -115,9 +115,9 @@ func (c *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	if err := c.Client.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
 		return nil, status.Errorf(codes.Internal, "delete ZfsShare %q: %v", id, err)
 	}
-	vol := &storagev1alpha1.ZfsVolume{ObjectMeta: metav1.ObjectMeta{Name: id}}
+	vol := &storagev1alpha1.ZfsDataset{ObjectMeta: metav1.ObjectMeta{Name: id}}
 	if err := c.Client.Delete(ctx, vol); err != nil && !apierrors.IsNotFound(err) {
-		return nil, status.Errorf(codes.Internal, "delete ZfsVolume %q: %v", id, err)
+		return nil, status.Errorf(codes.Internal, "delete ZfsDataset %q: %v", id, err)
 	}
 
 	c.Log.Info("deprovisioned volume", "name", id)
@@ -134,7 +134,7 @@ func (c *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.C
 	}, nil
 }
 
-// ControllerExpandVolume grows a volume by bumping the backing ZfsVolume's size
+// ControllerExpandVolume grows a volume by bumping the backing ZfsDataset's size
 // (filesystem refquota or zvol volsize) and waiting for the agent to apply it.
 // For zvol (NVMe-oF) volumes the node must still grow the on-device filesystem,
 // so NodeExpansionRequired is set; NFS filesystem quotas take effect immediately.
@@ -148,19 +148,19 @@ func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		return nil, status.Error(codes.InvalidArgument, "capacity range is required")
 	}
 
-	vol := &storagev1alpha1.ZfsVolume{}
+	vol := &storagev1alpha1.ZfsDataset{}
 	if err := c.Client.Get(ctx, client.ObjectKey{Name: id}, vol); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, status.Errorf(codes.NotFound, "volume %q not found", id)
 		}
-		return nil, status.Errorf(codes.Internal, "get ZfsVolume %q: %v", id, err)
+		return nil, status.Errorf(codes.Internal, "get ZfsDataset %q: %v", id, err)
 	}
 
 	var nodeExpansionRequired bool
 	switch vol.Spec.Type {
-	case storagev1alpha1.VolumeTypeFilesystem:
+	case storagev1alpha1.DatasetTypeFilesystem:
 		// NFS quota grows live; no node-side work.
-	case storagev1alpha1.VolumeTypeVolume:
+	case storagev1alpha1.DatasetTypeVolume:
 		if vol.Spec.Volume == nil {
 			return nil, status.Errorf(codes.Internal, "volume %q has no size", id)
 		}
@@ -172,13 +172,13 @@ func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 	// Bump the backing size, retrying on conflict with the agent's status writes.
 	var targetGen int64
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		cur := &storagev1alpha1.ZfsVolume{}
+		cur := &storagev1alpha1.ZfsDataset{}
 		if err := c.Client.Get(ctx, client.ObjectKey{Name: id}, cur); err != nil {
 			return err
 		}
 		changed := false
 		switch cur.Spec.Type {
-		case storagev1alpha1.VolumeTypeFilesystem:
+		case storagev1alpha1.DatasetTypeFilesystem:
 			if cur.Spec.Filesystem == nil {
 				cur.Spec.Filesystem = &storagev1alpha1.FilesystemConfig{}
 			}
@@ -186,7 +186,7 @@ func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 				cur.Spec.Filesystem.Quota = resource.NewQuantity(required, resource.BinarySI)
 				changed = true
 			}
-		case storagev1alpha1.VolumeTypeVolume:
+		case storagev1alpha1.DatasetTypeVolume:
 			if cur.Spec.Volume != nil && cur.Spec.Volume.Size.Value() < required {
 				cur.Spec.Volume.Size = *resource.NewQuantity(required, resource.BinarySI)
 				changed = true
@@ -200,7 +200,7 @@ func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 		targetGen = cur.Generation
 		return nil
 	}); err != nil {
-		return nil, status.Errorf(codes.Internal, "update ZfsVolume %q: %v", id, err)
+		return nil, status.Errorf(codes.Internal, "update ZfsDataset %q: %v", id, err)
 	}
 
 	if _, err := c.waitVolumeReady(ctx, id, targetGen); err != nil {
@@ -234,23 +234,23 @@ func (c *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *cs
 	}, nil
 }
 
-// ensureVolume creates the ZfsVolume, or validates that an existing one with the
+// ensureVolume creates the ZfsDataset, or validates that an existing one with the
 // same name is compatible (CSI idempotency).
-func (c *ControllerServer) ensureVolume(ctx context.Context, name string, desired storagev1alpha1.ZfsVolumeSpec) error {
-	existing := &storagev1alpha1.ZfsVolume{}
+func (c *ControllerServer) ensureVolume(ctx context.Context, name string, desired storagev1alpha1.ZfsDatasetSpec) error {
+	existing := &storagev1alpha1.ZfsDataset{}
 	err := c.Client.Get(ctx, client.ObjectKey{Name: name}, existing)
 	switch {
 	case apierrors.IsNotFound(err):
-		vol := &storagev1alpha1.ZfsVolume{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: desired}
+		vol := &storagev1alpha1.ZfsDataset{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: desired}
 		if err := c.Client.Create(ctx, vol); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				return c.ensureVolume(ctx, name, desired)
 			}
-			return status.Errorf(codes.Internal, "create ZfsVolume %q: %v", name, err)
+			return status.Errorf(codes.Internal, "create ZfsDataset %q: %v", name, err)
 		}
 		return nil
 	case err != nil:
-		return status.Errorf(codes.Internal, "get ZfsVolume %q: %v", name, err)
+		return status.Errorf(codes.Internal, "get ZfsDataset %q: %v", name, err)
 	default:
 		if !volumeSpecCompatible(existing.Spec, desired) {
 			return status.Errorf(codes.AlreadyExists, "volume %q already exists with different parameters", name)
@@ -285,11 +285,11 @@ func (c *ControllerServer) ensureShare(ctx context.Context, name string, desired
 	}
 }
 
-// waitVolumeReady polls the ZfsVolume until it is Ready, fails, or the deadline
+// waitVolumeReady polls the ZfsDataset until it is Ready, fails, or the deadline
 // elapses. A timeout returns DeadlineExceeded so external-provisioner retries.
 // minGeneration requires the agent to have observed at least that spec
 // generation (used after an expansion bumps the spec); 0 accepts any Ready.
-func (c *ControllerServer) waitVolumeReady(ctx context.Context, name string, minGeneration int64) (*storagev1alpha1.ZfsVolume, error) {
+func (c *ControllerServer) waitVolumeReady(ctx context.Context, name string, minGeneration int64) (*storagev1alpha1.ZfsDataset, error) {
 	interval := c.PollInterval
 	if interval <= 0 {
 		interval = time.Second
@@ -304,15 +304,15 @@ func (c *ControllerServer) waitVolumeReady(ctx context.Context, name string, min
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		vol := &storagev1alpha1.ZfsVolume{}
+		vol := &storagev1alpha1.ZfsDataset{}
 		if err := c.Client.Get(waitCtx, client.ObjectKey{Name: name}, vol); err != nil {
-			return nil, status.Errorf(codes.Internal, "get ZfsVolume %q: %v", name, err)
+			return nil, status.Errorf(codes.Internal, "get ZfsDataset %q: %v", name, err)
 		}
 		observed := vol.Status.ObservedGeneration >= minGeneration
 		switch {
-		case observed && vol.Status.Phase == storagev1alpha1.VolumePhaseReady:
+		case observed && vol.Status.Phase == storagev1alpha1.DatasetPhaseReady:
 			return vol, nil
-		case observed && vol.Status.Phase == storagev1alpha1.VolumePhaseError:
+		case observed && vol.Status.Phase == storagev1alpha1.DatasetPhaseError:
 			return nil, status.Errorf(codes.Internal, "volume %q provisioning failed: %s", name, vol.Status.Message)
 		}
 		select {
@@ -345,20 +345,20 @@ func (c *ControllerServer) pvcAnnotations(ctx context.Context, params map[string
 	return pvc.Annotations, nil
 }
 
-// volumeSpec builds the desired ZfsVolume spec from resolved parameters.
-func volumeSpec(rp *ResolvedParams, dataset string, sizeBytes int64) storagev1alpha1.ZfsVolumeSpec {
-	spec := storagev1alpha1.ZfsVolumeSpec{
+// volumeSpec builds the desired ZfsDataset spec from resolved parameters.
+func volumeSpec(rp *ResolvedParams, dataset string, sizeBytes int64) storagev1alpha1.ZfsDatasetSpec {
+	spec := storagev1alpha1.ZfsDatasetSpec{
 		PoolGUID:   rp.PoolGUID,
 		Dataset:    dataset,
-		Type:       rp.VolumeType,
+		Type:       rp.DatasetType,
 		Properties: rp.Properties,
 	}
-	switch rp.VolumeType {
-	case storagev1alpha1.VolumeTypeFilesystem:
+	switch rp.DatasetType {
+	case storagev1alpha1.DatasetTypeFilesystem:
 		if sizeBytes > 0 {
 			spec.Filesystem = &storagev1alpha1.FilesystemConfig{Quota: resource.NewQuantity(sizeBytes, resource.BinarySI)}
 		}
-	case storagev1alpha1.VolumeTypeVolume:
+	case storagev1alpha1.DatasetTypeVolume:
 		spec.Volume = &storagev1alpha1.VolumeConfig{
 			Size:         *resource.NewQuantity(sizeBytes, resource.BinarySI),
 			Volblocksize: rp.Volblocksize,
@@ -383,9 +383,9 @@ func shareSpec(rp *ResolvedParams, dataset string) storagev1alpha1.ZfsShareSpec 
 	return spec
 }
 
-// volumeSpecCompatible reports whether an existing ZfsVolume can satisfy a
+// volumeSpecCompatible reports whether an existing ZfsDataset can satisfy a
 // repeated CreateVolume for the same name (identity + size must match).
-func volumeSpecCompatible(existing, desired storagev1alpha1.ZfsVolumeSpec) bool {
+func volumeSpecCompatible(existing, desired storagev1alpha1.ZfsDatasetSpec) bool {
 	if existing.PoolGUID != desired.PoolGUID || existing.Dataset != desired.Dataset || existing.Type != desired.Type {
 		return false
 	}
@@ -394,13 +394,13 @@ func volumeSpecCompatible(existing, desired storagev1alpha1.ZfsVolumeSpec) bool 
 
 // volumeSize returns the sizing quantity for a spec (zvol size or fs quota), or
 // nil when unbounded.
-func volumeSize(spec storagev1alpha1.ZfsVolumeSpec) *resource.Quantity {
+func volumeSize(spec storagev1alpha1.ZfsDatasetSpec) *resource.Quantity {
 	switch spec.Type {
-	case storagev1alpha1.VolumeTypeVolume:
+	case storagev1alpha1.DatasetTypeVolume:
 		if spec.Volume != nil {
 			return &spec.Volume.Size
 		}
-	case storagev1alpha1.VolumeTypeFilesystem:
+	case storagev1alpha1.DatasetTypeFilesystem:
 		if spec.Filesystem != nil {
 			return spec.Filesystem.Quota
 		}

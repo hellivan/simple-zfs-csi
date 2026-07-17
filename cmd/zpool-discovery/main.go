@@ -2,7 +2,7 @@
 // privileged DaemonSet on every storage node and hosts two responsibilities:
 // Tier 1 pool discovery (enumerating locally imported ZFS pools and publishing
 // their identity, routing and health into cluster-scoped ZfsPool objects) and
-// the ZfsVolume allocation reconciler (creating/destroying datasets and zvols
+// the ZfsDataset allocation reconciler (creating/destroying datasets and zvols
 // for volumes whose pool is currently hosted on this node).
 package main
 
@@ -101,13 +101,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.ZfsVolumeReconciler{
+	if err := (&controller.ZfsDatasetReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		NodeName: nodeName,
 		ZFS:      &zpool.CLI{Bin: zfsBin, Run: hostRunner},
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to set up ZfsVolume reconciler")
+		setupLog.Error(err, "unable to set up ZfsDataset reconciler")
 		os.Exit(1)
 	}
 

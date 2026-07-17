@@ -40,7 +40,7 @@ Resolve the image reference for a component ("nfs", "nvmeof", ...).
 The values key is `component`; the derived image suffix is `suffix` (defaults to
 `component`) so camelCase values keys can map to hyphenated image names.
 Usage: {{ include "simple-zfs-csi.image" (dict "root" . "component" "nfs") }}
-       {{ include "simple-zfs-csi.image" (dict "root" . "component" "csiController" "suffix" "csi-controller") }}
+       {{ include "simple-zfs-csi.image" (dict "root" . "component" "csiController" "suffix" "controller") }}
 */}}
 {{- define "simple-zfs-csi.image" -}}
 {{- $root := .root -}}

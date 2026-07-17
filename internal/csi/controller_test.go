@@ -32,7 +32,7 @@ func newTestClient(t *testing.T, objs ...client.Object) client.Client {
 	}
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}, &storagev1alpha1.ZfsShare{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsShare{}).
 		WithObjects(objs...).
 		Build()
 }
@@ -51,13 +51,13 @@ func blockCaps() []*csi.VolumeCapability {
 	}}
 }
 
-// markReadyAsync flips a ZfsVolume to Ready once it appears, simulating the agent.
+// markReadyAsync flips a ZfsDataset to Ready once it appears, simulating the agent.
 func markReadyAsync(cl client.Client, name string) {
 	go func() {
 		for i := 0; i < 200; i++ {
-			vol := &storagev1alpha1.ZfsVolume{}
+			vol := &storagev1alpha1.ZfsDataset{}
 			if err := cl.Get(context.Background(), client.ObjectKey{Name: name}, vol); err == nil {
-				vol.Status.Phase = storagev1alpha1.VolumePhaseReady
+				vol.Status.Phase = storagev1alpha1.DatasetPhaseReady
 				vol.Status.Path = "/mnt/tank/" + vol.Spec.Dataset
 				_ = cl.Status().Update(context.Background(), vol)
 				return
@@ -99,11 +99,11 @@ func TestCreateVolume_NFSFilesystem(t *testing.T) {
 		t.Errorf("volume_context = %+v", vctx)
 	}
 
-	vol := &storagev1alpha1.ZfsVolume{}
+	vol := &storagev1alpha1.ZfsDataset{}
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, vol); err != nil {
-		t.Fatalf("get ZfsVolume: %v", err)
+		t.Fatalf("get ZfsDataset: %v", err)
 	}
-	if vol.Spec.Type != storagev1alpha1.VolumeTypeFilesystem {
+	if vol.Spec.Type != storagev1alpha1.DatasetTypeFilesystem {
 		t.Errorf("type = %q, want filesystem", vol.Spec.Type)
 	}
 	if vol.Spec.Filesystem == nil || vol.Spec.Filesystem.Quota == nil || vol.Spec.Filesystem.Quota.Value() != 1<<30 {
@@ -137,11 +137,11 @@ func TestCreateVolume_NVMeoFVolume(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	vol := &storagev1alpha1.ZfsVolume{}
+	vol := &storagev1alpha1.ZfsDataset{}
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-2"}, vol); err != nil {
-		t.Fatalf("get ZfsVolume: %v", err)
+		t.Fatalf("get ZfsDataset: %v", err)
 	}
-	if vol.Spec.Type != storagev1alpha1.VolumeTypeVolume {
+	if vol.Spec.Type != storagev1alpha1.DatasetTypeVolume {
 		t.Errorf("type = %q, want volume", vol.Spec.Type)
 	}
 	if vol.Spec.Volume == nil || vol.Spec.Volume.Size.Value() != 10<<30 || vol.Spec.Volume.Volblocksize != "16k" {
@@ -287,7 +287,7 @@ func TestCreateVolume_TimeoutWhenNotReady(t *testing.T) {
 }
 
 func TestDeleteVolume_RemovesBoth(t *testing.T) {
-	vol := &storagev1alpha1.ZfsVolume{ObjectMeta: metav1.ObjectMeta{Name: "pvc-9"}}
+	vol := &storagev1alpha1.ZfsDataset{ObjectMeta: metav1.ObjectMeta{Name: "pvc-9"}}
 	share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: "pvc-9"}}
 	cl := newTestClient(t, vol, share)
 	cs := newController(cl)
@@ -295,8 +295,8 @@ func TestDeleteVolume_RemovesBoth(t *testing.T) {
 	if _, err := cs.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-9"}); err != nil {
 		t.Fatalf("DeleteVolume: %v", err)
 	}
-	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-9"}, &storagev1alpha1.ZfsVolume{}); !apierrors.IsNotFound(err) {
-		t.Errorf("ZfsVolume still present: %v", err)
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-9"}, &storagev1alpha1.ZfsDataset{}); !apierrors.IsNotFound(err) {
+		t.Errorf("ZfsDataset still present: %v", err)
 	}
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-9"}, &storagev1alpha1.ZfsShare{}); !apierrors.IsNotFound(err) {
 		t.Errorf("ZfsShare still present: %v", err)
@@ -310,16 +310,16 @@ func TestDeleteVolume_IdempotentWhenAbsent(t *testing.T) {
 	}
 }
 
-// markReadyTrackingGen keeps a ZfsVolume Ready with ObservedGeneration synced to
+// markReadyTrackingGen keeps a ZfsDataset Ready with ObservedGeneration synced to
 // its spec generation, simulating the agent across expansion (which bumps the
 // spec). Used by expansion tests where waitVolumeReady requires the generation.
 func markReadyTrackingGen(cl client.Client, name string) {
 	go func() {
 		for i := 0; i < 400; i++ {
-			vol := &storagev1alpha1.ZfsVolume{}
+			vol := &storagev1alpha1.ZfsDataset{}
 			if err := cl.Get(context.Background(), client.ObjectKey{Name: name}, vol); err == nil {
-				if vol.Status.Phase != storagev1alpha1.VolumePhaseReady || vol.Status.ObservedGeneration != vol.Generation {
-					vol.Status.Phase = storagev1alpha1.VolumePhaseReady
+				if vol.Status.Phase != storagev1alpha1.DatasetPhaseReady || vol.Status.ObservedGeneration != vol.Generation {
+					vol.Status.Phase = storagev1alpha1.DatasetPhaseReady
 					vol.Status.Path = "/mnt/tank/" + vol.Spec.Dataset
 					vol.Status.ObservedGeneration = vol.Generation
 					_ = cl.Status().Update(context.Background(), vol)
@@ -332,12 +332,12 @@ func markReadyTrackingGen(cl client.Client, name string) {
 
 func TestControllerExpandVolume_Filesystem(t *testing.T) {
 	small := resource.MustParse("1Gi")
-	vol := &storagev1alpha1.ZfsVolume{
+	vol := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-e1"},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID:   "999",
 			Dataset:    "k8s/pvc-e1",
-			Type:       storagev1alpha1.VolumeTypeFilesystem,
+			Type:       storagev1alpha1.DatasetTypeFilesystem,
 			Filesystem: &storagev1alpha1.FilesystemConfig{Quota: &small},
 		},
 	}
@@ -358,7 +358,7 @@ func TestControllerExpandVolume_Filesystem(t *testing.T) {
 	if resp.GetNodeExpansionRequired() {
 		t.Errorf("filesystem (NFS) expansion should not require node expansion")
 	}
-	got := &storagev1alpha1.ZfsVolume{}
+	got := &storagev1alpha1.ZfsDataset{}
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-e1"}, got); err != nil {
 		t.Fatalf("get volume: %v", err)
 	}
@@ -369,12 +369,12 @@ func TestControllerExpandVolume_Filesystem(t *testing.T) {
 
 func TestControllerExpandVolume_Zvol(t *testing.T) {
 	small := resource.MustParse("1Gi")
-	vol := &storagev1alpha1.ZfsVolume{
+	vol := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-e2"},
-		Spec: storagev1alpha1.ZfsVolumeSpec{
+		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID: "999",
 			Dataset:  "k8s/pvc-e2",
-			Type:     storagev1alpha1.VolumeTypeVolume,
+			Type:     storagev1alpha1.DatasetTypeVolume,
 			Volume:   &storagev1alpha1.VolumeConfig{Size: small},
 		},
 	}
@@ -392,7 +392,7 @@ func TestControllerExpandVolume_Zvol(t *testing.T) {
 	if !resp.GetNodeExpansionRequired() {
 		t.Errorf("zvol (NVMe-oF) expansion must require node expansion")
 	}
-	got := &storagev1alpha1.ZfsVolume{}
+	got := &storagev1alpha1.ZfsDataset{}
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-e2"}, got); err != nil {
 		t.Fatalf("get volume: %v", err)
 	}

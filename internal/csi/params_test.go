@@ -118,8 +118,8 @@ func TestParseParams_NFSDerivesFilesystem(t *testing.T) {
 	if rp.Protocol != storagev1alpha1.ProtocolNFS {
 		t.Errorf("protocol = %q, want nfs", rp.Protocol)
 	}
-	if rp.VolumeType != storagev1alpha1.VolumeTypeFilesystem {
-		t.Errorf("volumeType = %q, want filesystem", rp.VolumeType)
+	if rp.DatasetType != storagev1alpha1.DatasetTypeFilesystem {
+		t.Errorf("volumeType = %q, want filesystem", rp.DatasetType)
 	}
 	if rp.DatasetPrefix != "k8s" {
 		t.Errorf("datasetPrefix = %q, want k8s (trimmed)", rp.DatasetPrefix)
@@ -146,8 +146,8 @@ func TestParseParams_NVMeoFDerivesVolume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if rp.VolumeType != storagev1alpha1.VolumeTypeVolume {
-		t.Errorf("volumeType = %q, want volume", rp.VolumeType)
+	if rp.DatasetType != storagev1alpha1.DatasetTypeVolume {
+		t.Errorf("volumeType = %q, want volume", rp.DatasetType)
 	}
 	if rp.Volblocksize != "16k" {
 		t.Errorf("volblocksize = %q, want 16k", rp.Volblocksize)

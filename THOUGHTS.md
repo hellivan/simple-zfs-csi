@@ -792,7 +792,7 @@ RunCommand(cmd)
 
 ## 2. Provisioning Model: CRD Indirection
 - CSI controller is a pure K8s API client (unprivileged, node-agnostic, schedules anywhere). It does NOT run zfs.
-- CreateVolume → writes an allocation CRD (new ZfsVolume/ZfsDataset, or extend ZfsShare with an allocation block) → waits for Ready → returns volume context.
+- CreateVolume → writes an allocation CRD (new ZfsDataset/ZfsDataset, or extend ZfsShare with an allocation block) → waits for Ready → returns volume context.
 - The storage-node `agent` executes the actual `zfs create` when it reconciles the allocation CRD.
 - VolumeContext carries ONLY pool_guid + logical dataset name — NEVER an absolute path (survives pool rename / alt import root / mountpoint shift).
 - Node plugin does late binding at attach: reads ZfsPool.status (currentIP + baseMountPath), joins the logical name, then mounts. Refuses to mount when health = NODE_OFFLINE (clean gRPC error instead of hanging on a dead IP).
@@ -925,7 +925,7 @@ One extra object per ZFS share + a small `ZfsShare` reconciler that renders/sync
   renderer): **"do I currently host this pool GUID?"** → resolve `poolGUID` →
   `ZfsPool.status.currentNode == $NODE_NAME`. Requires watching `ZfsPool` and mapping changes
   back to the referencing objects so both old and new node re-reconcile on takeover.
-- The **allocation CRD (`ZfsVolume`)** keys off `poolGUID` too, so `agent` uses the identical
+- The **allocation CRD (`ZfsDataset`)** keys off `poolGUID` too, so `agent` uses the identical
   "is this pool mine right now?" rule for creation, discovery, and share rendering.
 - The generic `NetworkExport` **retains `nodeName`** — GUID routing lives only in the ZFS
   layer, which *produces* the `nodeName` dynamically.
@@ -933,12 +933,12 @@ One extra object per ZFS share + a small `ZfsShare` reconciler that renders/sync
 ## 9. Revised Build Order (supersedes the earlier step list)
 1. Rename current `ZfsShare` → `NetworkExport` (type + controllers + CRD + samples + chart);
    verify with `make manifests` + `make vet`.
-2. Add `ZfsVolume` allocation CRD (keyed on `poolGUID`).
+2. Add `ZfsDataset` allocation CRD (keyed on `poolGUID`).
 3. Add the new GUID-based `ZfsShare` whose reconciler renders/syncs a child `NetworkExport`.
 4. Formalize the Go `ZFS` interface (+ hostexec impl) over `internal/zpool/hostexec.go`.
 5. Agent allocation reconciler (create/destroy zvol/dataset, idempotent, finalizer), folded
    into the discovery loop as one `agent` binary/container.
-6. CSI controller (`cmd/csi-controller`): CreateVolume → writes `ZfsVolume` (+ `ZfsShare`),
+6. CSI controller (`cmd/csi-controller`): CreateVolume → writes `ZfsDataset` (+ `ZfsShare`),
    waits for Ready, returns volume context (pool_guid + logical name).
 7. CSI node plugin (`cmd/csi-node`): NodePublish routes via `ZfsPool.status`, mounts NFS /
    `nvme connect`, refuses on NODE_OFFLINE; ship `CSIDriver` + node-driver-registrar.
@@ -960,7 +960,7 @@ unprivileged, cluster-wide, leader-elected reconcilers:
 - **Decoupled from CSI:** a static, GUID-routed `ZfsShare` (e.g. a media library that must
   survive pool takeover) needs translation but **no dynamic provisioning**. Binding the
   reconciler to the CSI controller would force a CSI deploy just to render shares.
-- **CSI stays a thin adapter:** the CSI controller only *creates* `ZfsVolume`/`ZfsShare` and
+- **CSI stays a thin adapter:** the CSI controller only *creates* `ZfsDataset`/`ZfsShare` and
   returns volume context — no continuous reconcile loops in the gRPC pod.
 - **Cohesion:** watcher and translator are both cluster-wide `ZfsPool`-driven reconcilers.
 - **No extra pods:** reuse the existing cluster-wide Deployment (important for a 2-node homelab).
@@ -976,7 +976,7 @@ anyway). The per-node `agent`/`nfs`/`nvmeof` only *consume* `NetworkExport`.
   `zpool-watcher` + `ZfsShare → NetworkExport`.
 - **`csi-controller`** (Deployment): thin gRPC adapter; creates CRDs, returns context.
 - **`agent` / `nfs` / `nvmeof`** (DaemonSet, per storage node, privileged): consume
-  `ZfsVolume`/`NetworkExport`, do the privileged ZFS/export work.
+  `ZfsDataset`/`NetworkExport`, do the privileged ZFS/export work.
 - **`csi-node`** (DaemonSet, all nodes): mounts.
 
 Fleet naming: `agent` (data plane) · `operator` (brain) · `csi-controller` / `csi-node`
