@@ -51,6 +51,14 @@ func blockCaps() []*csi.VolumeCapability {
 	}}
 }
 
+// multiNodeMountCaps requests a multi-node (RWX) filesystem access mode.
+func multiNodeMountCaps() []*csi.VolumeCapability {
+	return []*csi.VolumeCapability{{
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER},
+	}}
+}
+
 // markReadyAsync flips a ZfsDataset to Ready once it appears, simulating the agent.
 func markReadyAsync(cl client.Client, name string) {
 	go func() {
@@ -171,6 +179,86 @@ func TestCreateVolume_NVMeoFRequiresCapacity(t *testing.T) {
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("err = %v, want InvalidArgument", err)
+	}
+}
+
+func TestCreateVolume_NVMeoFMultiNodeRejected(t *testing.T) {
+	cs := newController(newTestClient(t))
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "pvc-5",
+		VolumeCapabilities: multiNodeMountCaps(),
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1 << 30},
+		Parameters:         map[string]string{"poolGUID": "999", "protocol": "nvmeof"},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("err = %v, want InvalidArgument", err)
+	}
+}
+
+func TestCreateVolume_NFSMultiNodeAllowed(t *testing.T) {
+	cl := newTestClient(t)
+	cs := newController(cl)
+	markReadyAsync(cl, "pvc-6")
+
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:               "pvc-6",
+		VolumeCapabilities: multiNodeMountCaps(),
+		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1 << 30},
+		Parameters:         map[string]string{"poolGUID": "999", "protocol": "nfs"},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume (nfs RWX): %v", err)
+	}
+}
+
+func TestValidateVolumeCapabilities_NVMeoFMultiNodeNotConfirmed(t *testing.T) {
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-7"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999",
+			Dataset:  "k8s/pvc-7",
+			Type:     storagev1alpha1.DatasetTypeVolume,
+			Volume:   &storagev1alpha1.VolumeConfig{Size: *resource.NewQuantity(1<<30, resource.BinarySI)},
+		},
+	}
+	cs := newController(newTestClient(t, vol))
+
+	resp, err := cs.ValidateVolumeCapabilities(context.Background(), &csi.ValidateVolumeCapabilitiesRequest{
+		VolumeId:           "pvc-7",
+		VolumeCapabilities: multiNodeMountCaps(),
+	})
+	if err != nil {
+		t.Fatalf("ValidateVolumeCapabilities: %v", err)
+	}
+	if resp.GetConfirmed() != nil {
+		t.Errorf("multi-node nvmeof should not be confirmed, got %+v", resp.GetConfirmed())
+	}
+	if resp.GetMessage() == "" {
+		t.Errorf("expected a rejection message")
+	}
+}
+
+func TestValidateVolumeCapabilities_NVMeoFSingleNodeConfirmed(t *testing.T) {
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-8"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999",
+			Dataset:  "k8s/pvc-8",
+			Type:     storagev1alpha1.DatasetTypeVolume,
+			Volume:   &storagev1alpha1.VolumeConfig{Size: *resource.NewQuantity(1<<30, resource.BinarySI)},
+		},
+	}
+	cs := newController(newTestClient(t, vol))
+
+	resp, err := cs.ValidateVolumeCapabilities(context.Background(), &csi.ValidateVolumeCapabilitiesRequest{
+		VolumeId:           "pvc-8",
+		VolumeCapabilities: blockCaps(),
+	})
+	if err != nil {
+		t.Fatalf("ValidateVolumeCapabilities: %v", err)
+	}
+	if resp.GetConfirmed() == nil {
+		t.Errorf("single-node nvmeof should be confirmed, got message %q", resp.GetMessage())
 	}
 }
 

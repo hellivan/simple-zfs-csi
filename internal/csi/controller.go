@@ -70,6 +70,10 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if hasBlockCapability(caps) && rp.Protocol == storagev1alpha1.ProtocolNFS {
 		return nil, status.Error(codes.InvalidArgument, "block volumeMode requires protocol nvmeof")
 	}
+	if rp.Protocol == storagev1alpha1.ProtocolNVMeoF && hasMultiNodeAccessMode(caps) {
+		return nil, status.Error(codes.InvalidArgument,
+			"protocol nvmeof is single-node only; multi-node (RWX) access modes are not supported (use protocol nfs)")
+	}
 
 	sizeBytes := capacityBytes(req.GetCapacityRange())
 	if rp.DatasetType == storagev1alpha1.DatasetTypeVolume && sizeBytes <= 0 {
@@ -225,21 +229,38 @@ func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 }
 
 // ValidateVolumeCapabilities confirms the requested capabilities are supported.
-func (c *ControllerServer) ValidateVolumeCapabilities(_ context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+func (c *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
 	if req.GetVolumeId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume id is required")
 	}
-	if len(req.GetVolumeCapabilities()) == 0 {
+	caps := req.GetVolumeCapabilities()
+	if len(caps) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "volume capabilities are required")
 	}
-	for _, cap := range req.GetVolumeCapabilities() {
+	for _, cap := range caps {
 		if cap.GetAccessMode() == nil {
 			return &csi.ValidateVolumeCapabilitiesResponse{Message: "missing access mode"}, nil
 		}
 	}
+
+	// NVMe-oF (zvol) is single-node only: a multi-node access mode on a zvol +
+	// filesystem corrupts data (ext4/xfs are not cluster filesystems).
+	vol := &storagev1alpha1.ZfsDataset{}
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: req.GetVolumeId()}, vol); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, status.Errorf(codes.NotFound, "volume %q not found", req.GetVolumeId())
+		}
+		return nil, status.Errorf(codes.Internal, "get ZfsDataset %q: %v", req.GetVolumeId(), err)
+	}
+	if vol.Spec.Type == storagev1alpha1.DatasetTypeVolume && hasMultiNodeAccessMode(caps) {
+		return &csi.ValidateVolumeCapabilitiesResponse{
+			Message: "protocol nvmeof is single-node only; multi-node (RWX) access modes are not supported",
+		}, nil
+	}
+
 	return &csi.ValidateVolumeCapabilitiesResponse{
 		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
-			VolumeCapabilities: req.GetVolumeCapabilities(),
+			VolumeCapabilities: caps,
 		},
 	}, nil
 }
@@ -452,6 +473,21 @@ func capacityBytes(cr *csi.CapacityRange) int64 {
 func hasBlockCapability(caps []*csi.VolumeCapability) bool {
 	for _, cap := range caps {
 		if cap.GetBlock() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMultiNodeAccessMode reports whether any requested capability asks for a
+// multi-node (RWX-style) access mode. NVMe-oF exports a zvol to a single node
+// only; sharing it across nodes with a non-cluster filesystem corrupts data.
+func hasMultiNodeAccessMode(caps []*csi.VolumeCapability) bool {
+	for _, cap := range caps {
+		switch cap.GetAccessMode().GetMode() {
+		case csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+			csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
+			csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER:
 			return true
 		}
 	}
