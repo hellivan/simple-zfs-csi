@@ -8,6 +8,104 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0010 — Attach-stage share lifecycle & zero-trust access control
+
+**Status:** Accepted direction (2026-07-17), not yet implemented · **Scope:** CSI controller, csi-node (`CSIDriver`), operator, new `ZfsShareAttachRequest` CRD, `NetworkExport`/`ZfsShare` status · **Supersedes** ADR-0001 §2; **implements/extends** ADR-0005.
+
+### Context
+
+ADR-0005 accepted "move access control to the attach stage" but kept the
+provision-time share (ADR-0001 §2). Revisiting: a share created at `CreateVolume`
+sits there exposed (or dormant-but-present) for the volume's whole life and only
+gets *narrowed* when attaches arrive — the opposite of zero-trust. The intent is
+that **nothing is exported until a specific node is authorized**, and the export
+disappears again when the last consumer detaches. ADR-0001 §2's counter-argument
+("shares work without a pod") is preserved by manual/static authoring, and its
+stated reason for rejecting publish-time (node-side CRD writes needing RBAC) does
+not apply here because the write happens **controller-side** at
+`ControllerPublishVolume`. So ADR-0001 §2 is superseded; nothing breaks
+technically.
+
+### Decisions
+
+1. **The share is lazy — created at attach, destroyed at last detach.**
+   `CreateVolume` writes **only** the `ZfsDataset` (allocation). No `ZfsShare` at
+   provision time. `DeleteVolume` deletes the `ZfsDataset` (and any stray
+   `ZfsShare`, defensively). This supersedes ADR-0001 §2.
+
+2. **Attach hook via `external-attacher`.** `CSIDriver.attachRequired: true` (both
+   protocols — we use attach purely as the authorization hook, not for block
+   map/lock). `ControllerPublishVolume(vol, node)` creates a
+   `ZfsShareAttachRequest{vol, node}`; `ControllerUnpublishVolume` deletes it. The
+   CSI controller stays thin: it only creates the request and polls its status.
+
+3. **New `ZfsShareAttachRequest` CRD, aggregated declaratively in the operator.**
+   One tiny object per `(volume, node)` attach. An operator reconciler aggregates
+   the set per volume:
+   - ≥1 request → **ensure `ZfsShare` exists**, `allowedClients` = resolve(each
+     request's node) → compiles to `NetworkExport` as usual (ADR/THOUGHTS §7).
+   - 0 requests → **delete the `ZfsShare`** (→ `NetworkExport` GC'd → export torn
+     down).
+   Ref-counting is free: the allow-list *is* the set of request objects. Each
+   attach writes its **own** object (no read-modify-write contention on a shared
+   allow-list field); a single leader-elected reconciler owns the `ZfsShare` write.
+
+4. **Readiness bubbles up the chain; each reconciler reads only its neighbour.**
+   `nfs`/`nvmeof` aggregator writes `NetworkExport.status` (applied allow-list +
+   `observedGeneration`) → operator's `ZfsShare` reconciler reflects it into
+   `ZfsShare.status` → operator's `ZfsShareAttachRequest` reconciler reflects
+   "is my node applied?" into `ZfsShareAttachRequest.status` →
+   `ControllerPublishVolume` polls **that** status before returning success (so the
+   subsequent `NodePublish` mount finds a live export). Readiness is
+   **generation-gated** (report the applied set and/or `observedGeneration`) so a
+   stale "ready" from before this node was added can never satisfy the wait. This
+   keeps RBAC minimal (the CSI controller reads only the request) and matches the
+   existing owner/watch layering.
+
+5. **NVMe-oF is single-node only.** `RWX`/multi-node access modes on a zvol +
+   filesystem = corruption (ext4/xfs are not cluster filesystems). `CreateVolume`
+   **and** `ValidateVolumeCapabilities` reject any `MULTI_NODE_*` access mode when
+   `protocol == nvmeof` (`InvalidArgument`), sitting next to the existing
+   `Block + nfs` rejection. NFS remains the only RWX path. Consequence: an NVMe-oF
+   volume always has exactly one attach request, so its share lifecycle is the
+   trivial create-on-attach / delete-on-detach case; the ref-counting in decision
+   3 only ever exercises for NFS RWX.
+
+6. **Static provisioning asymmetry (documented, not a blocker).** Kubernetes has
+   **no in-tree NVMe-oF volume plugin** (only `nfs`, `iscsi`, `fc`). So the "bypass
+   the driver with a native PV" path exists for **NFS** (`spec.nfs`) but **not**
+   for NVMe-oF. Static NVMe-oF uses a **static CSI PV** (`spec.csi` + `volumeHandle`
+   + `volumeAttributes = { poolGUID, dataset, protocol }`); the node plugin does the
+   `nvme connect`. The admin pre-creates the zvol (and optionally the
+   `NetworkExport`/`ZfsShare`, or lets the attach flow create it).
+
+### Consequences
+
+- **Zero-trust:** no export exists until a node is authorized; the export is torn
+  down when the last consumer detaches. Truest reading of THOUGHTS §20.
+- **CSI controller stays a thin adapter:** it creates `ZfsDataset` (+ on attach a
+  `ZfsShareAttachRequest`) and polls status; **all** reconcile/aggregation lives in
+  the `operator`.
+- **New machinery required:** `external-attacher` sidecar + `VolumeAttachment` RBAC;
+  `ControllerPublish/Unpublish`; the `ZfsShareAttachRequest` CRD + its reconciler;
+  status subresources on `NetworkExport`/`ZfsShare`/`ZfsShareAttachRequest`;
+  `attachRequired: true` on the `CSIDriver`.
+- **Fencing unchanged:** `NODE_OFFLINE` remains the *availability* gate (ADR-0003);
+  attach adds an *authorization* gate — orthogonal.
+- **Crypto auth (DH-CHAP / TLS-PSK) and NQN discovery** (THOUGHTS §20.3, §21) layer
+  on top of this attach stage later; out of scope for the first cut.
+
+### Plan (→ [implementation-strategy.md](implementation-strategy.md) Step 11)
+
+1. Forbid `nvmeof` multi-node access modes in `CreateVolume` + `ValidateVolumeCapabilities` (small, self-contained; ship first).
+2. `ZfsShareAttachRequest` CRD + `allowedClients`/status fields on `ZfsShare`/`NetworkExport`.
+3. Stop creating `ZfsShare` in `CreateVolume`; add `ControllerPublish/Unpublish` creating/deleting the request; wait on request status.
+4. Operator: attach-request aggregation reconciler (lazy create/GC the `ZfsShare`) + status bubble-up.
+5. Chart: `external-attacher` sidecar, `VolumeAttachment` RBAC, `CSIDriver.attachRequired: true`.
+6. Verify: unit tests (nvmeof RWX rejection, aggregation create/GC, status gating); e2e RWO NVMe + RWX NFS attach/detach.
+
+---
+
 ## ADR-0009 — Clone/restore: `spec.source` on `ZfsDataset`, same-pool `zfs clone`
 
 **Status:** Accepted (2026-07-17) · **Scope:** Step 10 — API, agent, CSI controller, Helm RBAC

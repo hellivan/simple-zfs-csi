@@ -168,6 +168,25 @@ Dedicated `ZfsSnapshot` CRD (grouped by lifecycle, not ZFS taxonomy — ADR-0006
   `zfs snapshot`+`zfs clone` (from volume) instead of `zfs create`.
 - Verify: `make manifests` if spec grows a source ref; unit tests; e2e restore + clone.
 
+### Step 11 — Attach-stage share lifecycle & zero-trust access control (ADR-0010)
+Move the share lifecycle to the CSI attach stage so nothing is exported until a
+node is authorized; forbid NVMe-oF multi-node.
+- **11a (ship first, standalone):** reject `MULTI_NODE_*` access modes for
+  `protocol: nvmeof` in `CreateVolume` + `ValidateVolumeCapabilities` (RWX-on-zvol
+  corruption). NFS stays the RWX path.
+- New `ZfsShareAttachRequest` CRD (one per `volume,node`); `allowedClients` +
+  status subresources on `ZfsShare`/`NetworkExport`.
+- CSI controller: stop creating `ZfsShare` in `CreateVolume` (now `ZfsDataset`
+  only); implement `ControllerPublish/Unpublish` to create/delete the request;
+  poll the request status (generation-gated) before returning. Advertise
+  `PUBLISH_UNPUBLISH_VOLUME`; `CSIDriver.attachRequired: true`.
+- Operator: attach-request aggregation reconciler — ≥1 request ⇒ ensure `ZfsShare`
+  (allow-list = resolved nodes); 0 ⇒ delete it. Readiness bubbles up
+  `NetworkExport.status → ZfsShare.status → ZfsShareAttachRequest.status`.
+- Deploy: `external-attacher` sidecar + `volumeattachments` RBAC.
+- Verify: unit tests (nvmeof RWX rejection, aggregation create/GC, status gating);
+  e2e RWO NVMe + RWX NFS attach/detach; static CSI PV for nvmeof.
+
 ## Verification matrix
 
 | Step | Build | Unit | Cluster/e2e |
@@ -183,6 +202,7 @@ Dedicated `ZfsSnapshot` CRD (grouped by lifecycle, not ZFS taxonomy — ADR-0006
 | 8 expansion ✅ | `vet`+`build`+`helm-template` | controller/node expand unit tests | PVC resize grows fs/zvol |
 | 9 snapshots ✅ | `make manifests`+`build` | snapshot reconcile + CreateSnapshot | `VolumeSnapshot` create/delete |
 | 10 clone/restore ✅ | `make manifests`+`build` | clone spec + CreateVolume source | PVC from snapshot; PVC clone |
+| 11 attach access-control | `make manifests`+`build`+`helm-template` | nvmeof RWX rejection, attach-request aggregation, status gating | RWO NVMe + RWX NFS attach/detach; static CSI PV |
 
 ## Out of scope (tracked, not now)
 - Backup pod (`ssh-daemon` + `cron-puller`) — separate pod, later; shares the host-exec helper.
