@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "github.com/hellivan/zfs-shares/api/v1alpha1"
@@ -81,7 +82,7 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if err := c.ensureVolume(ctx, name, desiredVol); err != nil {
 		return nil, err
 	}
-	ready, err := c.waitVolumeReady(ctx, name)
+	ready, err := c.waitVolumeReady(ctx, name, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +129,88 @@ func (c *ControllerServer) ControllerGetCapabilities(_ context.Context, _ *csi.C
 	return &csi.ControllerGetCapabilitiesResponse{
 		Capabilities: []*csi.ControllerServiceCapability{
 			rpcCapability(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME),
+			rpcCapability(csi.ControllerServiceCapability_RPC_EXPAND_VOLUME),
 		},
+	}, nil
+}
+
+// ControllerExpandVolume grows a volume by bumping the backing ZfsVolume's size
+// (filesystem refquota or zvol volsize) and waiting for the agent to apply it.
+// For zvol (NVMe-oF) volumes the node must still grow the on-device filesystem,
+// so NodeExpansionRequired is set; NFS filesystem quotas take effect immediately.
+func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	id := req.GetVolumeId()
+	if id == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	required := capacityBytes(req.GetCapacityRange())
+	if required <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "capacity range is required")
+	}
+
+	vol := &storagev1alpha1.ZfsVolume{}
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: id}, vol); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, status.Errorf(codes.NotFound, "volume %q not found", id)
+		}
+		return nil, status.Errorf(codes.Internal, "get ZfsVolume %q: %v", id, err)
+	}
+
+	var nodeExpansionRequired bool
+	switch vol.Spec.Type {
+	case storagev1alpha1.VolumeTypeFilesystem:
+		// NFS quota grows live; no node-side work.
+	case storagev1alpha1.VolumeTypeVolume:
+		if vol.Spec.Volume == nil {
+			return nil, status.Errorf(codes.Internal, "volume %q has no size", id)
+		}
+		nodeExpansionRequired = true
+	default:
+		return nil, status.Errorf(codes.Internal, "volume %q has unknown type %q", id, vol.Spec.Type)
+	}
+
+	// Bump the backing size, retrying on conflict with the agent's status writes.
+	var targetGen int64
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cur := &storagev1alpha1.ZfsVolume{}
+		if err := c.Client.Get(ctx, client.ObjectKey{Name: id}, cur); err != nil {
+			return err
+		}
+		changed := false
+		switch cur.Spec.Type {
+		case storagev1alpha1.VolumeTypeFilesystem:
+			if cur.Spec.Filesystem == nil {
+				cur.Spec.Filesystem = &storagev1alpha1.FilesystemConfig{}
+			}
+			if q := cur.Spec.Filesystem.Quota; q == nil || q.Value() < required {
+				cur.Spec.Filesystem.Quota = resource.NewQuantity(required, resource.BinarySI)
+				changed = true
+			}
+		case storagev1alpha1.VolumeTypeVolume:
+			if cur.Spec.Volume != nil && cur.Spec.Volume.Size.Value() < required {
+				cur.Spec.Volume.Size = *resource.NewQuantity(required, resource.BinarySI)
+				changed = true
+			}
+		}
+		if changed {
+			if err := c.Client.Update(ctx, cur); err != nil {
+				return err
+			}
+		}
+		targetGen = cur.Generation
+		return nil
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "update ZfsVolume %q: %v", id, err)
+	}
+
+	if _, err := c.waitVolumeReady(ctx, id, targetGen); err != nil {
+		return nil, err
+	}
+
+	c.Log.Info("expanded volume", "name", id, "capacity", required, "nodeExpansionRequired", nodeExpansionRequired)
+	return &csi.ControllerExpandVolumeResponse{
+		CapacityBytes:         required,
+		NodeExpansionRequired: nodeExpansionRequired,
 	}, nil
 }
 
@@ -205,7 +287,9 @@ func (c *ControllerServer) ensureShare(ctx context.Context, name string, desired
 
 // waitVolumeReady polls the ZfsVolume until it is Ready, fails, or the deadline
 // elapses. A timeout returns DeadlineExceeded so external-provisioner retries.
-func (c *ControllerServer) waitVolumeReady(ctx context.Context, name string) (*storagev1alpha1.ZfsVolume, error) {
+// minGeneration requires the agent to have observed at least that spec
+// generation (used after an expansion bumps the spec); 0 accepts any Ready.
+func (c *ControllerServer) waitVolumeReady(ctx context.Context, name string, minGeneration int64) (*storagev1alpha1.ZfsVolume, error) {
 	interval := c.PollInterval
 	if interval <= 0 {
 		interval = time.Second
@@ -224,10 +308,11 @@ func (c *ControllerServer) waitVolumeReady(ctx context.Context, name string) (*s
 		if err := c.Client.Get(waitCtx, client.ObjectKey{Name: name}, vol); err != nil {
 			return nil, status.Errorf(codes.Internal, "get ZfsVolume %q: %v", name, err)
 		}
-		switch vol.Status.Phase {
-		case storagev1alpha1.VolumePhaseReady:
+		observed := vol.Status.ObservedGeneration >= minGeneration
+		switch {
+		case observed && vol.Status.Phase == storagev1alpha1.VolumePhaseReady:
 			return vol, nil
-		case storagev1alpha1.VolumePhaseError:
+		case observed && vol.Status.Phase == storagev1alpha1.VolumePhaseError:
 			return nil, status.Errorf(codes.Internal, "volume %q provisioning failed: %s", name, vol.Status.Message)
 		}
 		select {

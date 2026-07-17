@@ -8,6 +8,61 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0004 — Volume expansion: spec-driven size convergence, online grow
+
+**Status:** Accepted (2026-07-17) · **Scope:** CSI controller + node, agent reconciler, Helm chart
+
+### Context
+
+democratic-csi-class parity starts with online volume expansion. A PVC edit that
+requests more capacity flows through `external-resizer` →
+`ControllerExpandVolume` → (for block) `NodeExpandVolume`. The backing size lives
+in the `ZfsVolume` spec (`filesystem.quota` → ZFS `refquota`, `volume.size` → ZFS
+`volsize`), which the per-node agent already owns. Expansion should reuse that
+ownership rather than have the CSI plane touch ZFS directly.
+
+### Decisions
+
+1. **Expansion is spec convergence, not a special path.** `ControllerExpandVolume`
+   only bumps the `ZfsVolume` spec size (retrying on conflict with the agent's
+   status writes) and waits for the agent to observe it
+   (`status.observedGeneration >= target`). The agent's reconciler gained an
+   `ensureSize` step that runs on every reconcile: filesystem → `zfs set refquota`
+   (grows or shrinks the cap), zvol → `zfs set volsize` (**grow only**, never
+   shrink — shrinking a zvol under a live filesystem is unsafe). This also makes
+   quota drift self-heal, not just explicit expands.
+
+2. **`NodeExpansionRequired` follows the protocol.** NFS/filesystem quotas take
+   effect the instant `refquota` is set, so no node work is needed
+   (`NodeExpansionRequired: false`). A zvol grow only changes the target; the
+   initiator must rescan the namespace and grow the on-device filesystem, so
+   `NodeExpansionRequired: true`. `NodeExpandVolume` runs `nvme ns-rescan` then
+   `resize2fs`/`xfs_growfs`; raw-block volumes stop after the rescan (no fs), and
+   an NFS volume (no `NetworkExport` NQN) is a no-op.
+
+3. **`volsize` alignment.** ZFS requires `volsize` to be a multiple of
+   `volblocksize`, so the agent rounds the requested bytes up to the volume's
+   block size (default 16 KiB) before `zfs set`.
+
+4. **Online capability.** The controller Identity advertises
+   `VOLUME_EXPANSION: ONLINE`; the controller service advertises `EXPAND_VOLUME`;
+   the node service advertises `EXPAND_VOLUME`. Helm gains the `external-resizer`
+   sidecar (`csiController.resizer.*`, on by default) plus RBAC for
+   `persistentvolumeclaims/status` and `persistentvolumes` update. StorageClasses
+   opt in per class with `allowVolumeExpansion: true`.
+
+### Consequences
+
+- No new CRD; expansion rides the existing `ZfsVolume` ownership boundary — the
+  CSI plane stays a thin CRD adapter and only the agent runs ZFS.
+- Shrinking is intentionally unsupported for zvols (and Kubernetes forbids PVC
+  shrink anyway); filesystem `refquota` can still be lowered by editing the spec.
+- Live `resize2fs`/`xfs_growfs` over NVMe-oF is the manual verification step (not
+  unit-tested); unit tests cover the controller size-bump + node rescan/resize
+  dispatch and the agent's `ensureSize` for both types.
+
+---
+
 ## ADR-0003 — CSI node plugin: routing-only publish, NODE_OFFLINE fencing, protocol dispatch
 
 **Status:** Accepted (2026-07-17) · **Scope:** Step 7 (`cmd/csi-node`), Helm chart

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -17,29 +18,44 @@ import (
 	"github.com/hellivan/zfs-shares/internal/zpool"
 )
 
-// fakeZFS is an in-memory zpool.ZFS used to assert the reconciler's create and
-// destroy behaviour without shelling out.
+// fakeZFS is an in-memory zpool.ZFS used to assert the reconciler's create,
+// destroy and resize behaviour without shelling out.
 type fakeZFS struct {
 	existing    map[string]bool
+	props       map[string]map[string]string
 	createdDS   []string
 	createdZvol map[string]int64
 	destroyed   []string
 	lastDSProps map[string]string
 	lastZvProps map[string]string
+	setProps    []string // records "name property=value" for each SetProperty
 }
 
 func newFakeZFS(existing ...string) *fakeZFS {
-	f := &fakeZFS{existing: map[string]bool{}, createdZvol: map[string]int64{}}
+	f := &fakeZFS{
+		existing:    map[string]bool{},
+		props:       map[string]map[string]string{},
+		createdZvol: map[string]int64{},
+	}
 	for _, e := range existing {
 		f.existing[e] = true
 	}
 	return f
 }
 
+func (f *fakeZFS) store(name string, props map[string]string) {
+	m := map[string]string{}
+	for k, v := range props {
+		m[k] = v
+	}
+	f.props[name] = m
+}
+
 func (f *fakeZFS) CreateDataset(_ context.Context, name string, props map[string]string) error {
 	f.createdDS = append(f.createdDS, name)
 	f.lastDSProps = props
 	f.existing[name] = true
+	f.store(name, props)
 	return nil
 }
 
@@ -47,20 +63,38 @@ func (f *fakeZFS) CreateZvol(_ context.Context, name string, sizeBytes int64, pr
 	f.createdZvol[name] = sizeBytes
 	f.lastZvProps = props
 	f.existing[name] = true
+	f.store(name, props)
+	f.props[name]["volsize"] = strconv.FormatInt(sizeBytes, 10)
 	return nil
 }
 
 func (f *fakeZFS) Destroy(_ context.Context, name string, _ bool) error {
 	f.destroyed = append(f.destroyed, name)
 	delete(f.existing, name)
+	delete(f.props, name)
 	return nil
 }
 
-func (f *fakeZFS) Get(_ context.Context, name, _ string) (string, error) {
-	if f.existing[name] {
+func (f *fakeZFS) Get(_ context.Context, name, property string) (string, error) {
+	if !f.existing[name] {
+		return "", fmt.Errorf("%w: %s", zpool.ErrNotExist, name)
+	}
+	if property == "type" {
 		return "filesystem", nil
 	}
-	return "", fmt.Errorf("%w: %s", zpool.ErrNotExist, name)
+	if m := f.props[name]; m != nil {
+		return m[property], nil
+	}
+	return "", nil
+}
+
+func (f *fakeZFS) SetProperty(_ context.Context, name, property, value string) error {
+	if f.props[name] == nil {
+		f.props[name] = map[string]string{}
+	}
+	f.props[name][property] = value
+	f.setProps = append(f.setProps, name+" "+property+"="+value)
+	return nil
 }
 
 func (f *fakeZFS) List(context.Context, zpool.DatasetKind) ([]zpool.Dataset, error) {
@@ -238,6 +272,106 @@ func TestZfsVolumeReconcile_ZvolUsesSize(t *testing.T) {
 	if got.Status.Path != "/dev/zvol/tank/k8s/pvc-blk" {
 		t.Errorf("path = %q, want /dev/zvol/tank/k8s/pvc-blk", got.Status.Path)
 	}
+}
+
+func TestZfsVolumeReconcile_ExpandsFilesystemQuota(t *testing.T) {
+	scheme := newTestScheme(t)
+	small := resource.MustParse("1Gi")
+	vol := &storagev1alpha1.ZfsVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-fs", Finalizers: []string{zfsVolumeFinalizer}},
+		Spec: storagev1alpha1.ZfsVolumeSpec{
+			PoolGUID:   "999",
+			Dataset:    "k8s/pvc-fs",
+			Type:       storagev1alpha1.VolumeTypeFilesystem,
+			Filesystem: &storagev1alpha1.FilesystemConfig{Quota: &small},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol).
+		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		Build()
+
+	z := newFakeZFS()
+	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-fs"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile create: %v", err)
+	}
+
+	// Grow the quota and reconcile: the agent must apply refquota via SetProperty.
+	var cur storagev1alpha1.ZfsVolume
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-fs"}, &cur); err != nil {
+		t.Fatalf("get volume: %v", err)
+	}
+	large := resource.MustParse("5Gi")
+	cur.Spec.Filesystem.Quota = &large
+	if err := c.Update(context.Background(), &cur); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile expand: %v", err)
+	}
+
+	want := "tank/k8s/pvc-fs refquota=" + strconv.FormatInt(large.Value(), 10)
+	if !containsString(z.setProps, want) {
+		t.Fatalf("expected SetProperty %q, got %v", want, z.setProps)
+	}
+}
+
+func TestZfsVolumeReconcile_GrowsZvolVolsize(t *testing.T) {
+	scheme := newTestScheme(t)
+	small := resource.MustParse("1Gi")
+	vol := &storagev1alpha1.ZfsVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-blk", Finalizers: []string{zfsVolumeFinalizer}},
+		Spec: storagev1alpha1.ZfsVolumeSpec{
+			PoolGUID: "999",
+			Dataset:  "k8s/pvc-blk",
+			Type:     storagev1alpha1.VolumeTypeVolume,
+			Volume:   &storagev1alpha1.VolumeConfig{Size: small, Volblocksize: "16k"},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol).
+		WithStatusSubresource(&storagev1alpha1.ZfsVolume{}).
+		Build()
+
+	z := newFakeZFS()
+	r := &ZfsVolumeReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-blk"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile create: %v", err)
+	}
+
+	var cur storagev1alpha1.ZfsVolume
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-blk"}, &cur); err != nil {
+		t.Fatalf("get volume: %v", err)
+	}
+	large := resource.MustParse("4Gi")
+	cur.Spec.Volume.Size = large
+	if err := c.Update(context.Background(), &cur); err != nil {
+		t.Fatalf("update size: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile expand: %v", err)
+	}
+
+	want := "tank/k8s/pvc-blk volsize=" + strconv.FormatInt(large.Value(), 10)
+	if !containsString(z.setProps, want) {
+		t.Fatalf("expected SetProperty %q, got %v", want, z.setProps)
+	}
+}
+
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestZfsVolumeReconcile_IdempotentWhenExists(t *testing.T) {

@@ -47,6 +47,19 @@ func ControllerServiceCapability() *csi.PluginCapability {
 	}
 }
 
+// VolumeExpansionCapability advertises online volume expansion, enabling
+// external-resizer. Filesystem quotas grow live; zvol growth is applied online
+// and finished by NodeExpandVolume.
+func VolumeExpansionCapability() *csi.PluginCapability {
+	return &csi.PluginCapability{
+		Type: &csi.PluginCapability_VolumeExpansion_{
+			VolumeExpansion: &csi.PluginCapability_VolumeExpansion{
+				Type: csi.PluginCapability_VolumeExpansion_ONLINE,
+			},
+		},
+	}
+}
+
 // Probe reports readiness.
 func (s *IdentityServer) Probe(_ context.Context, _ *csi.ProbeRequest) (*csi.ProbeResponse, error) {
 	return &csi.ProbeResponse{Ready: wrapperspb.Bool(true)}, nil

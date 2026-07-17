@@ -51,6 +51,9 @@ type ZFS interface {
 	// Get returns a single ZFS property value. It wraps ErrNotExist when the
 	// object does not exist.
 	Get(ctx context.Context, name, property string) (string, error)
+	// SetProperty sets a single ZFS property on an existing object, e.g.
+	// refquota (filesystem) or volsize (zvol). It backs volume expansion.
+	SetProperty(ctx context.Context, name, property, value string) error
 	// List enumerates datasets/zvols of the given kind.
 	List(ctx context.Context, kind DatasetKind) ([]Dataset, error)
 }
@@ -135,6 +138,18 @@ func (z *CLI) Get(ctx context.Context, name, property string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// SetProperty sets a single ZFS property on an existing dataset/zvol.
+func (z *CLI) SetProperty(ctx context.Context, name, property, value string) error {
+	if name == "" {
+		return fmt.Errorf("dataset name is empty")
+	}
+	if property == "" {
+		return fmt.Errorf("property is empty")
+	}
+	_, err := z.run(ctx, "set", property+"="+value, name)
+	return err
 }
 
 // List enumerates datasets/zvols of the given kind.

@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -306,5 +307,124 @@ func TestDeleteVolume_IdempotentWhenAbsent(t *testing.T) {
 	cs := newController(newTestClient(t))
 	if _, err := cs.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "ghost"}); err != nil {
 		t.Fatalf("DeleteVolume on absent volume should succeed: %v", err)
+	}
+}
+
+// markReadyTrackingGen keeps a ZfsVolume Ready with ObservedGeneration synced to
+// its spec generation, simulating the agent across expansion (which bumps the
+// spec). Used by expansion tests where waitVolumeReady requires the generation.
+func markReadyTrackingGen(cl client.Client, name string) {
+	go func() {
+		for i := 0; i < 400; i++ {
+			vol := &storagev1alpha1.ZfsVolume{}
+			if err := cl.Get(context.Background(), client.ObjectKey{Name: name}, vol); err == nil {
+				if vol.Status.Phase != storagev1alpha1.VolumePhaseReady || vol.Status.ObservedGeneration != vol.Generation {
+					vol.Status.Phase = storagev1alpha1.VolumePhaseReady
+					vol.Status.Path = "/mnt/tank/" + vol.Spec.Dataset
+					vol.Status.ObservedGeneration = vol.Generation
+					_ = cl.Status().Update(context.Background(), vol)
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+}
+
+func TestControllerExpandVolume_Filesystem(t *testing.T) {
+	small := resource.MustParse("1Gi")
+	vol := &storagev1alpha1.ZfsVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-e1"},
+		Spec: storagev1alpha1.ZfsVolumeSpec{
+			PoolGUID:   "999",
+			Dataset:    "k8s/pvc-e1",
+			Type:       storagev1alpha1.VolumeTypeFilesystem,
+			Filesystem: &storagev1alpha1.FilesystemConfig{Quota: &small},
+		},
+	}
+	cl := newTestClient(t, vol)
+	cs := newController(cl)
+	markReadyTrackingGen(cl, "pvc-e1")
+
+	resp, err := cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "pvc-e1",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 5 << 30},
+	})
+	if err != nil {
+		t.Fatalf("ControllerExpandVolume: %v", err)
+	}
+	if resp.GetCapacityBytes() != 5<<30 {
+		t.Errorf("capacity = %d, want %d", resp.GetCapacityBytes(), int64(5<<30))
+	}
+	if resp.GetNodeExpansionRequired() {
+		t.Errorf("filesystem (NFS) expansion should not require node expansion")
+	}
+	got := &storagev1alpha1.ZfsVolume{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-e1"}, got); err != nil {
+		t.Fatalf("get volume: %v", err)
+	}
+	if got.Spec.Filesystem.Quota.Value() != int64(5<<30) {
+		t.Errorf("quota = %d, want %d", got.Spec.Filesystem.Quota.Value(), int64(5<<30))
+	}
+}
+
+func TestControllerExpandVolume_Zvol(t *testing.T) {
+	small := resource.MustParse("1Gi")
+	vol := &storagev1alpha1.ZfsVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-e2"},
+		Spec: storagev1alpha1.ZfsVolumeSpec{
+			PoolGUID: "999",
+			Dataset:  "k8s/pvc-e2",
+			Type:     storagev1alpha1.VolumeTypeVolume,
+			Volume:   &storagev1alpha1.VolumeConfig{Size: small},
+		},
+	}
+	cl := newTestClient(t, vol)
+	cs := newController(cl)
+	markReadyTrackingGen(cl, "pvc-e2")
+
+	resp, err := cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "pvc-e2",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 4 << 30},
+	})
+	if err != nil {
+		t.Fatalf("ControllerExpandVolume: %v", err)
+	}
+	if !resp.GetNodeExpansionRequired() {
+		t.Errorf("zvol (NVMe-oF) expansion must require node expansion")
+	}
+	got := &storagev1alpha1.ZfsVolume{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-e2"}, got); err != nil {
+		t.Fatalf("get volume: %v", err)
+	}
+	if got.Spec.Volume.Size.Value() != int64(4<<30) {
+		t.Errorf("size = %d, want %d", got.Spec.Volume.Size.Value(), int64(4<<30))
+	}
+}
+
+func TestControllerExpandVolume_NotFound(t *testing.T) {
+	cs := newController(newTestClient(t))
+	_, err := cs.ControllerExpandVolume(context.Background(), &csi.ControllerExpandVolumeRequest{
+		VolumeId:      "ghost",
+		CapacityRange: &csi.CapacityRange{RequiredBytes: 1 << 30},
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("err = %v, want NotFound", err)
+	}
+}
+
+func TestControllerGetCapabilities_Expand(t *testing.T) {
+	cs := newController(newTestClient(t))
+	resp, err := cs.ControllerGetCapabilities(context.Background(), &csi.ControllerGetCapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("ControllerGetCapabilities: %v", err)
+	}
+	found := false
+	for _, c := range resp.GetCapabilities() {
+		if c.GetRpc().GetType() == csi.ControllerServiceCapability_RPC_EXPAND_VOLUME {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("EXPAND_VOLUME capability not advertised")
 	}
 }

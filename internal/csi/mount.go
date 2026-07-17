@@ -40,6 +40,15 @@ type NodeMounter interface {
 	NVMeConnect(ctx context.Context, transport, addr, port, nqn string) (string, error)
 	// NVMeDisconnect disconnects the NVMe-oF subsystem, ignoring absence.
 	NVMeDisconnect(ctx context.Context, nqn string) error
+	// NVMeDevice returns the current block device path for a connected NQN, or
+	// "" when the subsystem is not connected.
+	NVMeDevice(ctx context.Context, nqn string) (string, error)
+	// RescanNVMe asks the kernel to re-read a namespace's size after the backing
+	// zvol has been grown, so the block device reflects the new capacity.
+	RescanNVMe(ctx context.Context, device string) error
+	// ResizeFS grows the filesystem on device (mounted at volumePath) to fill the
+	// device. It is a no-op when the device carries no filesystem (raw block).
+	ResizeFS(device, volumePath string) error
 }
 
 // hostMounter is the real NodeMounter. It shells out to mount(8), nvme(1) and
@@ -185,6 +194,43 @@ func (m *hostMounter) NVMeDisconnect(ctx context.Context, nqn string) error {
 		return nil
 	}
 	return err
+}
+
+// NVMeDevice exposes the connected device lookup for node-side expansion.
+func (m *hostMounter) NVMeDevice(ctx context.Context, nqn string) (string, error) {
+	return m.nvmeDevice(ctx, nqn)
+}
+
+// RescanNVMe re-reads the namespace size after a zvol grow. `nvme ns-rescan`
+// accepts the namespace block device and rescans its controller.
+func (m *hostMounter) RescanNVMe(ctx context.Context, device string) error {
+	if device == "" {
+		return fmt.Errorf("device is empty")
+	}
+	_, err := m.run(ctx, "nvme", "ns-rescan", device)
+	return err
+}
+
+// ResizeFS grows the filesystem on device to fill it. ext* is grown by device
+// (resize2fs), xfs by mountpoint (xfs_growfs); an unformatted device is a no-op.
+func (m *hostMounter) ResizeFS(device, volumePath string) error {
+	fsType, err := m.detectFS(device)
+	if err != nil {
+		return err
+	}
+	switch {
+	case fsType == "":
+		return nil
+	case strings.HasPrefix(fsType, "ext"):
+		_, err := m.run(context.Background(), "resize2fs", device)
+		return err
+	case fsType == "xfs":
+		_, err := m.run(context.Background(), "xfs_growfs", volumePath)
+		return err
+	default:
+		_, err := m.run(context.Background(), "resize2fs", device)
+		return err
+	}
 }
 
 // detectFS returns the filesystem type on device, or "" if the device is

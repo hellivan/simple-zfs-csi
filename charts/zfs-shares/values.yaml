@@ -210,6 +210,19 @@ csiController:
     extraArgs: []
     # -- Resource requests/limits for the sidecar.
     resources: {}
+  # external-resizer sidecar (volume expansion). Set StorageClass
+  # `allowVolumeExpansion: true` to let PVCs grow.
+  resizer:
+    # -- Deploy the external-resizer sidecar (enables volume expansion).
+    enabled: true
+    # -- external-resizer image repository.
+    image: registry.k8s.io/sig-storage/csi-resizer
+    # -- external-resizer image tag.
+    tag: v1.13.1
+    # -- Extra args for external-resizer.
+    extraArgs: []
+    # -- Resource requests/limits for the sidecar.
+    resources: {}
   # -- Extra CLI args for the csi-controller binary.
   extraArgs: []
   # -- Resource requests/limits for the plugin container.

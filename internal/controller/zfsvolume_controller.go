@@ -133,6 +133,14 @@ func (r *ZfsVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		logger.Info("created ZFS object", "dataset", full, "type", vol.Spec.Type)
 	}
 
+	// Converge the on-disk size toward the spec (volume expansion). The CSI
+	// controller bumps spec.filesystem.quota / spec.volume.size; the agent applies
+	// it here on the next reconcile.
+	if err := r.ensureSize(ctx, &vol, full); err != nil {
+		return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.VolumePhaseError, "",
+			"ResizeFailed", err.Error())
+	}
+
 	volPath, err := deriveVolumePath(vol.Spec.Type, pool.Status.BaseMountPath, pool.Status.PoolName, vol.Spec.Dataset)
 	if err != nil {
 		return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.VolumePhaseError, "",
@@ -163,6 +171,93 @@ func (r *ZfsVolumeReconciler) create(ctx context.Context, vol *storagev1alpha1.Z
 	default:
 		return fmt.Errorf("unknown volume type %q", vol.Spec.Type)
 	}
+}
+
+// ensureSize converges the on-disk size of an existing object toward the spec:
+// filesystem refquota (up or down) and zvol volsize (grow only, never shrink).
+// This is what makes volume expansion work end to end.
+func (r *ZfsVolumeReconciler) ensureSize(ctx context.Context, vol *storagev1alpha1.ZfsVolume, full string) error {
+	switch vol.Spec.Type {
+	case storagev1alpha1.VolumeTypeFilesystem:
+		desired := "none"
+		if cfg := vol.Spec.Filesystem; cfg != nil && cfg.Quota != nil && !cfg.Quota.IsZero() {
+			desired = strconv.FormatInt(cfg.Quota.Value(), 10)
+		}
+		current, err := r.ZFS.Get(ctx, full, "refquota")
+		if err != nil {
+			return err
+		}
+		if !refquotaEqual(current, desired) {
+			return r.ZFS.SetProperty(ctx, full, "refquota", desired)
+		}
+		return nil
+	case storagev1alpha1.VolumeTypeVolume:
+		if vol.Spec.Volume == nil {
+			return nil
+		}
+		desired := alignUp(vol.Spec.Volume.Size.Value(), volblockBytes(vol.Spec.Volume.Volblocksize))
+		current, err := r.ZFS.Get(ctx, full, "volsize")
+		if err != nil {
+			return err
+		}
+		cur, _ := strconv.ParseInt(strings.TrimSpace(current), 10, 64)
+		if desired > cur {
+			return r.ZFS.SetProperty(ctx, full, "volsize", strconv.FormatInt(desired, 10))
+		}
+		return nil
+	}
+	return nil
+}
+
+// refquotaEqual compares a ZFS refquota value against a desired one, treating the
+// several "unlimited" spellings ("", "-", "0", "none") as equivalent.
+func refquotaEqual(current, desired string) bool {
+	norm := func(s string) string {
+		s = strings.TrimSpace(s)
+		if s == "" || s == "-" || s == "0" || s == "none" {
+			return "none"
+		}
+		return s
+	}
+	return norm(current) == norm(desired)
+}
+
+// alignUp rounds size up to the next multiple of block (ZFS requires zvol volsize
+// to be a multiple of volblocksize). A non-positive block leaves size unchanged.
+func alignUp(size, block int64) int64 {
+	if block <= 0 || size <= 0 {
+		if size < 0 {
+			return 0
+		}
+		return size
+	}
+	if r := size % block; r != 0 {
+		return size + (block - r)
+	}
+	return size
+}
+
+// volblockBytes parses a ZFS volblocksize string (e.g. "16k", "8192") into bytes,
+// defaulting to 16 KiB (the modern OpenZFS zvol default) when empty/unparseable.
+func volblockBytes(s string) int64 {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return 16384
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 'k':
+		mult, s = 1024, s[:len(s)-1]
+	case 'm':
+		mult, s = 1024*1024, s[:len(s)-1]
+	case 'g':
+		mult, s = 1024*1024*1024, s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n <= 0 {
+		return 16384
+	}
+	return n * mult
 }
 
 // filesystemProps renders the ZFS properties for a filesystem dataset: the user

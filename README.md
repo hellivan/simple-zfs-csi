@@ -1,22 +1,63 @@
 # zfs-shares
 
-Cloud-native network sharing of pre-provisioned ZFS storage on Talos Linux
-(no SSH, no systemd-in-a-pod). A generic, cluster-scoped CRD, `NetworkExport`, expresses
-the intent to export a node-local path from a specific storage node. Two lightweight,
-per-node controllers turn that intent into live exports:
+Cloud-native, dynamically-provisioned ZFS storage for Kubernetes on Talos Linux
+(no SSH, no systemd-in-a-pod). A PersistentVolumeClaim becomes a ZFS dataset or
+zvol, exported over NFS or NVMe-oF and mounted into a pod — driven entirely by
+cluster-scoped CRDs, with the physical pool addressed by its **immutable GUID**
+so shares survive node takeover, renames and IP changes.
 
-| Controller | Image | Reconciles | Mechanism |
-|------------|-------|------------|-----------|
-| `nfs-controller` | `zfs-shares-nfs` | `protocol: nfs` exports | writes `/etc/exports`, runs `exportfs -ra`, supervises the in-container NFS server |
-| `nvmeof-controller` | `zfs-shares-nvmeof` | `protocol: nvmeof` exports | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
-| `zpool-discovery` | `zfs-shares-discovery` | local ZFS pools (Tier 1) | polls `zpool`/`zfs`, publishes each pool's identity, routing and health into `ZfsPool` objects |
-| `operator` | `zfs-shares-operator` | core `Node` objects (Tier 2) | cluster-wide control plane: detects node death and forces stale `ZfsPool` status to `NODE_OFFLINE` |
+The system is layered: a thin CSI adapter records *intent* as CRDs, per-node
+agents realise ZFS *allocation*, a cluster-wide operator compiles *shares* into
+node-pinned *exports*, and per-node aggregators execute those exports.
 
-Storage *allocation* (creating datasets/zvols, quotas, snapshots) is intentionally
-**out of scope** here — that is owned by the CSI/storage plane. `NetworkExport` carries
-no sizing parameters; it is strictly an "intent to share" over the network.
+| Component | Image | Kind | Reconciles | Mechanism |
+|-----------|-------|------|------------|-----------|
+| `csi-controller` | `zfs-shares-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` | thin gRPC adapter: writes `ZfsVolume` (+ `ZfsShare`), returns a routing-only volume context |
+| `csi-node` | `zfs-shares-csi-node` | DaemonSet (all nodes) | CSI `NodePublishVolume` | resolves `ZfsPool.status`, `mount -t nfs` / `nvme connect`; refuses `NODE_OFFLINE` |
+| `zpool-discovery` (agent) | `zfs-shares-discovery` | DaemonSet (storage nodes) | local pools (Tier 1) + `ZfsVolume` | polls `zpool`/`zfs` into `ZfsPool`; `zfs create/destroy` for datasets/zvols |
+| `operator` | `zfs-shares-operator` | Deployment (x1, leader-elected) | `Node` (Tier 2) + `ZfsShare` | forces dead nodes' `ZfsPool` to `NODE_OFFLINE`; compiles `ZfsShare` → `NetworkExport` |
+| `nfs-controller` | `zfs-shares-nfs` | DaemonSet (storage nodes) | `protocol: nfs` `NetworkExport` | writes `/etc/exports`, runs `exportfs -ra`, supervises the NFS server |
+| `nvmeof-controller` | `zfs-shares-nvmeof` | DaemonSet (storage nodes) | `protocol: nvmeof` `NetworkExport` | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
+
+The four CRDs form a compile-down chain — a PVC turns into a `ZfsVolume` +
+`ZfsShare`, and the `ZfsShare` renders a `NetworkExport`:
+
+| CRD | Scope | Keyed on | Written by | Purpose |
+|-----|-------|----------|------------|---------|
+| `ZfsPool` | Cluster | pool GUID (`metadata.name`) | discovery + operator | routing + health of a physical pool |
+| `ZfsVolume` | Cluster | `spec.poolGUID` | csi-controller (creates), agent (reconciles) | dataset/zvol allocation intent |
+| `ZfsShare` | Cluster | `spec.poolGUID` + `spec.dataset` | csi-controller (creates), operator (reconciles) | ZFS-centric "intent to share"; renders a `NetworkExport` |
+| `NetworkExport` | Cluster | `spec.nodeName` + `spec.path` | operator (owns) or admin (standalone) | generic, ZFS-agnostic node-local export executor contract |
+
+Key rule: **`ZfsShare` compiles down to `NetworkExport`.** Only `NetworkExport`
+controllers touch `/etc/exports` / nvmet `configfs` — exactly one aggregator per
+node per protocol. `NetworkExport` itself carries no ZFS or sizing parameters, so
+it can still be authored by hand for non-ZFS paths.
 
 ## Architecture
+
+### Provisioning flow (PVC → mounted pod)
+
+```
+kubelet ──► csi-controller ──► ZfsVolume  ──► agent: zfs create dataset/zvol
+(CreateVolume)   (writes CRDs)  └► ZfsShare ──► operator ──► NetworkExport
+                                                                   │
+                                              ┌────────────────────┴───────────┐
+                                              ▼                                ▼
+                                       nfs-controller                   nvmeof-controller
+                                       (/etc/exports)                   (nvmet configfs)
+
+kubelet ──► csi-node (NodePublishVolume) ──► reads ZfsPool.status (currentIP, baseMountPath)
+                                              └► mount -t nfs  /  nvme connect + mount
+```
+
+The CSI plane is deliberately **thin**: `csi-controller` performs no ZFS work —
+it only records intent as `ZfsVolume` + `ZfsShare` and returns a routing-only
+volume context (`poolGUID`, `dataset`, `protocol`). All ZFS allocation happens in
+the per-node agent; all export execution happens in the `NetworkExport`
+aggregators; `csi-node` only resolves the live `ZfsPool.status` and mounts.
+
+### Export execution
 
 ```
 [ NetworkExport CRD (etcd = source of truth) ]
@@ -31,7 +72,7 @@ no sizing parameters; it is strictly an "intent to share" over the network.
  /etc/exports + exportfs        configfs /sys/kernel/config/nvmet
 ```
 
-Each controller:
+Each `NetworkExport` controller:
 
 - Acts **only** on shares whose `spec.nodeName` matches its own `$NODE_NAME`
   (injected via the downward API) and whose `spec.protocol` matches.
@@ -133,12 +174,93 @@ A CSI node plugin resolves the real mount at attach time by reading
 logical dataset name — so node deaths, IP changes, pool renames and mountpoint
 shifts never require editing a PersistentVolume.
 
+## Dynamic provisioning (CSI)
+
+The CSI driver (`zfs-shares.io`) turns a PVC into a ZFS dataset (NFS) or zvol
+(NVMe-oF). Provisioning is driven by **StorageClass parameters**, merged in three
+flat layers (later wins):
+
+```
+chart defaultParameters  <  StorageClass.parameters  <  PVC annotations
+                                                        (param.zfs-shares.io/<key>)
+```
+
+| Parameter | Where | Meaning |
+|-----------|-------|---------|
+| `poolGUID` | **StorageClass only** | target `ZfsPool` GUID; no default — required per class |
+| `datasetPrefix` | **StorageClass only** | dataset namespace prepended to the volume name |
+| `protocol` | any layer | `nfs` (→ filesystem) or `nvmeof` (→ zvol) |
+| `volblocksize` | any layer | zvol block size (NVMe-oF only) |
+| `nfsClients` / `nfsOptions` | any layer | NFS export allow-list + options |
+| `nvmeofAllowedHosts` | any layer | NVMe-oF host NQN allow-list |
+| `property.<name>` | any layer | passed through as a ZFS `-o` property |
+
+`poolGUID` and `datasetPrefix` are **StorageClass-only** on purpose (ADR-0002):
+they define tenancy/placement, so a PVC author cannot redirect a claim to another
+pool or dataset namespace via annotations — those keys are stripped from the
+`defaultParameters` and PVC-annotation layers.
+
+`protocol` also fixes the ZFS object type (`nfs` → filesystem, `nvmeof` →
+zvol); `volumeMode` (`Filesystem` vs `Block`) is orthogonal and resolved at the
+node. The only rejected combination is `Block` + `nfs`.
+
+StorageClasses are declared in the chart under `storageClasses:` (Ceph-style —
+none are created by default):
+
+```yaml
+# values.yaml
+storageClasses:
+  nfs:
+    reclaimPolicy: Delete
+    volumeBindingMode: Immediate
+    allowVolumeExpansion: true
+    parameters:
+      poolGUID: "12140134988506841113"   # required
+      datasetPrefix: k8s/nfs
+      protocol: nfs
+  nvmeof:
+    parameters:
+      poolGUID: "12140134988506841113"
+      datasetPrefix: k8s/block
+      protocol: nvmeof
+      volblocksize: "16k"
+```
+
+```yaml
+# A PVC that overrides the NFS options for just this claim:
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: media-movies
+  annotations:
+    param.zfs-shares.io/nfsOptions: "rw,sync,no_root_squash"
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: zfs-shares-nfs
+  resources:
+    requests:
+      storage: 100Gi
+```
+
+### Volume expansion
+
+Set `allowVolumeExpansion: true` on the StorageClass and grow a PVC by editing its
+`spec.resources.requests.storage`. The `external-resizer` sidecar
+(`csiController.resizer`, on by default) drives it:
+
+- **NFS (filesystem):** the agent raises the dataset's `refquota` — effective
+  immediately, no node action.
+- **NVMe-oF (zvol):** the agent grows `volsize`, then the node rescans the NVMe
+  namespace and grows the on-device filesystem (`resize2fs`/`xfs_growfs`).
+
+Shrinking is not supported for zvols (and Kubernetes forbids PVC shrink).
+
 ## Build
 
 ```sh
-make build          # compile both binaries
+make build          # compile all binaries
 make vet            # static checks
-make docker         # build both container images
+make docker         # build all container images
 make manifests      # regenerate deepcopy + CRD/RBAC from Go types (needs network)
 make helm-lint      # lint the chart
 make helm-template  # render the chart
@@ -146,10 +268,10 @@ make helm-template  # render the chart
 
 ## Deploy
 
-The chart and both images are published to GHCR by the release pipeline:
+The chart and all images are published to GHCR by the release pipeline:
 
 - `oci://ghcr.io/hellivan/charts/zfs-shares` (chart)
-- `ghcr.io/hellivan/zfs-shares-nfs` / `ghcr.io/hellivan/zfs-shares-nvmeof` (images)
+- `ghcr.io/hellivan/zfs-shares-{csi-controller,csi-node,discovery,operator,nfs,nvmeof}` (images)
 
 ```sh
 # Label your storage node(s) first:
@@ -172,19 +294,26 @@ Common values (see [charts/zfs-shares/values.yaml](charts/zfs-shares/values.yaml
 
 | Value | Default | Purpose |
 |-------|---------|---------|
-| `nfs.enabled` / `nvmeof.enabled` | `true` | toggle each controller |
+| `driverName` | `zfs-shares.io` | CSI driver / StorageClass provisioner name |
+| `storageClasses` | `{}` | map of StorageClasses to create (see above; none by default) |
+| `csiController.enabled` | `true` | provisioner Deployment (+ external-provisioner sidecar) |
+| `csiController.defaultParameters` | `{}` | lowest-priority parameter layer (`poolGUID`/`datasetPrefix` ignored here) |
+| `csiNode.enabled` | `true` | node-publish DaemonSet (+ node-driver-registrar sidecar) |
+| `csiNode.hostExec.*` | `chroot` | how the node plugin runs `nvme`/`mount` against the host |
+| `nfs.enabled` / `nvmeof.enabled` | `true` | toggle each export controller |
 | `nfs.pool.hostPath` / `mountPath` | `/tank` | ZFS pool root visible to the NFS pod |
 | `nfs.v4Only` | `false` | NFSv4-only mode (drops rpcbind) |
 | `nvmeof.transport.serviceId` | `"4420"` | NVMe/TCP port |
 | `nvmeof.nqnPrefix` | `nqn.2025-01.io.zfs-shares` | derived subsystem NQN prefix |
-| `nodeSelector` | `zfs-shares.io/storage: "true"` | where the DaemonSets run |
+| `nodeSelector` | `zfs-shares.io/storage: "true"` | where the storage-node DaemonSets run |
 | `image.tag` | chart `appVersion` | image tag override |
 
 ### CRD management & upgrades
 
-The `NetworkExport` CRD is generated from the Go types (`make manifests`) and shipped
-in the chart's Helm-native [charts/zfs-shares/crds](charts/zfs-shares/crds)
-directory. Helm treats `crds/` specially:
+The four CRDs (`ZfsPool`, `ZfsVolume`, `ZfsShare`, `NetworkExport`) are generated
+from the Go types (`make manifests`) and shipped in the chart's Helm-native
+[charts/zfs-shares/crds](charts/zfs-shares/crds) directory. Helm treats `crds/`
+specially:
 
 - **Install:** `helm install` applies the CRD automatically. Skip it (e.g. when
   CRDs are managed separately) with `helm install --skip-crds`.
@@ -206,17 +335,23 @@ directory. Helm treats `crds/` specially:
 
   `kubectl apply` on a CRD is additive and safe for the schema changes this
   project makes (adding fields/validations). Never `kubectl delete` the CRD to
-  "refresh" it — that cascade-deletes every `NetworkExport` object.
-- **Uninstall:** Helm does not remove `crds/` CRDs, so the CRD and any `NetworkExport`
+  "refresh" it — that cascade-deletes every object of that kind.
+- **Uninstall:** Helm does not remove `crds/` CRDs, so the CRDs and any custom
   objects are retained by design.
 
 ### Host prerequisites (Talos system extensions)
 
-- **NFS:** `nfsd` + `sunrpc` kernel modules available on the host.
-- **NVMe-oF:** `nvmet` + `nvmet-tcp` kernel modules loaded; `configfs` mounted at
-  `/sys/kernel/config`.
-- Both DaemonSets run `privileged` with `hostNetwork` so exports are reachable on
-  the node IP (NFS `2049/111/20048`, NVMe/TCP `4420` by default).
+- **Storage nodes (exports):**
+  - **NFS:** `nfsd` + `sunrpc` kernel modules available on the host.
+  - **NVMe-oF:** `nvmet` + `nvmet-tcp` kernel modules loaded; `configfs` mounted
+    at `/sys/kernel/config`.
+  - The export DaemonSets run `privileged` with `hostNetwork` so exports are
+    reachable on the node IP (NFS `2049/111/20048`, NVMe/TCP `4420` by default).
+- **All nodes (csi-node client mounts):**
+  - **NFS client:** `nfs`/`nfsd` client support to `mount -t nfs`.
+  - **NVMe-oF initiator:** `nvme_tcp` (+ `nvme_fabrics`) modules loaded; the
+    plugin shells `nvme connect`/`nvme disconnect` against the host via
+    `csiNode.hostExec` (`chroot /host` by default).
 
 ## CI/CD
 
@@ -224,9 +359,9 @@ Two GitHub Actions workflows:
 
 - [.github/workflows/ci.yaml](.github/workflows/ci.yaml) — on push/PR to `main`:
   `gofmt`/`go vet`/`build`/`test`, `helm lint` + `helm template`, and a no-push
-  Docker build of both images.
+  Docker build of all images.
 - [.github/workflows/release.yaml](.github/workflows/release.yaml) — on a
-  `v*.*.*` tag (or manual dispatch): builds and pushes both multi-arch
+  `v*.*.*` tag (or manual dispatch): builds and pushes the multi-arch
   (`amd64`+`arm64`) images to GHCR via Buildx, then packages the Helm chart with
   the tag version and `helm push`es it as an OCI artifact. Uses the built-in
   `GITHUB_TOKEN` (`packages: write`) — no extra secrets required.
@@ -244,14 +379,20 @@ version at package time, so `helm install --version 0.1.0` pulls the matching
 ## Repository layout
 
 ```
-api/v1alpha1/            NetworkExport types + generated deepcopy
-cmd/nfs-controller/      NFS controller entrypoint
-cmd/nvmeof-controller/   NVMe-oF controller entrypoint
-internal/controller/     reconcilers (nfs, nvmeof) + shared helpers
+api/v1alpha1/            CRD types (ZfsPool, ZfsVolume, ZfsShare, NetworkExport) + deepcopy
+cmd/csi-controller/      CSI controller (provisioner) entrypoint
+cmd/csi-node/            CSI node plugin entrypoint
+cmd/nfs-controller/      NFS export controller entrypoint
+cmd/nvmeof-controller/   NVMe-oF export controller entrypoint
+cmd/operator/            cluster operator (node health + ZfsShare) entrypoint
+cmd/zpool-discovery/     per-node agent (ZfsPool discovery + ZfsVolume) entrypoint
+internal/csi/            CSI identity/controller/node servers + params + mount backend
+internal/controller/     reconcilers (nfs, nvmeof, zfsshare, zfsvolume, discovery) + helpers
 internal/nfsserver/      /etc/exports rendering + NFS daemon supervisor
 internal/nvmet/          nvmet configfs backend
-config/samples/          example NetworkExport objects
-charts/zfs-shares/       Helm chart (canonical deploy path; CRD lives here)
+internal/zpool/          zpool/zfs CLI wrappers + host-exec
+config/samples/          example CRD objects
+charts/zfs-shares/       Helm chart (canonical deploy path; CRDs live here)
 build/                   Dockerfiles (multi-arch)
 .github/workflows/       CI + release pipelines
 ```

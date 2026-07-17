@@ -69,9 +69,12 @@ func main() {
 	}
 
 	ids := &zfscsi.IdentityServer{
-		DriverName:   driverName,
-		Version:      version,
-		Capabilities: []*csi.PluginCapability{zfscsi.ControllerServiceCapability()},
+		DriverName: driverName,
+		Version:    version,
+		Capabilities: []*csi.PluginCapability{
+			zfscsi.ControllerServiceCapability(),
+			zfscsi.VolumeExpansionCapability(),
+		},
 	}
 	cs := &zfscsi.ControllerServer{
 		Client:           cl,

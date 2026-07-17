@@ -46,10 +46,15 @@ func (n *NodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (
 	return &csi.NodeGetInfoResponse{NodeId: n.NodeID}, nil
 }
 
-// NodeGetCapabilities advertises no optional capabilities: the plugin publishes
+// NodeGetCapabilities advertises EXPAND_VOLUME: the plugin can finish an online
+// zvol expansion by growing the on-device filesystem. It still publishes
 // directly in NodePublishVolume without a separate stage step.
 func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	return &csi.NodeGetCapabilitiesResponse{}, nil
+	return &csi.NodeGetCapabilitiesResponse{
+		Capabilities: []*csi.NodeServiceCapability{
+			nodeRPCCapability(csi.NodeServiceCapability_RPC_EXPAND_VOLUME),
+		},
+	}, nil
 }
 
 // NodePublishVolume mounts the volume at the target path.
@@ -142,6 +147,49 @@ func (n *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 
 	n.Log.Info("unpublished volume", "volume", volumeID, "target", targetPath)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+// NodeExpandVolume finishes an online expansion on the node. For NVMe-oF zvols it
+// rescans the namespace (so the block device reflects the grown zvol) and grows
+// the on-device filesystem. NFS volumes and raw-block volumes need no node work.
+func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+
+	// Only NVMe-oF (zvol) volumes have a node-local device to grow. Absence of a
+	// NetworkExport NQN means this is an NFS volume: nothing to do here.
+	nqn := n.exportNQN(ctx, volumeID)
+	if nqn == "" {
+		return &csi.NodeExpandVolumeResponse{}, nil
+	}
+
+	device, err := n.Mounter.NVMeDevice(ctx, nqn)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "locate nvme device for %q: %v", volumeID, err)
+	}
+	if device == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "nvme device for volume %q is not connected", volumeID)
+	}
+	if err := n.Mounter.RescanNVMe(ctx, device); err != nil {
+		return nil, status.Errorf(codes.Internal, "rescan nvme device %q: %v", device, err)
+	}
+
+	// Raw block volumes have no filesystem to grow; the rescan is sufficient.
+	if req.GetVolumeCapability().GetBlock() != nil {
+		return &csi.NodeExpandVolumeResponse{}, nil
+	}
+	if err := n.Mounter.ResizeFS(device, volumePath); err != nil {
+		return nil, status.Errorf(codes.Internal, "resize filesystem on %q: %v", device, err)
+	}
+
+	n.Log.Info("expanded volume on node", "volume", volumeID, "device", device, "path", volumePath)
+	return &csi.NodeExpandVolumeResponse{}, nil
 }
 
 // resolvePool loads the ZfsPool for a GUID and validates it is reachable.
@@ -250,4 +298,13 @@ func mountOptions(flags []string, readOnly bool) []string {
 		opts = append(opts, "ro")
 	}
 	return opts
+}
+
+// nodeRPCCapability wraps a node service RPC type as a NodeServiceCapability.
+func nodeRPCCapability(t csi.NodeServiceCapability_RPC_Type) *csi.NodeServiceCapability {
+	return &csi.NodeServiceCapability{
+		Type: &csi.NodeServiceCapability_Rpc{
+			Rpc: &csi.NodeServiceCapability_RPC{Type: t},
+		},
+	}
 }

@@ -25,6 +25,8 @@ type fakeMounter struct {
 	connectDev   string
 	disconnected []string
 	removed      []string
+	rescanned    []string
+	resized      map[string]string // device -> volumePath
 }
 
 func newFakeMounter() *fakeMounter {
@@ -33,6 +35,7 @@ func newFakeMounter() *fakeMounter {
 		nfsMounts:   map[string]string{},
 		fsMounts:    map[string]string{},
 		blockMounts: map[string]string{},
+		resized:     map[string]string{},
 		connectDev:  "/dev/nvme1n1",
 	}
 }
@@ -69,6 +72,20 @@ func (f *fakeMounter) NVMeConnect(_ context.Context, _, _, _, nqn string) (strin
 }
 func (f *fakeMounter) NVMeDisconnect(_ context.Context, nqn string) error {
 	f.disconnected = append(f.disconnected, nqn)
+	return nil
+}
+func (f *fakeMounter) NVMeDevice(_ context.Context, nqn string) (string, error) {
+	if f.connectedNQN == nqn {
+		return f.connectDev, nil
+	}
+	return "", nil
+}
+func (f *fakeMounter) RescanNVMe(_ context.Context, device string) error {
+	f.rescanned = append(f.rescanned, device)
+	return nil
+}
+func (f *fakeMounter) ResizeFS(device, volumePath string) error {
+	f.resized[device] = volumePath
 	return nil
 }
 
@@ -281,5 +298,85 @@ func TestNodeGetInfo(t *testing.T) {
 	}
 	if resp.GetNodeId() != "node-a" {
 		t.Errorf("nodeId = %q, want node-a", resp.GetNodeId())
+	}
+}
+
+func TestNodeExpand_NVMeoFFilesystem(t *testing.T) {
+	m := newFakeMounter()
+	m.connectedNQN = "nqn.exp" // already connected from an earlier publish
+	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-e"}}
+	export.Status.NQN = "nqn.exp"
+	ns := newNodeServer(t, m, export)
+
+	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:         "pvc-e",
+		VolumePath:       "/target/fs",
+		VolumeCapability: mountCap(),
+	})
+	if err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+	if len(m.rescanned) != 1 || m.rescanned[0] != "/dev/nvme1n1" {
+		t.Errorf("rescanned = %v, want [/dev/nvme1n1]", m.rescanned)
+	}
+	if m.resized["/dev/nvme1n1"] != "/target/fs" {
+		t.Errorf("resized = %v, want /dev/nvme1n1 -> /target/fs", m.resized)
+	}
+}
+
+func TestNodeExpand_NVMeoFBlockSkipsResize(t *testing.T) {
+	m := newFakeMounter()
+	m.connectedNQN = "nqn.exp"
+	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-e"}}
+	export.Status.NQN = "nqn.exp"
+	ns := newNodeServer(t, m, export)
+
+	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:         "pvc-e",
+		VolumePath:       "/target/block",
+		VolumeCapability: blockCap(),
+	})
+	if err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+	if len(m.rescanned) != 1 {
+		t.Errorf("expected one rescan, got %v", m.rescanned)
+	}
+	if len(m.resized) != 0 {
+		t.Errorf("block volume should not be resized, got %v", m.resized)
+	}
+}
+
+func TestNodeExpand_NFSNoop(t *testing.T) {
+	m := newFakeMounter()
+	// No NetworkExport -> NFS volume; nothing to grow on the node.
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"))
+
+	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:   "pvc-nfs",
+		VolumePath: "/target/fs",
+	})
+	if err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+	if len(m.rescanned) != 0 || len(m.resized) != 0 {
+		t.Errorf("nfs expand should be a no-op, rescanned=%v resized=%v", m.rescanned, m.resized)
+	}
+}
+
+func TestNodeGetCapabilities_Expand(t *testing.T) {
+	ns := newNodeServer(t, newFakeMounter())
+	resp, err := ns.NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("NodeGetCapabilities: %v", err)
+	}
+	found := false
+	for _, c := range resp.GetCapabilities() {
+		if c.GetRpc().GetType() == csi.NodeServiceCapability_RPC_EXPAND_VOLUME {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("EXPAND_VOLUME capability not advertised")
 	}
 }
