@@ -8,6 +8,56 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0002 — `poolGUID` and `datasetPrefix` are StorageClass-only
+
+**Status:** Accepted (2026-07-17) · **Scope:** Step 6 (`cmd/csi-controller`), Helm chart
+
+### Context
+
+ADR-0001 defined a three-layer parameter inheritance chain (provisioner defaults
+< StorageClass parameters < PVC annotations). Two of those keys select *where*
+data lands: `poolGUID` picks the physical ZFS pool, and `datasetPrefix` scopes
+the dataset namespace within it. If either could be set from the defaults layer
+or, worse, from a PVC annotation, then:
+
+- a cluster-wide default could silently route volumes to the wrong pool; and
+- a namespace tenant authoring a PVC could redirect provisioning onto another
+  pool or escape its dataset prefix — a tenancy/isolation hole.
+
+### Decisions
+
+1. **`poolGUID` and `datasetPrefix` are StorageClass-only.** They are honoured
+   *only* from `CreateVolumeRequest.Parameters` (the StorageClass layer). If they
+   appear in the provisioner-defaults layer or in the PVC-annotation layer they
+   are dropped during resolution. Implemented as `storageClassOnlyParams` in
+   [internal/csi/params.go](../internal/csi/params.go); other keys (`protocol`,
+   `volblocksize`, `nfsClients`, `nvmeofAllowedHosts`, `property.*`) keep the full
+   inheritance chain.
+
+2. **No default `poolGUID`.** There is no cluster-wide default pool. Every
+   StorageClass must name its pool explicitly; `poolGUID` remains required, so a
+   StorageClass that omits it fails `CreateVolume` with `InvalidArgument`. The
+   Helm `csiController.defaultParameters` value therefore must not carry
+   `poolGUID`/`datasetPrefix` (documented inline in `values.yaml`).
+
+3. **StorageClasses are declared in the Helm chart.** `values.yaml` exposes a
+   `storageClasses` map (empty by default — the chart installs none), rendered by
+   `templates/storageclasses.yaml`, mirroring the Ceph CSI chart. Each entry sets
+   its own `parameters` (including the required `poolGUID` and optional
+   `datasetPrefix`), `reclaimPolicy`, `volumeBindingMode`, etc.
+
+### Consequences
+
+- Pool routing and dataset scoping are fixed by cluster administrators at
+  StorageClass-authoring time and cannot be overridden by PVC authors.
+- `defaultParameters` stays useful for genuinely global, safe defaults
+  (`protocol`, ZFS `property.*`), not placement.
+- Tests cover the restriction: `TestResolveParameters_StorageClassOnly` and the
+  updated `TestCreateVolume_PVCAnnotationsOverride` assert the SC-only keys ignore
+  the defaults/annotation layers while non-restricted keys still inherit.
+
+---
+
 ## ADR-0001 — CSI controller: provisioning model, protocol/type/volumeMode axes, parameter inheritance
 
 **Status:** Accepted (2026-07-16) · **Scope:** Step 6 (`cmd/csi-controller`)
@@ -79,13 +129,14 @@ parse into the CRD specs. Deliberately simpler than democratic-csi templating.
    overlays annotations prefixed `param.zfs-shares.io/<key>`.
 
 Resolved keys (all optional except `poolGUID` and `protocol`, which must resolve
-from some layer):
+from some layer). `poolGUID` and `datasetPrefix` are **StorageClass-only** — see
+[ADR-0002](#adr-0002--poolguid-and-datasetprefix-are-storageclass-only):
 
 | Key | Applies to | Notes |
 |-----|-----------|-------|
-| `poolGUID` | ZfsVolume/ZfsShare | required; fixed per StorageClass |
+| `poolGUID` | ZfsVolume/ZfsShare | required; **StorageClass-only**; fixed per StorageClass |
 | `protocol` | both | `nfs`\|`nvmeof` → derives ZFS `type` |
-| `datasetPrefix` | ZfsVolume | final `dataset = <prefix>/<pv-name>` |
+| `datasetPrefix` | ZfsVolume | **StorageClass-only**; final `dataset = <prefix>/<pv-name>` |
 | `volblocksize` | zvol only | |
 | `nfsClients` | ZfsShare | comma list, e.g. `10.0.0.0/8:rw` |
 | `nvmeofAllowedHosts` | ZfsShare | comma list of host NQNs (empty = allow-all) |

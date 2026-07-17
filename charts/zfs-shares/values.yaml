@@ -193,10 +193,13 @@ csiController:
   # -- PVC inheritance layer).
   pvcAnnotationPrefix: param.zfs-shares.io/
   # -- Provisioner default parameters (lowest-precedence inheritance layer).
-  # -- When non-empty they are rendered into a ConfigMap and mounted.
+  # -- When non-empty they are rendered into a ConfigMap and mounted. NOTE:
+  # -- `poolGUID` and `datasetPrefix` are StorageClass-only and are ignored here
+  # -- (see docs/design-decisions.md ADR-0002); use them for cluster-wide
+  # -- defaults such as protocol or ZFS properties instead.
   defaultParameters: {}
-    # poolGUID: "1234567890"
     # protocol: nfs
+    # property.compression: lz4
   # external-provisioner sidecar.
   provisioner:
     # -- external-provisioner image repository.
@@ -224,8 +227,11 @@ csiDriver:
   create: true
 
 # -------- Example StorageClasses --------
-# -- Optional example StorageClasses. Each entry becomes a StorageClass named
-# -- "<fullname>-<key>" with the given parameters. Set to {} to install none.
+# -- StorageClasses to install with the chart. Each entry becomes a StorageClass
+# -- named "<fullname>-<key>". By default none are installed. `poolGUID` and
+# -- `datasetPrefix` are StorageClass-only parameters and must be set here (they
+# -- are never inherited from defaultParameters or PVC annotations). `poolGUID`
+# -- is required per StorageClass.
 storageClasses: {}
   # nfs:
   #   isDefault: false
@@ -233,5 +239,13 @@ storageClasses: {}
   #   volumeBindingMode: Immediate
   #   allowVolumeExpansion: false
   #   parameters:
-  #     poolGUID: "1234567890"
+  #     poolGUID: "1234567890"   # required; identifies the target ZFS pool
+  #     datasetPrefix: k8s        # optional; prefixes every provisioned dataset
   #     protocol: nfs
+  # nvmeof:
+  #   reclaimPolicy: Delete
+  #   parameters:
+  #     poolGUID: "1234567890"
+  #     datasetPrefix: k8s/block
+  #     protocol: nvmeof
+  #     volblocksize: 16k

@@ -216,9 +216,15 @@ func TestCreateVolume_ConflictingParams(t *testing.T) {
 func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "claim-a",
-			Namespace:   "team-a",
-			Annotations: map[string]string{"param.zfs-shares.io/poolGUID": "annotated-pool"},
+			Name:      "claim-a",
+			Namespace: "team-a",
+			Annotations: map[string]string{
+				// Non-restricted param: honoured.
+				"param.zfs-shares.io/nfsOptions": "rw no_root_squash",
+				// StorageClass-only params: MUST be ignored.
+				"param.zfs-shares.io/poolGUID":      "annotated-pool",
+				"param.zfs-shares.io/datasetPrefix": "annotated-pfx",
+			},
 		},
 	}
 	cl := newTestClient(t, pvc)
@@ -232,6 +238,7 @@ func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1 << 30},
 		Parameters: map[string]string{
 			"poolGUID":                         "sc-pool",
+			"datasetPrefix":                    "sc-pfx",
 			"protocol":                         "nfs",
 			"csi.storage.k8s.io/pvc/name":      "claim-a",
 			"csi.storage.k8s.io/pvc/namespace": "team-a",
@@ -240,8 +247,24 @@ func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if got := resp.GetVolume().GetVolumeContext()[CtxPoolGUID]; got != "annotated-pool" {
-		t.Errorf("poolGUID = %q, want annotated-pool (PVC annotation overrides SC)", got)
+	vctx := resp.GetVolume().GetVolumeContext()
+	// StorageClass-only params keep their StorageClass values.
+	if vctx[CtxPoolGUID] != "sc-pool" {
+		t.Errorf("poolGUID = %q, want sc-pool (PVC annotation must not override)", vctx[CtxPoolGUID])
+	}
+	if vctx[CtxDataset] != "sc-pfx/pvc-7" {
+		t.Errorf("dataset = %q, want sc-pfx/pvc-7 (datasetPrefix is StorageClass-only)", vctx[CtxDataset])
+	}
+	// Non-restricted param from the annotation layer takes effect.
+	share := &storagev1alpha1.ZfsShare{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-7"}, share); err != nil {
+		t.Fatalf("get ZfsShare: %v", err)
+	}
+	if share.Spec.NFS == nil || len(share.Spec.NFS.Clients) != 1 ||
+		len(share.Spec.NFS.Clients[0].Options) != 2 ||
+		share.Spec.NFS.Clients[0].Options[0] != "rw" ||
+		share.Spec.NFS.Clients[0].Options[1] != "no_root_squash" {
+		t.Errorf("NFS options not overridden by annotation: %+v", share.Spec.NFS)
 	}
 }
 

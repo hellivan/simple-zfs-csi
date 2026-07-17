@@ -15,7 +15,9 @@ import (
 
 // Parameter keys understood by the driver. They resolve through a three-layer
 // inheritance chain (provisioner defaults < StorageClass parameters < PVC
-// annotations); see docs/design-decisions.md ADR-0001.
+// annotations); see docs/design-decisions.md ADR-0001. poolGUID and
+// datasetPrefix are StorageClass-only (ADR-0002): they are never inherited from
+// the defaults or PVC-annotation layers.
 const (
 	ParamPoolGUID           = "poolGUID"
 	ParamProtocol           = "protocol"
@@ -39,6 +41,17 @@ const (
 	ReservedPVCNamespace = "csi.storage.k8s.io/pvc/namespace"
 )
 
+// storageClassOnlyParams may ONLY be set via StorageClass parameters. They are
+// ignored if present in the provisioner-defaults layer or the PVC-annotation
+// layer, so neither a cluster-wide default nor a namespace tenant can redirect
+// provisioning to a different pool or dataset prefix. poolGUID additionally has
+// no default and is required, so every StorageClass must name its pool
+// explicitly. See docs/design-decisions.md ADR-0002.
+var storageClassOnlyParams = map[string]struct{}{
+	ParamPoolGUID:      {},
+	ParamDatasetPrefix: {},
+}
+
 // ResolvedParams is the parsed, validated result of the parameter inheritance
 // chain: everything needed to render a ZfsVolume + ZfsShare.
 type ResolvedParams struct {
@@ -57,9 +70,16 @@ type ResolvedParams struct {
 //  1. defaults    — provisioner defaults (from --default-parameters-file);
 //  2. scParams    — StorageClass parameters (reserved csi.storage.k8s.io/* keys stripped);
 //  3. pvcAnnotations — PVC annotations carrying annPrefix (prefix stripped).
+//
+// storageClassOnlyParams (poolGUID, datasetPrefix) are honoured only from
+// scParams; if they appear in the defaults or PVC-annotation layers they are
+// dropped, so pool routing and the dataset prefix are fixed by the StorageClass.
 func ResolveParameters(defaults, scParams, pvcAnnotations map[string]string, annPrefix string) map[string]string {
 	merged := make(map[string]string, len(defaults)+len(scParams))
 	for k, v := range defaults {
+		if _, scOnly := storageClassOnlyParams[k]; scOnly {
+			continue
+		}
 		merged[k] = v
 	}
 	for k, v := range scParams {
@@ -70,9 +90,14 @@ func ResolveParameters(defaults, scParams, pvcAnnotations map[string]string, ann
 	}
 	if annPrefix != "" {
 		for k, v := range pvcAnnotations {
-			if strings.HasPrefix(k, annPrefix) {
-				merged[strings.TrimPrefix(k, annPrefix)] = v
+			if !strings.HasPrefix(k, annPrefix) {
+				continue
 			}
+			key := strings.TrimPrefix(k, annPrefix)
+			if _, scOnly := storageClassOnlyParams[key]; scOnly {
+				continue
+			}
+			merged[key] = v
 		}
 	}
 	return merged

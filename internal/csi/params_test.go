@@ -8,10 +8,14 @@ import (
 
 func TestResolveParameters_Inheritance(t *testing.T) {
 	defaults := map[string]string{
-		"poolGUID": "default-pool",
-		"protocol": "nfs",
+		"poolGUID":      "default-pool", // StorageClass-only: must be dropped
+		"datasetPrefix": "default/pfx",  // StorageClass-only: must be dropped
+		"protocol":      "nfs",
+		"nfsOptions":    "ro",
 	}
 	scParams := map[string]string{
+		"poolGUID":                         "sc-pool",
+		"datasetPrefix":                    "k8s",
 		"protocol":                         "nvmeof",
 		"volblocksize":                     "16k",
 		"csi.storage.k8s.io/pvc/name":      "my-pvc",
@@ -20,19 +24,29 @@ func TestResolveParameters_Inheritance(t *testing.T) {
 		"csi.storage.k8s.io/pvc/namespace": "team-a",
 	}
 	pvcAnnotations := map[string]string{
-		"param.zfs-shares.io/poolGUID": "pvc-pool",
-		"unrelated/annotation":         "ignored",
+		"param.zfs-shares.io/poolGUID":      "pvc-pool", // StorageClass-only: must be dropped
+		"param.zfs-shares.io/datasetPrefix": "pvc/pfx",  // StorageClass-only: must be dropped
+		"param.zfs-shares.io/nfsOptions":    "rw",
+		"unrelated/annotation":              "ignored",
 	}
 
 	merged := ResolveParameters(defaults, scParams, pvcAnnotations, "param.zfs-shares.io/")
 
-	// PVC annotation wins over SC over defaults.
-	if merged["poolGUID"] != "pvc-pool" {
-		t.Errorf("poolGUID = %q, want pvc-pool", merged["poolGUID"])
+	// poolGUID is StorageClass-only: neither defaults nor PVC annotations win.
+	if merged["poolGUID"] != "sc-pool" {
+		t.Errorf("poolGUID = %q, want sc-pool (StorageClass-only)", merged["poolGUID"])
+	}
+	// datasetPrefix is StorageClass-only too.
+	if merged["datasetPrefix"] != "k8s" {
+		t.Errorf("datasetPrefix = %q, want k8s (StorageClass-only)", merged["datasetPrefix"])
 	}
 	// SC wins over default.
 	if merged["protocol"] != "nvmeof" {
 		t.Errorf("protocol = %q, want nvmeof", merged["protocol"])
+	}
+	// PVC annotation overrides defaults for non-restricted keys.
+	if merged["nfsOptions"] != "rw" {
+		t.Errorf("nfsOptions = %q, want rw (PVC annotation wins)", merged["nfsOptions"])
 	}
 	// SC-only value passes through.
 	if merged["volblocksize"] != "16k" {
@@ -55,13 +69,39 @@ func TestResolveParameters_Inheritance(t *testing.T) {
 
 func TestResolveParameters_NoAnnotationLayer(t *testing.T) {
 	merged := ResolveParameters(
-		map[string]string{"poolGUID": "d"},
-		map[string]string{"protocol": "nfs"},
-		map[string]string{"param.zfs-shares.io/poolGUID": "should-be-ignored"},
+		map[string]string{"nfsOptions": "ro"},
+		map[string]string{"poolGUID": "sc-pool", "protocol": "nfs"},
+		map[string]string{"param.zfs-shares.io/nfsOptions": "should-be-ignored"},
 		"", // disabled
 	)
-	if merged["poolGUID"] != "d" {
-		t.Errorf("poolGUID = %q, want d (annotation layer disabled)", merged["poolGUID"])
+	if merged["nfsOptions"] != "ro" {
+		t.Errorf("nfsOptions = %q, want ro (annotation layer disabled)", merged["nfsOptions"])
+	}
+	if merged["poolGUID"] != "sc-pool" {
+		t.Errorf("poolGUID = %q, want sc-pool", merged["poolGUID"])
+	}
+}
+
+func TestResolveParameters_StorageClassOnly(t *testing.T) {
+	// poolGUID/datasetPrefix supplied only via defaults and PVC annotations must
+	// be dropped entirely, leaving the required poolGUID unset.
+	merged := ResolveParameters(
+		map[string]string{"poolGUID": "from-default", "datasetPrefix": "from-default"},
+		map[string]string{"protocol": "nfs"},
+		map[string]string{
+			"param.zfs-shares.io/poolGUID":      "from-pvc",
+			"param.zfs-shares.io/datasetPrefix": "from-pvc",
+		},
+		"param.zfs-shares.io/",
+	)
+	if _, ok := merged["poolGUID"]; ok {
+		t.Errorf("poolGUID leaked from non-StorageClass layer: %q", merged["poolGUID"])
+	}
+	if _, ok := merged["datasetPrefix"]; ok {
+		t.Errorf("datasetPrefix leaked from non-StorageClass layer: %q", merged["datasetPrefix"])
+	}
+	if _, err := ParseParams(merged); err == nil {
+		t.Errorf("expected ParseParams error when poolGUID only came from non-SC layers")
 	}
 }
 
