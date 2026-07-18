@@ -9,6 +9,19 @@ import (
 	"strings"
 )
 
+// NVMeConnectOptions carries the parameters for an `nvme connect`. HostNQN/HostID
+// are the per-attach initiator identity (ADR-0011); DHChapKey is the optional
+// in-band DH-CHAP secret. All three are empty for an unauthenticated connect.
+type NVMeConnectOptions struct {
+	Transport string
+	Addr      string
+	Port      string
+	NQN       string
+	HostNQN   string
+	HostID    string
+	DHChapKey string
+}
+
 // NodeMounter abstracts the privileged host operations the node plugin performs:
 // NFS mounts, NVMe-oF connect/disconnect, and filesystem/block publishing. It is
 // an interface so the NodeServer routing logic can be unit-tested without a real
@@ -37,7 +50,7 @@ type NodeMounter interface {
 	// NVMeConnect connects to the NVMe-oF subsystem and returns the resulting
 	// block device path (e.g. "/dev/nvme1n1"). It is idempotent: an existing
 	// connection returns the current device.
-	NVMeConnect(ctx context.Context, transport, addr, port, nqn string) (string, error)
+	NVMeConnect(ctx context.Context, opts NVMeConnectOptions) (string, error)
 	// NVMeDisconnect disconnects the NVMe-oF subsystem, ignoring absence.
 	NVMeDisconnect(ctx context.Context, nqn string) error
 	// NVMeDevice returns the current block device path for a connected NQN, or
@@ -171,19 +184,29 @@ func (m *hostMounter) Unmount(target string) error {
 	return err
 }
 
-func (m *hostMounter) NVMeConnect(ctx context.Context, transport, addr, port, nqn string) (string, error) {
-	if dev, _ := m.nvmeDevice(ctx, nqn); dev != "" {
+func (m *hostMounter) NVMeConnect(ctx context.Context, o NVMeConnectOptions) (string, error) {
+	if dev, _ := m.nvmeDevice(ctx, o.NQN); dev != "" {
 		return dev, nil
 	}
-	if _, err := m.run(ctx, "nvme", "connect", "-t", transport, "-a", addr, "-s", port, "-n", nqn); err != nil {
-		return "", fmt.Errorf("nvme connect %s: %w", nqn, err)
+	args := []string{"connect", "-t", o.Transport, "-a", o.Addr, "-s", o.Port, "-n", o.NQN}
+	if o.HostNQN != "" {
+		args = append(args, "--hostnqn", o.HostNQN)
 	}
-	dev, err := m.nvmeDevice(ctx, nqn)
+	if o.HostID != "" {
+		args = append(args, "--hostid", o.HostID)
+	}
+	if o.DHChapKey != "" {
+		args = append(args, "--dhchap-secret", o.DHChapKey)
+	}
+	if _, err := m.run(ctx, "nvme", args...); err != nil {
+		return "", fmt.Errorf("nvme connect %s: %w", o.NQN, err)
+	}
+	dev, err := m.nvmeDevice(ctx, o.NQN)
 	if err != nil {
 		return "", err
 	}
 	if dev == "" {
-		return "", fmt.Errorf("nvme device for %s not found after connect", nqn)
+		return "", fmt.Errorf("nvme device for %s not found after connect", o.NQN)
 	}
 	return dev, nil
 }

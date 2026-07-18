@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/nvmeauth"
 )
 
 // zfsShareAttachRequestFinalizer lets the aggregation reconciler recompute (and
@@ -43,6 +44,13 @@ const attachRequeue = 3 * time.Second
 type ZfsShareAttachRequestReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Namespace is the driver's release namespace, where per-attach DH-CHAP
+	// Secrets are created (must be readable by the nvmet aggregator and csi-node).
+	Namespace string
+	// DHChapEnabled turns on NVMe-oF in-band DH-CHAP authentication (ADR-0011).
+	// NQN allow-listing is applied regardless.
+	DHChapEnabled bool
 }
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsshareattachrequests,verbs=get;list;watch;update;patch
@@ -50,6 +58,7 @@ type ZfsShareAttachRequestReconciler struct {
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsshares,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;delete
 
 // Reconcile ensures the aggregated ZfsShare for the request's volume and reflects
 // its readiness back into the request status.
@@ -117,10 +126,14 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 
 	shareKey := client.ObjectKey{Name: volume}
 
-	// No consumers left: tear the share down (its NetworkExport is GC'd with it).
+	// No consumers left: tear the share down (its NetworkExport is GC'd with it),
+	// and remove any per-attach DH-CHAP secret.
 	if len(nodes) == 0 {
 		share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
 		if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+		if err := r.deleteDHChapSecret(ctx, volume); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -136,8 +149,15 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 	}
 
 	var nfsClients []storagev1alpha1.NFSClient
-	if protocol == storagev1alpha1.ProtocolNFS {
+	var nvmeSpec *storagev1alpha1.NVMeoFExportSpec
+	switch protocol {
+	case storagev1alpha1.ProtocolNFS:
 		nfsClients, err = r.nfsClientsForNodes(ctx, nodes)
+		if err != nil {
+			return nil, err
+		}
+	case storagev1alpha1.ProtocolNVMeoF:
+		nvmeSpec, err = r.nvmeExportSpec(ctx, volume, nodes)
 		if err != nil {
 			return nil, err
 		}
@@ -153,10 +173,9 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 			share.Spec.NFS = &storagev1alpha1.NFSExportSpec{Clients: nfsClients}
 			share.Spec.NVMeoF = nil
 		case storagev1alpha1.ProtocolNVMeoF:
-			// NVMe-oF is single-node (ADR-0010): the export exists only while the one
-			// consumer is attached (temporal zero-trust). Host-NQN allow-listing is a
-			// later refinement, so allowed hosts stay empty here.
-			share.Spec.NVMeoF = &storagev1alpha1.NVMeoFExportSpec{}
+			// NVMe-oF is single-node (ADR-0010): default-deny by the attached node's
+			// derived host NQN, plus optional per-attach DH-CHAP (ADR-0011).
+			share.Spec.NVMeoF = nvmeSpec
 			share.Spec.NFS = nil
 		}
 		return nil
@@ -230,6 +249,74 @@ func (r *ZfsShareAttachRequestReconciler) nodeInternalIP(ctx context.Context, no
 	}
 	return "", fmt.Errorf("node %q has no InternalIP", nodeName)
 }
+
+// nvmeExportSpec builds the NVMe-oF export spec for a single-node attach:
+// default-deny to the node's derived per-attach host NQN (ADR-0011), plus an
+// optional per-attach DH-CHAP secret when in-band auth is enabled.
+func (r *ZfsShareAttachRequestReconciler) nvmeExportSpec(ctx context.Context, volume string, nodes []string) (*storagev1alpha1.NVMeoFExportSpec, error) {
+	// NVMe-oF is single-node; the requesting node is the sole allowed host.
+	node := nodes[0]
+	hostNQN, _ := nvmeauth.HostIdentity(node, volume)
+	spec := &storagev1alpha1.NVMeoFExportSpec{AllowedHosts: []string{hostNQN}}
+
+	if r.DHChapEnabled {
+		name, err := r.ensureDHChapSecret(ctx, volume)
+		if err != nil {
+			return nil, err
+		}
+		spec.DHChapSecretName = name
+		spec.DHChapSecretNamespace = r.Namespace
+	}
+	return spec, nil
+}
+
+// ensureDHChapSecret creates (once) the per-attach DH-CHAP Secret for a volume
+// and returns its name. The key is generated only on first creation, so it is
+// stable for the life of the attachment and rotates only when the volume is
+// fully detached (the Secret is deleted) and later reattached.
+func (r *ZfsShareAttachRequestReconciler) ensureDHChapSecret(ctx context.Context, volume string) (string, error) {
+	if r.Namespace == "" {
+		return "", fmt.Errorf("operator namespace is unknown; cannot manage DH-CHAP secret")
+	}
+	name := dhchapSecretName(volume)
+	var sec corev1.Secret
+	err := r.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: name}, &sec)
+	switch {
+	case apierrors.IsNotFound(err):
+		key, gerr := nvmeauth.GenerateDHChapKey()
+		if gerr != nil {
+			return "", gerr
+		}
+		sec = corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.Namespace},
+			Type:       corev1.SecretTypeOpaque,
+			Data:       map[string][]byte{nvmeauth.SecretKeyDHChap: []byte(key)},
+		}
+		if err := r.Create(ctx, &sec); err != nil && !apierrors.IsAlreadyExists(err) {
+			return "", err
+		}
+		return name, nil
+	case err != nil:
+		return "", err
+	default:
+		return name, nil
+	}
+}
+
+// deleteDHChapSecret best-effort removes a volume's per-attach DH-CHAP Secret.
+func (r *ZfsShareAttachRequestReconciler) deleteDHChapSecret(ctx context.Context, volume string) error {
+	if r.Namespace == "" {
+		return nil
+	}
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: dhchapSecretName(volume), Namespace: r.Namespace}}
+	if err := r.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// dhchapSecretName is the deterministic Secret name for a volume's DH-CHAP key.
+func dhchapSecretName(volume string) string { return "dhchap-" + volume }
 
 // setStatus patches the attach request status subresource.
 func (r *ZfsShareAttachRequestReconciler) setStatus(ctx context.Context, ar *storagev1alpha1.ZfsShareAttachRequest, ready bool, shareName, reason, message string) error {

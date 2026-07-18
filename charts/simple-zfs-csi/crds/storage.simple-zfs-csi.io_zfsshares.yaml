@@ -119,6 +119,18 @@ spec:
                     items:
                       type: string
                     type: array
+                  dhchapSecretName:
+                    description: |-
+                      DHChapSecretName references a Secret holding the per-attach DH-CHAP key
+                      (data key "dhchap-key", DHHC-1 format) that the target programs onto the
+                      allowed host and the node passes to `nvme connect --dhchap-secret`. Empty
+                      means no in-band authentication. See design-decisions ADR-0011.
+                    type: string
+                  dhchapSecretNamespace:
+                    description: |-
+                      DHChapSecretNamespace is the namespace of DHChapSecretName (the driver's
+                      release namespace). Required when DHChapSecretName is set.
+                    type: string
                   nqn:
                     description: |-
                       NQN is the subsystem NQN clients use to connect. When empty the controller

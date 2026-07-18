@@ -39,6 +39,9 @@ type Subsystem struct {
 	DevicePath string
 	// AllowedHosts are host NQNs permitted to connect. Empty allows any host.
 	AllowedHosts []string
+	// DHChapKey is the DH-CHAP secret (DHHC-1 format) programmed on each allowed
+	// host for in-band authentication. Empty disables authentication.
+	DHChapKey string
 }
 
 // Target manages the nvmet configfs tree rooted at Root.
@@ -213,7 +216,7 @@ func (t *Target) ensureSubsystem(s Subsystem) error {
 		if err := writeAttrIfChanged(filepath.Join(subDir, "attr_allow_any_host"), "0"); err != nil {
 			return err
 		}
-		if err := t.reconcileAllowedHosts(subDir, s.AllowedHosts); err != nil {
+		if err := t.reconcileAllowedHosts(subDir, s.AllowedHosts, s.DHChapKey); err != nil {
 			return err
 		}
 	}
@@ -247,7 +250,7 @@ func (t *Target) ensureSubsystem(s Subsystem) error {
 	return nil
 }
 
-func (t *Target) reconcileAllowedHosts(subDir string, hosts []string) error {
+func (t *Target) reconcileAllowedHosts(subDir string, hosts []string, dhchapKey string) error {
 	allowedDir := filepath.Join(subDir, "allowed_hosts")
 	want := make(map[string]struct{}, len(hosts))
 	for _, h := range hosts {
@@ -255,6 +258,12 @@ func (t *Target) reconcileAllowedHosts(subDir string, hosts []string) error {
 		// The referenced host object must exist before it can be linked.
 		if err := ensureDir(filepath.Join(t.hostsDir(), h)); err != nil {
 			return err
+		}
+		// Program (or leave) the host's DH-CHAP key for in-band authentication.
+		if dhchapKey != "" {
+			if err := writeAttrIfChanged(filepath.Join(t.hostsDir(), h, "dhchap_key"), dhchapKey); err != nil {
+				return fmt.Errorf("set dhchap_key for host %s: %w", h, err)
+			}
 		}
 		link := filepath.Join(allowedDir, h)
 		if err := ensureSymlink(filepath.Join(t.hostsDir(), h), link); err != nil {

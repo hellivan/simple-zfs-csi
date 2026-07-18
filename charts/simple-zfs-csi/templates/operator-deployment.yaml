@@ -46,6 +46,7 @@ spec:
             - --leader-election-namespace=$(POD_NAMESPACE)
             - --metrics-bind-address=:{{ .Values.operator.ports.metrics }}
             - --health-probe-bind-address=:{{ .Values.operator.ports.health }}
+            - --nvmeof-dhchap={{ .Values.nvmeof.auth.dhchap.enabled }}
             {{- with .Values.operator.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

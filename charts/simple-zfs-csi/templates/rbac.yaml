@@ -336,4 +336,77 @@ subjects:
     name: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "csi-node") }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- if .Values.operator.enabled }}
+---
+# Operator: manages per-attach NVMe-oF DH-CHAP Secrets in the release namespace
+# (ADR-0011). Namespaced so the operator cannot read secrets cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-operator-dhchap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-operator-dhchap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "simple-zfs-csi.fullname" . }}-operator-dhchap
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "operator") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if or .Values.nvmeof.enabled .Values.csiNode.enabled }}
+---
+# DH-CHAP secret readers: the nvmeof aggregator programs the target's dhchap_key
+# and the csi-node passes it to `nvme connect` (ADR-0011). Read-only, namespaced.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-dhchap-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-dhchap-reader
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "simple-zfs-csi.fullname" . }}-dhchap-reader
+subjects:
+  {{- if .Values.nvmeof.enabled }}
+  - kind: ServiceAccount
+    name: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "nvmeof") }}
+    namespace: {{ .Release.Namespace }}
+  {{- end }}
+  {{- if .Values.csiNode.enabled }}
+  - kind: ServiceAccount
+    name: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "csi-node") }}
+    namespace: {{ .Release.Namespace }}
+  {{- end }}
+{{- end }}
 {{- end }}

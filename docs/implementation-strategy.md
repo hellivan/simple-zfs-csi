@@ -195,24 +195,23 @@ node is authorized; forbid NVMe-oF multi-node.
   e2e RWO NVMe + RWX NFS attach/detach and the static CSI PV for nvmeof remain the
   manual steps.
 
-### Step 12 — NVMe-oF zero-trust: host-NQN allow-listing + per-attach DH-CHAP (ADR-0011)
-Bring NVMe-oF to NFS's posture: default-deny by the attached node's host NQN, plus
+### Step 12 — NVMe-oF zero-trust: per-attach host NQN + DH-CHAP (ADR-0011)
+Bring NVMe-oF to NFS's posture: default-deny by a per-attach host NQN, plus
 DH-CHAP password auth, on by default.
-- New cluster-scoped `NvmeHost` CRD (`{nodeName, hostNQN}`), authored by csi-node at
-  startup; host NQN derived deterministically from the node name (`--host-nqn`
-  override), always passed to `nvme connect --hostnqn`.
-- Operator attach reconciler: resolve node → `NvmeHost.hostNQN` (default-deny if
-  absent) → `NetworkExport.nvmeof.allowedHosts`; when DH-CHAP on, generate a
-  per-attach key in `DHHC-1` format, store in a `Secret` (owner-ref the attach
-  request), set `NetworkExport.nvmeof.dhchapSecretRef`.
-- nvmet: `attr_allow_any_host=0`, link `allowed_hosts/<nqn>`, write `dhchap_key`
-  from the referenced `Secret`.
+- Shared `HostNQN(nodeName, volumeID)` helper: a per-attach host NQN derived
+  deterministically (UUIDv5) by both operator and node — nothing published, no CRD,
+  node stays CRD-free. The node always passes `--hostnqn` to `nvme connect`.
+- Operator attach reconciler: set `NetworkExport.nvmeof.allowedHosts` = derived NQN
+  (default-deny); when DH-CHAP on, generate a per-attach key in `DHHC-1` format,
+  store in a `Secret` (owner-ref the attach request), set
+  `NetworkExport.nvmeof.dhchapSecretRef`.
+- nvmet: `attr_allow_any_host=0`, host object + `dhchap_key` from the `Secret`, link
+  `allowed_hosts/<nqn>`. (Per-attach NQN ⇒ per-attach key with no sibling impact.)
 - csi-node: always `--hostnqn`; when a secret ref is present, read the `Secret` and
   `nvme connect --dhchap-secret`.
-- Deploy: `NvmeHost` CRD; RBAC (node: `nvmehosts` create/update + `secrets` read;
-  operator: `secrets` create/delete + `nvmehosts` read; nvmeof aggregator:
+- Deploy: RBAC (operator: `secrets` create/delete; nvmeof aggregator + csi-node:
   `secrets` read); values `nvmeof.auth.dhchap.enabled` (default true).
-- Verify: `make manifests`, unit tests (NQN resolution/default-deny, key gen +
+- Verify: `make manifests`, unit tests (NQN derivation/default-deny, key gen +
   Secret lifecycle, nvmet dhchap programming, node connect flags), `helm template`;
   live authenticated `nvme connect` is the manual e2e step.
 

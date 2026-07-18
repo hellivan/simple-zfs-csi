@@ -37,15 +37,17 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr  string
-		probeAddr    string
-		leaderElect  bool
-		leaderElecNS string
+		metricsAddr   string
+		probeAddr     string
+		leaderElect   bool
+		leaderElecNS  string
+		dhchapEnabled bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election so only one operator acts at a time.")
 	flag.StringVar(&leaderElecNS, "leader-election-namespace", os.Getenv("POD_NAMESPACE"), "Namespace for the leader-election lease (defaults to $POD_NAMESPACE).")
+	flag.BoolVar(&dhchapEnabled, "nvmeof-dhchap", true, "Enable NVMe-oF DH-CHAP in-band authentication (ADR-0011); NQN allow-listing applies regardless.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -84,8 +86,10 @@ func main() {
 	}
 
 	if err := (&controller.ZfsShareAttachRequestReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Namespace:     os.Getenv("POD_NAMESPACE"),
+		DHChapEnabled: dhchapEnabled,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up zfsshareattachrequest reconciler")
 		os.Exit(1)

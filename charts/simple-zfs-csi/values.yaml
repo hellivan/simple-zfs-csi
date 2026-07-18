@@ -80,6 +80,14 @@ nvmeof:
     tag: ""
   # -- Prefix for deterministically derived subsystem NQNs.
   nqnPrefix: nqn.2025-01.io.simple-zfs-csi
+  # NVMe-oF access control (ADR-0011). Exports are always default-deny by the
+  # attached node's per-attach host NQN; DH-CHAP adds in-band password auth.
+  auth:
+    dhchap:
+      # -- Enable NVMe-oF DH-CHAP in-band authentication. NQN allow-listing
+      # -- applies regardless; turning this off keeps identity restriction but
+      # -- drops the password.
+      enabled: true
   # -- Host mount point of the configfs filesystem. The nvmet target subtree
   # lives at `<configfsRoot>/nvmet`, which is what the controller manages.
   configfsRoot: /sys/kernel/config

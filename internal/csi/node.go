@@ -2,16 +2,19 @@ package csi
 
 import (
 	"context"
+	"fmt"
 	"path"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/go-logr/logr"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/nvmeauth"
 	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
@@ -139,7 +142,7 @@ func (n *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 	}
 
 	// Best-effort NVMe-oF disconnect: look up the export's NQN if it still exists.
-	if nqn := n.exportNQN(ctx, volumeID); nqn != "" {
+	if nqn := n.lookupExportNQN(ctx, volumeID); nqn != "" {
 		if err := n.Mounter.NVMeDisconnect(ctx, nqn); err != nil {
 			n.Log.Error(err, "nvme disconnect failed", "volume", volumeID, "nqn", nqn)
 		}
@@ -164,7 +167,7 @@ func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 
 	// Only NVMe-oF (zvol) volumes have a node-local device to grow. Absence of a
 	// NetworkExport NQN means this is an NFS volume: nothing to do here.
-	nqn := n.exportNQN(ctx, volumeID)
+	nqn := n.lookupExportNQN(ctx, volumeID)
 	if nqn == "" {
 		return &csi.NodeExpandVolumeResponse{}, nil
 	}
@@ -232,12 +235,33 @@ func (n *NodeServer) publishNFS(pool *storagev1alpha1.ZfsPool, dataset, targetPa
 // publishNVMeoF connects the zvol over NVMe-oF and publishes it as a raw block
 // device (block mode) or a formatted, mounted filesystem (filesystem mode).
 func (n *NodeServer) publishNVMeoF(ctx context.Context, volumeID string, pool *storagev1alpha1.ZfsPool, targetPath string, block, readOnly bool, fsType string, flags []string) error {
-	nqn := n.exportNQN(ctx, volumeID)
+	export := &storagev1alpha1.NetworkExport{}
+	if err := n.Client.Get(ctx, client.ObjectKey{Name: volumeID}, export); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "NVMe-oF export for volume %q is not ready: %v", volumeID, err)
+	}
+	nqn := exportNQN(export)
 	if nqn == "" {
 		return status.Errorf(codes.FailedPrecondition, "NVMe-oF export for volume %q is not ready (no NQN)", volumeID)
 	}
 
-	device, err := n.Mounter.NVMeConnect(ctx, n.transport(), pool.Status.CurrentIP, n.port(), nqn)
+	// Per-attach initiator identity, derived identically to the operator's
+	// target allow-list (ADR-0011); the DH-CHAP secret (when set) is read from
+	// the Secret the export references.
+	hostNQN, hostID := nvmeauth.HostIdentity(n.NodeID, volumeID)
+	dhchapKey, err := n.dhchapKey(ctx, export)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "resolve DH-CHAP secret for volume %q: %v", volumeID, err)
+	}
+
+	device, err := n.Mounter.NVMeConnect(ctx, NVMeConnectOptions{
+		Transport: n.transport(),
+		Addr:      pool.Status.CurrentIP,
+		Port:      n.port(),
+		NQN:       nqn,
+		HostNQN:   hostNQN,
+		HostID:    hostID,
+		DHChapKey: dhchapKey,
+	})
 	if err != nil {
 		return status.Errorf(codes.Internal, "nvme connect: %v", err)
 	}
@@ -261,13 +285,9 @@ func (n *NodeServer) publishNVMeoF(ctx context.Context, volumeID string, pool *s
 	return nil
 }
 
-// exportNQN returns the effective subsystem NQN for a volume by reading its
-// child NetworkExport status, or "" when absent/not-yet-rendered.
-func (n *NodeServer) exportNQN(ctx context.Context, volumeID string) string {
-	export := &storagev1alpha1.NetworkExport{}
-	if err := n.Client.Get(ctx, client.ObjectKey{Name: volumeID}, export); err != nil {
-		return ""
-	}
+// exportNQN returns the effective subsystem NQN for an nvmeof export, preferring
+// the aggregator-reported status over the spec.
+func exportNQN(export *storagev1alpha1.NetworkExport) string {
 	if export.Status.NQN != "" {
 		return export.Status.NQN
 	}
@@ -275,6 +295,38 @@ func (n *NodeServer) exportNQN(ctx context.Context, volumeID string) string {
 		return export.Spec.NVMeoF.NQN
 	}
 	return ""
+}
+
+// lookupExportNQN fetches a volume's child NetworkExport and returns its
+// effective NQN, or "" when absent/not-yet-rendered.
+func (n *NodeServer) lookupExportNQN(ctx context.Context, volumeID string) string {
+	export := &storagev1alpha1.NetworkExport{}
+	if err := n.Client.Get(ctx, client.ObjectKey{Name: volumeID}, export); err != nil {
+		return ""
+	}
+	return exportNQN(export)
+}
+
+// dhchapKey reads the DH-CHAP secret referenced by an nvmeof export, or "" when
+// in-band authentication is not configured.
+func (n *NodeServer) dhchapKey(ctx context.Context, export *storagev1alpha1.NetworkExport) (string, error) {
+	if export.Spec.NVMeoF == nil || export.Spec.NVMeoF.DHChapSecretName == "" {
+		return "", nil
+	}
+	ns := export.Spec.NVMeoF.DHChapSecretNamespace
+	name := export.Spec.NVMeoF.DHChapSecretName
+	if ns == "" {
+		return "", fmt.Errorf("dhchap secret %q has no namespace", name)
+	}
+	sec := &corev1.Secret{}
+	if err := n.Client.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, sec); err != nil {
+		return "", fmt.Errorf("get dhchap secret %s/%s: %w", ns, name, err)
+	}
+	key := sec.Data[nvmeauth.SecretKeyDHChap]
+	if len(key) == 0 {
+		return "", fmt.Errorf("dhchap secret %s/%s missing data key %q", ns, name, nvmeauth.SecretKeyDHChap)
+	}
+	return string(key), nil
 }
 
 func (n *NodeServer) transport() string {

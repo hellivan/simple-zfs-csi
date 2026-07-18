@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -11,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/nvmeauth"
 	"github.com/hellivan/simple-zfs-csi/internal/nvmet"
 )
 
@@ -25,6 +27,7 @@ type NVMeoFReconciler struct {
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=networkexports,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=networkexports/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile rebuilds the nvmet target from all nvmeof exports owned by this node.
 func (r *NVMeoFReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -42,13 +45,26 @@ func (r *NVMeoFReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		nqn := r.effectiveNQN(s)
 		nqnByName[s.Name] = nqn
 		var allowed []string
+		var dhchapKey string
 		if s.Spec.NVMeoF != nil {
 			allowed = s.Spec.NVMeoF.AllowedHosts
+			if s.Spec.NVMeoF.DHChapSecretName != "" {
+				key, err := r.dhchapKey(ctx, s.Spec.NVMeoF.DHChapSecretNamespace, s.Spec.NVMeoF.DHChapSecretName)
+				if err != nil {
+					// The target is not fully programmed until the key is available;
+					// requeue so the export is not prematurely marked Exported.
+					logger.Error(err, "resolve dhchap key", "export", s.Name)
+					r.markErrorForRequest(ctx, req, err)
+					return ctrl.Result{}, err
+				}
+				dhchapKey = key
+			}
 		}
 		desired = append(desired, nvmet.Subsystem{
 			NQN:          nqn,
 			DevicePath:   s.Spec.Path,
 			AllowedHosts: allowed,
+			DHChapKey:    dhchapKey,
 		})
 	}
 
@@ -69,6 +85,22 @@ func (r *NVMeoFReconciler) effectiveNQN(s *storagev1alpha1.NetworkExport) string
 		return s.Spec.NVMeoF.NQN
 	}
 	return fmt.Sprintf("%s:%s:%s", r.NQNPrefix, s.Spec.NodeName, s.Name)
+}
+
+// dhchapKey reads the DH-CHAP secret referenced by an nvmeof export.
+func (r *NVMeoFReconciler) dhchapKey(ctx context.Context, namespace, name string) (string, error) {
+	if namespace == "" {
+		return "", fmt.Errorf("dhchap secret %q has no namespace", name)
+	}
+	var sec corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec); err != nil {
+		return "", fmt.Errorf("get dhchap secret %s/%s: %w", namespace, name, err)
+	}
+	key := sec.Data[nvmeauth.SecretKeyDHChap]
+	if len(key) == 0 {
+		return "", fmt.Errorf("dhchap secret %s/%s missing data key %q", namespace, name, nvmeauth.SecretKeyDHChap)
+	}
+	return string(key), nil
 }
 
 func (r *NVMeoFReconciler) markErrorForRequest(ctx context.Context, req ctrl.Request, cause error) {

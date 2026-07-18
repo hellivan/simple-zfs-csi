@@ -8,25 +8,30 @@ import (
 	"github.com/go-logr/logr"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/nvmeauth"
 	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 // fakeMounter records operations and lets tests script mount state.
 type fakeMounter struct {
-	mounted      map[string]bool
-	nfsMounts    map[string]string // target -> source
-	fsMounts     map[string]string // target -> device
-	blockMounts  map[string]string // target -> device
-	connectedNQN string
-	connectDev   string
-	disconnected []string
-	removed      []string
-	rescanned    []string
-	resized      map[string]string // device -> volumePath
+	mounted        map[string]bool
+	nfsMounts      map[string]string // target -> source
+	fsMounts       map[string]string // target -> device
+	blockMounts    map[string]string // target -> device
+	connectedNQN   string
+	connectHostNQN string
+	connectHostID  string
+	connectDHChap  string
+	connectDev     string
+	disconnected   []string
+	removed        []string
+	rescanned      []string
+	resized        map[string]string // device -> volumePath
 }
 
 func newFakeMounter() *fakeMounter {
@@ -66,8 +71,11 @@ func (f *fakeMounter) Unmount(target string) error {
 	f.mounted[target] = false
 	return nil
 }
-func (f *fakeMounter) NVMeConnect(_ context.Context, _, _, _, nqn string) (string, error) {
-	f.connectedNQN = nqn
+func (f *fakeMounter) NVMeConnect(_ context.Context, o NVMeConnectOptions) (string, error) {
+	f.connectedNQN = o.NQN
+	f.connectHostNQN = o.HostNQN
+	f.connectHostID = o.HostID
+	f.connectDHChap = o.DHChapKey
 	return f.connectDev, nil
 }
 func (f *fakeMounter) NVMeDisconnect(_ context.Context, nqn string) error {
@@ -161,8 +169,43 @@ func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 	if m.connectedNQN != "nqn.2025-01.io.simple-zfs-csi:pvc-2" {
 		t.Errorf("connected NQN = %q", m.connectedNQN)
 	}
+	wantHostNQN, wantHostID := nvmeauth.HostIdentity("node-a", "pvc-2")
+	if m.connectHostNQN != wantHostNQN || m.connectHostID != wantHostID {
+		t.Errorf("host identity = %q/%q, want %q/%q", m.connectHostNQN, m.connectHostID, wantHostNQN, wantHostID)
+	}
+	if m.connectDHChap != "" {
+		t.Errorf("expected no DH-CHAP key without a secret ref, got %q", m.connectDHChap)
+	}
 	if m.fsMounts["/target/fs"] != "/dev/nvme1n1" {
 		t.Errorf("fs mount device = %q, want /dev/nvme1n1", m.fsMounts["/target/fs"])
+	}
+}
+
+func TestNodePublish_NVMeoF_DHChap(t *testing.T) {
+	m := newFakeMounter()
+	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-9"}}
+	export.Status.NQN = "nqn.2025-01.io.simple-zfs-csi:pvc-9"
+	export.Spec.NVMeoF = &storagev1alpha1.NVMeoFExportSpec{
+		DHChapSecretName:      "dhchap-pvc-9",
+		DHChapSecretNamespace: "sys",
+	}
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "dhchap-pvc-9", Namespace: "sys"},
+		Data:       map[string][]byte{nvmeauth.SecretKeyDHChap: []byte("DHHC-1:00:Zm9v:")},
+	}
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export, sec)
+
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-9",
+		TargetPath:       "/target/fs",
+		VolumeCapability: mountCap(),
+		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-9", CtxProtocol: "nvmeof"},
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	if m.connectDHChap != "DHHC-1:00:Zm9v:" {
+		t.Errorf("DH-CHAP key = %q, want the referenced secret value", m.connectDHChap)
 	}
 }
 

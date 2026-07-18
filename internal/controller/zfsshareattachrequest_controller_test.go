@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/nvmeauth"
 )
 
 func newAttachScheme(t *testing.T) *runtime.Scheme {
@@ -182,5 +183,58 @@ func TestAttachRequest_NVMeoFSingleNodeShare(t *testing.T) {
 	}
 	if share.Spec.NFS != nil {
 		t.Errorf("nfs export spec must be nil for nvmeof")
+	}
+}
+
+func TestAttachRequest_NVMeoFAuthProgramsSecretAndNQN(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-4"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-4", Type: storagev1alpha1.DatasetTypeVolume},
+	}
+	node := nodeWithIP("node-a", "10.0.0.8")
+	ar := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-4-node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-4", NodeName: "node-a"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, node, ar).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme, Namespace: "sys", DHChapEnabled: true}
+	reconcileAttach(t, r, "pvc-4-node-a") // finalizer
+	reconcileAttach(t, r, "pvc-4-node-a") // aggregate
+
+	share := &storagev1alpha1.ZfsShare{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-4"}, share); err != nil {
+		t.Fatalf("get share: %v", err)
+	}
+	wantNQN, _ := nvmeauth.HostIdentity("node-a", "pvc-4")
+	if share.Spec.NVMeoF == nil || len(share.Spec.NVMeoF.AllowedHosts) != 1 || share.Spec.NVMeoF.AllowedHosts[0] != wantNQN {
+		t.Errorf("allowedHosts = %+v, want [%s]", share.Spec.NVMeoF, wantNQN)
+	}
+	if share.Spec.NVMeoF.DHChapSecretName != "dhchap-pvc-4" || share.Spec.NVMeoF.DHChapSecretNamespace != "sys" {
+		t.Errorf("dhchap secret ref = %q/%q", share.Spec.NVMeoF.DHChapSecretNamespace, share.Spec.NVMeoF.DHChapSecretName)
+	}
+
+	sec := &corev1.Secret{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "sys", Name: "dhchap-pvc-4"}, sec); err != nil {
+		t.Fatalf("expected DH-CHAP secret: %v", err)
+	}
+	if len(sec.Data[nvmeauth.SecretKeyDHChap]) == 0 {
+		t.Errorf("secret missing key %q", nvmeauth.SecretKeyDHChap)
+	}
+
+	// Detach removes the share and the secret.
+	if err := c.Delete(context.Background(), ar); err != nil {
+		t.Fatalf("delete attach request: %v", err)
+	}
+	reconcileAttach(t, r, "pvc-4-node-a")
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "sys", Name: "dhchap-pvc-4"}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Errorf("expected DH-CHAP secret deleted after detach, got err=%v", err)
 	}
 }
