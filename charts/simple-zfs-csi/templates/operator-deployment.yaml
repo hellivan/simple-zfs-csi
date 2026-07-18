@@ -48,6 +48,9 @@ spec:
             - --health-probe-bind-address=:{{ .Values.operator.ports.health }}
             - --nvmeof-dhchap={{ .Values.nvmeof.auth.dhchap.enabled }}
             - --nvmeof-dhchap-secret-key={{ .Values.nvmeof.auth.dhchap.secretKeyName }}
+            {{- if .Values.maintenance.scrub.enabled }}
+            - --scrub-config-map={{ include "simple-zfs-csi.fullname" . }}-scrub
+            {{- end }}
             {{- with .Values.operator.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

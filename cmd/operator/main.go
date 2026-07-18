@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -43,6 +44,7 @@ func main() {
 		leaderElecNS    string
 		dhchapEnabled   bool
 		dhchapSecretKey string
+		scrubConfigMap  string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe binds to.")
@@ -50,6 +52,7 @@ func main() {
 	flag.StringVar(&leaderElecNS, "leader-election-namespace", os.Getenv("POD_NAMESPACE"), "Namespace for the leader-election lease (defaults to $POD_NAMESPACE).")
 	flag.BoolVar(&dhchapEnabled, "nvmeof-dhchap", true, "Enable NVMe-oF DH-CHAP in-band authentication (ADR-0011); NQN allow-listing applies regardless.")
 	flag.StringVar(&dhchapSecretKey, "nvmeof-dhchap-secret-key", "dhchap-key", "Data key under which the DH-CHAP secret is stored in the per-attach Secret.")
+	flag.StringVar(&scrubConfigMap, "scrub-config-map", "", "Name of the scrub config ConfigMap in the operator namespace (empty disables scrub reconciliation).")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -59,10 +62,22 @@ func main() {
 	ctrl.SetLogger(logger)
 	setupLog := ctrl.Log.WithName("setup")
 
+	podNamespace := os.Getenv("POD_NAMESPACE")
+
+	// Scope the cache's namespaced reads (Secrets, ConfigMaps, CronJobs, Leases,
+	// Events) to the release namespace so the operator needs only namespaced RBAC
+	// for them; cluster-scoped resources (ZfsPool, Node, the ZFS CRDs) are still
+	// watched cluster-wide.
+	cacheOpts := cache.Options{}
+	if podNamespace != "" {
+		cacheOpts.DefaultNamespaces = map[string]cache.Config{podNamespace: {}}
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                  scheme,
 		Metrics:                 metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress:  probeAddr,
+		Cache:                   cacheOpts,
 		LeaderElection:          leaderElect,
 		LeaderElectionID:        "operator.storage.simple-zfs-csi.io",
 		LeaderElectionNamespace: leaderElecNS,
@@ -96,6 +111,17 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up zfsshareattachrequest reconciler")
 		os.Exit(1)
+	}
+
+	if scrubConfigMap != "" {
+		if err := (&controller.ScrubReconciler{
+			Client:        mgr.GetClient(),
+			Namespace:     os.Getenv("POD_NAMESPACE"),
+			ConfigMapName: scrubConfigMap,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to set up scrub reconciler")
+			os.Exit(1)
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

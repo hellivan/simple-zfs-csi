@@ -8,6 +8,87 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0012 — Pool maintenance: operator-reconciled scrub CronJobs
+
+**Status:** Accepted (2026-07-18) · **Scope:** new `cmd/zpool-scrub` (bundled in the discovery image), operator `ScrubReconciler` + config ConfigMap, `ZfsPool` watch, Helm values + RBAC · **Builds on** the `ZfsPool` discovery/takeover model (ADR-0003).
+
+### Context
+
+ZFS pools need periodic `zpool scrub` (read-verify + repair-from-redundancy) as
+routine maintenance. Requirements: configure it in `values.yaml`; surface each run
+as a Kubernetes Job that succeeds or fails (so kube-state-metrics → Prometheus
+alerting is trivial); run on the node that currently imports the pool; and follow
+the pool automatically when it moves nodes (takeover).
+
+The hard part is not the scrub — it is **node targeting**. A `zpool scrub` must run
+where the pool is imported, but a `CronJob`'s pod template is static while a pool
+can move. A plain chart-rendered CronJob would need a node-label indirection to
+track the host. Instead we let the operator — which already watches `ZfsPool` and
+knows `status.currentNode` — own the CronJob and re-target it.
+
+### Decisions
+
+1. **Config: an explicit per-pool list in values, rendered into an operator
+   ConfigMap.** `maintenance.scrub.pools: [{ guid, schedule }]` (plus a top-level
+   `enabled` and default schedule) is rendered into a ConfigMap the operator reads
+   via `--scrub-config-file` (the operator's first config file; it was flags-only).
+   Explicit list — not auto-all-pools — so the admin controls exactly which pools
+   are scrubbed and at what cadence.
+
+2. **The operator reconciles one CronJob per configured pool.** A `ScrubReconciler`
+   in the operator ensures a `CronJob` named `scrub-<guid>` whose `jobTemplate` pins
+   the pod via `nodeAffinity` on `kubernetes.io/hostname == ZfsPool.status.currentNode`
+   (affinity, not raw `nodeName`, so node taints/tolerations still apply). It watches
+   `ZfsPool` (re-pin on takeover) and the config ConfigMap (re-render on change).
+   When the pool is `NODE_OFFLINE` or has no current node it sets the CronJob
+   `.spec.suspend: true` rather than scheduling a doomed scrub. CronJobs carry a
+   `pool-guid` label; the reconciler prunes those whose pool left the config or
+   disappeared (a cluster-scoped `ZfsPool` cannot own a namespaced CronJob via
+   ownerRef GC, so pruning is label-based).
+
+3. **The scrub itself is a small host-exec binary, reusing the discovery image.**
+   `cmd/zpool-scrub` resolves the pool GUID → name, runs `zpool scrub -w <pool>`
+   (blocking), then parses `zpool status` and **exits non-zero on unrepairable
+   errors / an unhealthy pool, zero on a clean scrub** — so the Job's success/failure
+   is the scrub result. It reuses the discovery plane's `zpool.HostExec` (chroot/
+   nsenter) and is bundled into the existing discovery image (no new image or CI
+   matrix entry); the CronJob just overrides the container command. CronJobs use
+   `concurrencyPolicy: Forbid` and `backoffLimit: 0` (a failed scrub is a signal, not
+   a transient error to retry) and a long `activeDeadlineSeconds`.
+
+4. **Observability via native Job status.** kube-state-metrics
+   (`kube_job_status_failed`, `kube_cronjob_status_last_schedule_time`, …) is the
+   monitoring surface — no bespoke exporter. Writing scrub results back to
+   `ZfsPool.status` (last scrub time, repaired bytes, errors) is a deferred
+   enhancement.
+
+5. **Extensible to other maintenance later.** The same reconciler shape covers
+   `zpool trim` (SSD maintenance) as a sibling task; this cut ships scrub only.
+
+### Consequences
+
+- The operator gains `batch/cronjobs` RBAC (namespaced) and a config ConfigMap; no
+  new CRD, no new image (scrub rides the discovery image).
+- Native CronJob scheduling + native Job pass/fail keep the Prometheus story simple
+  and keep scheduling logic out of Go (the operator only reconciles the CronJob spec,
+  not the cron ticks).
+- Self-healing on takeover: the operator rewrites the affinity when a pool moves.
+- A pool not listed in `maintenance.scrub.pools` is never scrubbed by the driver —
+  intentional; the admin opts each pool in.
+
+### Plan (→ [implementation-strategy.md](implementation-strategy.md) Step 13)
+
+1. `internal/zpool`: `Scrub` + status parse (host-exec).
+2. `cmd/zpool-scrub` binary; bundle it in the discovery image.
+3. Operator `ScrubReconciler`: load config file, reconcile one CronJob per pool,
+   pin via nodeAffinity, suspend-when-offline, label-prune.
+4. Chart: `maintenance.scrub` values → operator ConfigMap; operator `cronjobs` RBAC;
+   mount the config file.
+5. Verify: unit tests (status parse → exit code, CronJob render/pin/suspend/prune),
+   `helm template`; live scrub Job is the manual e2e.
+
+---
+
 ## ADR-0011 — NVMe-oF zero-trust: per-attach host NQN + DH-CHAP
 
 **Status:** Accepted (2026-07-18) · **Scope:** csi-node (authenticated connect), operator (attach reconciler), nvmeof aggregator + nvmet, `NetworkExport.nvmeof` spec, per-attach `Secret`, Helm · **Extends** ADR-0010; **completes** ADR-0005 for NVMe-oF.

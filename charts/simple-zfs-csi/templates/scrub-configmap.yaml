@@ -1,0 +1,97 @@
+{{- if and .Values.operator.enabled .Values.maintenance.scrub.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-scrub
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scrub
+data:
+  # Consumed by the operator's ScrubReconciler (ADR-0012). `template` is a base
+  # CronJob the operator clones per pool, setting name, schedule, node affinity
+  # and the --pool-guid argument.
+  config.yaml: |
+    enabled: {{ .Values.maintenance.scrub.enabled }}
+    defaultSchedule: {{ .Values.maintenance.scrub.defaultSchedule | quote }}
+    pools:
+      {{- range .Values.maintenance.scrub.pools }}
+      - guid: {{ .guid | quote }}
+        {{- with .schedule }}
+        schedule: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/component: scrub
+      spec:
+        schedule: {{ .Values.maintenance.scrub.defaultSchedule | quote }}
+        concurrencyPolicy: Forbid
+        successfulJobsHistoryLimit: {{ .Values.maintenance.scrub.successfulJobsHistoryLimit }}
+        failedJobsHistoryLimit: {{ .Values.maintenance.scrub.failedJobsHistoryLimit }}
+        jobTemplate:
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: {{ .Values.maintenance.scrub.activeDeadlineSeconds }}
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/component: scrub
+              spec:
+                serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "discovery") }}
+                restartPolicy: Never
+                {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "nsenter") }}
+                hostPID: true
+                {{- end }}
+                {{- with .Values.tolerations }}
+                tolerations:
+                  {{- toYaml . | nindent 18 }}
+                {{- end }}
+                {{- with .Values.nodeSelector }}
+                nodeSelector:
+                  {{- toYaml . | nindent 18 }}
+                {{- end }}
+                containers:
+                  - name: scrub
+                    image: {{ include "simple-zfs-csi.image" (dict "root" . "component" "discovery") }}
+                    imagePullPolicy: {{ .Values.image.pullPolicy }}
+                    command: ["/usr/local/bin/zpool-scrub"]
+                    args:
+                      - --zpool-bin={{ .Values.discovery.zpoolBin }}
+                      {{- if .Values.discovery.hostExec.enabled }}
+                      - --host-exec-mode={{ .Values.discovery.hostExec.mode }}
+                      {{- if eq .Values.discovery.hostExec.mode "chroot" }}
+                      - --host-root=/host
+                      {{- else if eq .Values.discovery.hostExec.mode "nsenter" }}
+                      - --nsenter-target-pid={{ .Values.discovery.hostExec.targetPid }}
+                      {{- end }}
+                      {{- end }}
+                      - --timeout={{ .Values.maintenance.scrub.timeout }}
+                    securityContext:
+                      privileged: true
+                    {{- with .Values.maintenance.scrub.resources }}
+                    resources:
+                      {{- toYaml . | nindent 22 }}
+                    {{- end }}
+                    volumeMounts:
+                      - name: dev
+                        mountPath: /dev
+                        mountPropagation: HostToContainer
+                      {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "chroot") }}
+                      - name: host-root
+                        mountPath: /host
+                        mountPropagation: HostToContainer
+                      {{- end }}
+                volumes:
+                  - name: dev
+                    hostPath:
+                      path: /dev
+                      type: Directory
+                  {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "chroot") }}
+                  - name: host-root
+                    hostPath:
+                      path: {{ .Values.discovery.hostExec.hostRootPath }}
+                      type: Directory
+                  {{- end }}
+{{- end }}

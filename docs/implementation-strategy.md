@@ -215,6 +215,22 @@ DH-CHAP password auth, on by default.
   Secret lifecycle, nvmet dhchap programming, node connect flags), `helm template`;
   live authenticated `nvme connect` is the manual e2e step.
 
+### Step 13 — Pool maintenance: operator-reconciled scrub CronJobs (ADR-0012)
+Periodic `zpool scrub` per pool, configured in values, surfaced as pass/fail Jobs.
+- `internal/zpool`: `Scrub(pool)` (`zpool scrub -w`) + parse `zpool status` into a
+  health/error result (host-exec).
+- `cmd/zpool-scrub`: resolve GUID → pool, scrub, exit non-zero on errors/unhealthy;
+  bundled into the discovery image (CronJob overrides the command).
+- Operator `ScrubReconciler`: read `--scrub-config-file` (per-pool `{guid, schedule}`),
+  watch `ZfsPool` + the ConfigMap, ensure one `CronJob scrub-<guid>` pinned via
+  `nodeAffinity` on `kubernetes.io/hostname == status.currentNode`; suspend when
+  offline; label-prune pools removed from config. `concurrencyPolicy: Forbid`,
+  `backoffLimit: 0`.
+- Chart: `maintenance.scrub.{enabled,defaultSchedule,pools[]}` → operator ConfigMap;
+  operator `batch/cronjobs` RBAC; mount the config file.
+- Verify: unit tests (status parse → exit code, CronJob render/pin/suspend/prune),
+  `helm template`; live scrub Job is the manual e2e.
+
 ## Verification matrix
 
 | Step | Build | Unit | Cluster/e2e |
@@ -232,6 +248,7 @@ DH-CHAP password auth, on by default.
 | 10 clone/restore ✅ | `make manifests`+`build` | clone spec + CreateVolume source | PVC from snapshot; PVC clone |
 | 11 attach access-control ✅ | `make manifests`+`build`+`helm-template` | nvmeof RWX rejection, publish/unpublish, attach-request aggregation, status gating | RWO NVMe + RWX NFS attach/detach; static CSI PV |
 | 12 nvmeof auth | `make manifests`+`build`+`helm-template` | NQN resolution/default-deny, DH-CHAP key+Secret, nvmet dhchap, node connect flags | authenticated `nvme connect` (NQN + DH-CHAP) |
+| 13 scrub maintenance | `build`+`helm-template` | status parse → exit code, CronJob render/pin/suspend/prune | scrub Job pass/fail per pool |
 
 ## Out of scope (tracked, not now)
 - Backup pod (`ssh-daemon` + `cron-puller`) — separate pod, later; shares the host-exec helper.

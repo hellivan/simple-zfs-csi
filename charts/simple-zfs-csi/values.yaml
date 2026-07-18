@@ -329,6 +329,32 @@ csiDriver:
   # -- Install the CSIDriver object for the driver.
   create: true
 
+# -------- Pool maintenance --------
+# ZFS pools need periodic scrubbing. When enabled, the operator reconciles one
+# CronJob per listed pool, pinned to the pool's current node (following takeover)
+# and suspended while the pool is offline. Each run is a Kubernetes Job that
+# succeeds on a clean scrub and fails on errors — monitor via kube-state-metrics
+# (`kube_job_status_failed`). See docs/design-decisions.md ADR-0012.
+maintenance:
+  scrub:
+    # -- Enable operator-reconciled scrub CronJobs (requires the operator).
+    enabled: false
+    # -- Default cron schedule for pools that don't set their own.
+    defaultSchedule: "0 3 * * 0"
+    # -- Max time a single scrub Job may run before being killed.
+    activeDeadlineSeconds: 86400
+    # -- Timeout passed to the scrub binary (should be <= activeDeadlineSeconds).
+    timeout: 24h
+    # -- Retained finished/failed Job history per pool CronJob.
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    # -- Resource requests/limits for the scrub container.
+    resources: {}
+    # -- Pools to scrub, by GUID, with an optional per-pool schedule override.
+    pools: []
+      # - guid: "1234567890"
+      #   schedule: "0 3 * * 6"
+
 # -------- Example StorageClasses --------
 # -- StorageClasses to install with the chart. Each entry becomes a StorageClass
 # -- named "<fullname>-<key>". By default none are installed. `poolGUID` and

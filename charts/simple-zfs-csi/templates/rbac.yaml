@@ -370,6 +370,43 @@ subjects:
     name: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "operator") }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- if and .Values.operator.enabled .Values.maintenance.scrub.enabled }}
+---
+# Scrub maintenance: the operator reconciles per-pool scrub CronJobs from the
+# scrub ConfigMap and the live ZfsPools (ADR-0012). Namespaced.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-operator-scrub
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-operator-scrub
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "simple-zfs-csi.fullname" . }}-operator-scrub
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "operator") }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- if or .Values.nvmeof.enabled .Values.csiNode.enabled }}
 ---
 # DH-CHAP secret readers: the nvmeof aggregator programs the target's dhchap_key
