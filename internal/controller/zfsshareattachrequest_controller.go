@@ -51,6 +51,9 @@ type ZfsShareAttachRequestReconciler struct {
 	// DHChapEnabled turns on NVMe-oF in-band DH-CHAP authentication (ADR-0011).
 	// NQN allow-listing is applied regardless.
 	DHChapEnabled bool
+	// DHChapSecretKey is the data key under which the DH-CHAP secret is stored in
+	// the Secret and recorded on the NetworkExport. Empty defaults to "dhchap-key".
+	DHChapSecretKey string
 }
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsshareattachrequests,verbs=get;list;watch;update;patch
@@ -266,6 +269,7 @@ func (r *ZfsShareAttachRequestReconciler) nvmeExportSpec(ctx context.Context, vo
 		}
 		spec.DHChapSecretName = name
 		spec.DHChapSecretNamespace = r.Namespace
+		spec.DHChapSecretKey = nvmeauth.ResolveSecretKey(r.DHChapSecretKey)
 	}
 	return spec, nil
 }
@@ -290,7 +294,7 @@ func (r *ZfsShareAttachRequestReconciler) ensureDHChapSecret(ctx context.Context
 		sec = corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.Namespace},
 			Type:       corev1.SecretTypeOpaque,
-			Data:       map[string][]byte{nvmeauth.SecretKeyDHChap: []byte(key)},
+			Data:       map[string][]byte{nvmeauth.ResolveSecretKey(r.DHChapSecretKey): []byte(key)},
 		}
 		if err := r.Create(ctx, &sec); err != nil && !apierrors.IsAlreadyExists(err) {
 			return "", err

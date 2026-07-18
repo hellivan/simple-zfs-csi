@@ -322,9 +322,10 @@ func (n *NodeServer) dhchapKey(ctx context.Context, export *storagev1alpha1.Netw
 	if err := n.Client.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, sec); err != nil {
 		return "", fmt.Errorf("get dhchap secret %s/%s: %w", ns, name, err)
 	}
-	key := sec.Data[nvmeauth.SecretKeyDHChap]
+	dataKey := nvmeauth.ResolveSecretKey(export.Spec.NVMeoF.DHChapSecretKey)
+	key := sec.Data[dataKey]
 	if len(key) == 0 {
-		return "", fmt.Errorf("dhchap secret %s/%s missing data key %q", ns, name, nvmeauth.SecretKeyDHChap)
+		return "", fmt.Errorf("dhchap secret %s/%s missing data key %q", ns, name, dataKey)
 	}
 	return string(key), nil
 }

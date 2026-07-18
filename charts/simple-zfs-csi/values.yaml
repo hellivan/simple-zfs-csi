@@ -88,6 +88,9 @@ nvmeof:
       # -- applies regardless; turning this off keeps identity restriction but
       # -- drops the password.
       enabled: true
+      # -- Data key under which the operator stores the DH-CHAP secret in each
+      # -- per-attach Secret (recorded on the NetworkExport for readers).
+      secretKeyName: dhchap-key
   # -- Host mount point of the configfs filesystem. The nvmet target subtree
   # lives at `<configfsRoot>/nvmet`, which is what the controller manages.
   configfsRoot: /sys/kernel/config

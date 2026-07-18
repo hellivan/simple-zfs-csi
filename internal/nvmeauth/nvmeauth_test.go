@@ -56,3 +56,12 @@ func TestGenerateDHChapKey_Format(t *testing.T) {
 		t.Errorf("expected distinct keys across calls")
 	}
 }
+
+func TestResolveSecretKey(t *testing.T) {
+	if got := ResolveSecretKey(""); got != SecretKeyDHChap {
+		t.Errorf("ResolveSecretKey(empty) = %q, want %q", got, SecretKeyDHChap)
+	}
+	if got := ResolveSecretKey("custom"); got != "custom" {
+		t.Errorf("ResolveSecretKey(custom) = %q, want custom", got)
+	}
+}

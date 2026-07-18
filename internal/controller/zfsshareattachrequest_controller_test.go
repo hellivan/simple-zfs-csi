@@ -220,6 +220,9 @@ func TestAttachRequest_NVMeoFAuthProgramsSecretAndNQN(t *testing.T) {
 	if share.Spec.NVMeoF.DHChapSecretName != "dhchap-pvc-4" || share.Spec.NVMeoF.DHChapSecretNamespace != "sys" {
 		t.Errorf("dhchap secret ref = %q/%q", share.Spec.NVMeoF.DHChapSecretNamespace, share.Spec.NVMeoF.DHChapSecretName)
 	}
+	if share.Spec.NVMeoF.DHChapSecretKey != nvmeauth.SecretKeyDHChap {
+		t.Errorf("dhchap secret key = %q, want %q", share.Spec.NVMeoF.DHChapSecretKey, nvmeauth.SecretKeyDHChap)
+	}
 
 	sec := &corev1.Secret{}
 	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "sys", Name: "dhchap-pvc-4"}, sec); err != nil {

@@ -19,9 +19,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// SecretKeyDHChap is the data key under which the DH-CHAP secret is stored in
-// the per-attach Kubernetes Secret.
+// SecretKeyDHChap is the default data key under which the DH-CHAP secret is
+// stored in the per-attach Kubernetes Secret. The operator may override it, in
+// which case the chosen key is recorded on the NetworkExport for readers.
 const SecretKeyDHChap = "dhchap-key"
+
+// ResolveSecretKey returns configured when non-empty, otherwise the default
+// DH-CHAP data key. Readers use it so the key name is never assumed.
+func ResolveSecretKey(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return SecretKeyDHChap
+}
 
 // hostNamespace is the fixed UUIDv5 namespace for deriving per-attach host UUIDs.
 // It is a stable, arbitrary constant (derived once from the driver domain).

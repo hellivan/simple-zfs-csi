@@ -92,9 +92,9 @@ type NVMeoFExportSpec struct {
 	AllowedHosts []string `json:"allowedHosts,omitempty"`
 
 	// DHChapSecretName references a Secret holding the per-attach DH-CHAP key
-	// (data key "dhchap-key", DHHC-1 format) that the target programs onto the
-	// allowed host and the node passes to `nvme connect --dhchap-secret`. Empty
-	// means no in-band authentication. See design-decisions ADR-0011.
+	// that the target programs onto the allowed host and the node passes to
+	// `nvme connect --dhchap-secret`. Empty means no in-band authentication. See
+	// design-decisions ADR-0011.
 	// +optional
 	DHChapSecretName string `json:"dhchapSecretName,omitempty"`
 
@@ -102,6 +102,13 @@ type NVMeoFExportSpec struct {
 	// release namespace). Required when DHChapSecretName is set.
 	// +optional
 	DHChapSecretNamespace string `json:"dhchapSecretNamespace,omitempty"`
+
+	// DHChapSecretKey is the data key within DHChapSecretName that holds the
+	// DH-CHAP secret (DHHC-1 format). The operator always sets it alongside
+	// DHChapSecretName (defaulting to "dhchap-key"); readers must use this value
+	// rather than assuming a fixed key.
+	// +optional
+	DHChapSecretKey string `json:"dhchapSecretKey,omitempty"`
 }
 
 // NetworkExportStatus reports the observed export state on the node.

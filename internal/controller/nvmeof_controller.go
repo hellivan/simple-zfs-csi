@@ -49,7 +49,7 @@ func (r *NVMeoFReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if s.Spec.NVMeoF != nil {
 			allowed = s.Spec.NVMeoF.AllowedHosts
 			if s.Spec.NVMeoF.DHChapSecretName != "" {
-				key, err := r.dhchapKey(ctx, s.Spec.NVMeoF.DHChapSecretNamespace, s.Spec.NVMeoF.DHChapSecretName)
+				key, err := r.dhchapKey(ctx, s.Spec.NVMeoF.DHChapSecretNamespace, s.Spec.NVMeoF.DHChapSecretName, s.Spec.NVMeoF.DHChapSecretKey)
 				if err != nil {
 					// The target is not fully programmed until the key is available;
 					// requeue so the export is not prematurely marked Exported.
@@ -88,7 +88,7 @@ func (r *NVMeoFReconciler) effectiveNQN(s *storagev1alpha1.NetworkExport) string
 }
 
 // dhchapKey reads the DH-CHAP secret referenced by an nvmeof export.
-func (r *NVMeoFReconciler) dhchapKey(ctx context.Context, namespace, name string) (string, error) {
+func (r *NVMeoFReconciler) dhchapKey(ctx context.Context, namespace, name, dataKey string) (string, error) {
 	if namespace == "" {
 		return "", fmt.Errorf("dhchap secret %q has no namespace", name)
 	}
@@ -96,9 +96,10 @@ func (r *NVMeoFReconciler) dhchapKey(ctx context.Context, namespace, name string
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec); err != nil {
 		return "", fmt.Errorf("get dhchap secret %s/%s: %w", namespace, name, err)
 	}
-	key := sec.Data[nvmeauth.SecretKeyDHChap]
+	k := nvmeauth.ResolveSecretKey(dataKey)
+	key := sec.Data[k]
 	if len(key) == 0 {
-		return "", fmt.Errorf("dhchap secret %s/%s missing data key %q", namespace, name, nvmeauth.SecretKeyDHChap)
+		return "", fmt.Errorf("dhchap secret %s/%s missing data key %q", namespace, name, k)
 	}
 	return string(key), nil
 }

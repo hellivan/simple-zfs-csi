@@ -65,6 +65,9 @@ them — so rotating a key on a new attach would clobber sibling connections.
    nvmet aggregator** (writes it to the host object's `dhchap_key`) and the
    **consuming node** (passes it as `nvme connect --dhchap-secret`). Readiness gating
    (ADR-0010 §4) already guarantees the target is programmed before the node connects.
+   The Secret's **data-key name is configurable** (operator flag
+   `--nvmeof-dhchap-secret-key`, default `dhchap-key`) and is always recorded on the
+   `NetworkExport` (`dhchapSecretKey`), so readers never assume a fixed key name.
 
 5. **One-way DH-CHAP first; bidirectional later.** The initiator authenticates to
    the target (`dhchap_key`). Bidirectional (`dhchap_ctrl_key`, target authenticates
