@@ -273,7 +273,8 @@ subjects:
     name: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "csi-controller") }}
     namespace: {{ .Release.Namespace }}
 ---
-# Namespaced permissions for external-provisioner leader-election.
+# Namespaced permissions for external-provisioner leader-election, plus the
+# driver's live read of the provisioner default-parameters ConfigMap (ADR-0001).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -286,6 +287,9 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

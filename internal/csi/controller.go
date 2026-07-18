@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
@@ -29,6 +30,10 @@ const (
 	CtxProtocol = "protocol"
 )
 
+// defaultsConfigMapKey is the ConfigMap data key holding the provisioner default
+// parameters (a YAML map of parameter name -> value).
+const defaultsConfigMapKey = "parameters.yaml"
+
 // ControllerServer implements the CSI Controller service by writing the ZFS
 // CRDs. CreateVolume writes a ZfsDataset, waits for it to become Ready, writes a
 // ZfsShare, and returns a routing-only volume_context. DeleteVolume deletes both
@@ -36,8 +41,14 @@ const (
 type ControllerServer struct {
 	csi.UnimplementedControllerServer
 
-	Client        client.Client
-	DefaultParams map[string]string
+	Client client.Client
+	// DefaultsConfigMap names a ConfigMap in DefaultsNamespace whose
+	// "parameters.yaml" key holds the provisioner default parameters (the
+	// lowest-precedence layer). It is read live from the API on every CreateVolume
+	// (no file mount, edits take effect without a restart); empty disables the
+	// defaults layer.
+	DefaultsConfigMap string
+	DefaultsNamespace string
 	// AnnotationPrefix selects which PVC annotations override parameters, e.g.
 	// "param.simple-zfs-csi.io/". Empty disables the PVC-annotation layer.
 	AnnotationPrefix string
@@ -64,7 +75,11 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if err != nil {
 		return nil, err
 	}
-	merged := ResolveParameters(c.DefaultParams, req.GetParameters(), pvcAnnotations, c.AnnotationPrefix)
+	defaults, err := c.defaultParams(ctx)
+	if err != nil {
+		return nil, err
+	}
+	merged := ResolveParameters(defaults, req.GetParameters(), pvcAnnotations, c.AnnotationPrefix)
 	rp, err := ParseParams(merged)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -484,6 +499,32 @@ func (c *ControllerServer) waitVolumeReady(ctx context.Context, name string, min
 		case <-ticker.C:
 		}
 	}
+}
+
+// defaultParams reads the provisioner default parameters live from the defaults
+// ConfigMap on every CreateVolume. It returns nil (no defaults layer) when the
+// ConfigMap is unconfigured, absent, or empty, so a missing ConfigMap is not an
+// error.
+func (c *ControllerServer) defaultParams(ctx context.Context) (map[string]string, error) {
+	if c.DefaultsConfigMap == "" {
+		return nil, nil
+	}
+	var cm corev1.ConfigMap
+	if err := c.Client.Get(ctx, client.ObjectKey{Namespace: c.DefaultsNamespace, Name: c.DefaultsConfigMap}, &cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, status.Errorf(codes.Internal, "get default-parameters ConfigMap %s/%s: %v", c.DefaultsNamespace, c.DefaultsConfigMap, err)
+	}
+	raw := cm.Data[defaultsConfigMapKey]
+	if raw == "" {
+		return nil, nil
+	}
+	out := map[string]string{}
+	if err := yaml.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, status.Errorf(codes.Internal, "parse default parameters from %s/%s[%s]: %v", c.DefaultsNamespace, c.DefaultsConfigMap, defaultsConfigMapKey, err)
+	}
+	return out, nil
 }
 
 // pvcAnnotations fetches the source PVC (identified by the reserved metadata

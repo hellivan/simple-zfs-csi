@@ -62,7 +62,7 @@ type ResolvedParams struct {
 
 // ResolveParameters merges the three inheritance layers into a single flat map,
 // later layers overriding earlier ones:
-//  1. defaults    — provisioner defaults (from --default-parameters-file);
+//  1. defaults    — provisioner defaults (read live from the default-parameters ConfigMap);
 //  2. scParams    — StorageClass parameters (reserved csi.storage.k8s.io/* keys stripped);
 //  3. pvcAnnotations — PVC annotations carrying annPrefix (prefix stripped).
 //

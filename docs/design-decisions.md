@@ -796,8 +796,11 @@ free-space picking and no CSI topology awareness in this step.
 Parameters resolve into a single `map[string]string` (later layer wins), then
 parse into the CRD specs. Deliberately simpler than democratic-csi templating.
 
-1. **Provisioner defaults** — a YAML map mounted into the controller
-   (`--default-parameters-file`, sourced from Helm values).
+1. **Provisioner defaults** — a YAML map in a ConfigMap the controller reads
+   live from the API per `CreateVolume` (`--default-parameters-configmap`,
+   sourced from Helm values; originally a mounted `--default-parameters-file`,
+   later switched to a live API read so edits need no restart and nothing is
+   mounted).
 2. **StorageClass `parameters`** — arrive in `CreateVolumeRequest.Parameters`.
 3. **PVC annotations** — `external-provisioner` runs with
    `--extra-create-metadata`, which injects

@@ -10,7 +10,6 @@ import (
 	"os"
 	"time"
 
-	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -34,16 +33,16 @@ func init() {
 
 func main() {
 	var (
-		endpoint         string
-		driverName       string
-		defaultsFile     string
-		annotationPrefix string
-		createTimeout    time.Duration
-		pollInterval     time.Duration
+		endpoint          string
+		driverName        string
+		defaultsConfigMap string
+		annotationPrefix  string
+		createTimeout     time.Duration
+		pollInterval      time.Duration
 	)
 	flag.StringVar(&endpoint, "endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint the plugin listens on.")
 	flag.StringVar(&driverName, "driver-name", "simple-zfs-csi.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
-	flag.StringVar(&defaultsFile, "default-parameters-file", "", "Optional YAML file with provisioner default parameters (lowest precedence).")
+	flag.StringVar(&defaultsConfigMap, "default-parameters-configmap", "", "Optional ConfigMap (in the controller namespace) whose \"parameters.yaml\" key holds provisioner default parameters, read live per CreateVolume (empty disables the defaults layer).")
 	flag.StringVar(&annotationPrefix, "pvc-annotation-prefix", "param.simple-zfs-csi.io/", "PVC annotation prefix whose keys override parameters (empty disables the PVC layer).")
 	flag.DurationVar(&createTimeout, "create-timeout", 2*time.Minute, "How long CreateVolume waits for a ZfsDataset to become Ready.")
 	flag.DurationVar(&pollInterval, "poll-interval", 2*time.Second, "How often CreateVolume re-reads a ZfsDataset while waiting for Ready.")
@@ -55,12 +54,6 @@ func main() {
 	logger := zap.New(zap.UseFlagOptions(&opts))
 	ctrl.SetLogger(logger)
 	setupLog := ctrl.Log.WithName("setup")
-
-	defaultParams, err := loadDefaults(defaultsFile)
-	if err != nil {
-		setupLog.Error(err, "unable to load default parameters", "file", defaultsFile)
-		os.Exit(1)
-	}
 
 	cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 	if err != nil {
@@ -77,12 +70,13 @@ func main() {
 		},
 	}
 	cs := &zfscsi.ControllerServer{
-		Client:           cl,
-		DefaultParams:    defaultParams,
-		AnnotationPrefix: annotationPrefix,
-		CreateTimeout:    createTimeout,
-		PollInterval:     pollInterval,
-		Log:              ctrl.Log.WithName("controller"),
+		Client:            cl,
+		DefaultsConfigMap: defaultsConfigMap,
+		DefaultsNamespace: os.Getenv("POD_NAMESPACE"),
+		AnnotationPrefix:  annotationPrefix,
+		CreateTimeout:     createTimeout,
+		PollInterval:      pollInterval,
+		Log:               ctrl.Log.WithName("controller"),
 	}
 
 	setupLog.Info("starting CSI controller", "driver", driverName, "endpoint", endpoint, "version", version)
@@ -90,21 +84,4 @@ func main() {
 		setupLog.Error(err, "CSI server exited with error")
 		os.Exit(1)
 	}
-}
-
-// loadDefaults reads an optional YAML map of default parameters. A missing path
-// yields an empty map.
-func loadDefaults(path string) (map[string]string, error) {
-	if path == "" {
-		return map[string]string{}, nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]string{}
-	if err := yaml.Unmarshal(data, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
 }

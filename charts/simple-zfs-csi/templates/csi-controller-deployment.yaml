@@ -62,19 +62,19 @@ spec:
             - --poll-interval={{ .Values.csiController.pollInterval }}
             - --pvc-annotation-prefix={{ .Values.csiController.pvcAnnotationPrefix }}
             {{- if .Values.csiController.defaultParameters }}
-            - --default-parameters-file=/etc/simple-zfs-csi/parameters.yaml
+            - --default-parameters-configmap={{ include "simple-zfs-csi.fullname" . }}-csi-controller-defaults
             {{- end }}
             {{- with .Values.csiController.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           volumeMounts:
             - name: socket-dir
               mountPath: {{ .Values.csiController.socketDir }}
-            {{- if .Values.csiController.defaultParameters }}
-            - name: default-parameters
-              mountPath: /etc/simple-zfs-csi
-              readOnly: true
-            {{- end }}
           {{- with .Values.csiController.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -175,9 +175,4 @@ spec:
       volumes:
         - name: socket-dir
           emptyDir: {}
-        {{- if .Values.csiController.defaultParameters }}
-        - name: default-parameters
-          configMap:
-            name: {{ include "simple-zfs-csi.fullname" . }}-csi-controller-defaults
-        {{- end }}
 {{- end }}

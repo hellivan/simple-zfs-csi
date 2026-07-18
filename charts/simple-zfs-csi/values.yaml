@@ -204,7 +204,9 @@ csiController:
   # -- PVC inheritance layer).
   pvcAnnotationPrefix: param.simple-zfs-csi.io/
   # -- Provisioner default parameters (lowest-precedence inheritance layer).
-  # -- When non-empty they are rendered into a ConfigMap and mounted. NOTE:
+  # -- When non-empty they are rendered into a ConfigMap that the controller reads
+  # -- live from the API on each CreateVolume (no file mount; edits take effect
+  # -- without a restart). NOTE:
   # -- `poolGUID` and `datasetPrefix` are StorageClass-only and are ignored here
   # -- (see docs/design-decisions.md ADR-0002); use them for cluster-wide
   # -- defaults such as protocol or ZFS properties instead.
