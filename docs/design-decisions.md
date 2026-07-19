@@ -707,7 +707,7 @@ or, worse, from a PVC annotation, then:
    appear in the provisioner-defaults layer or in the PVC-annotation layer they
    are dropped during resolution. Implemented as `storageClassOnlyParams` in
    [internal/csi/params.go](../internal/csi/params.go); other keys (`protocol`,
-   `volblocksize`, `nfsClients`, `nvmeofAllowedHosts`, `property.*`) keep the full
+   `volblocksize`, `property.*`) keep the full
    inheritance chain.
 
 2. **No default `poolGUID`.** There is no cluster-wide default pool. Every
@@ -717,8 +717,8 @@ or, worse, from a PVC annotation, then:
    `poolGUID`/`datasetPrefix` (documented inline in `values.yaml`).
 
 3. **StorageClasses are declared in the Helm chart.** `values.yaml` exposes a
-   `storageClasses` map (empty by default — the chart installs none), rendered by
-   `templates/storageclasses.yaml`, mirroring the Ceph CSI chart. Each entry sets
+   `storageClasses` list (empty by default — the chart installs none), rendered by
+   `templates/storageclasses.yaml`. Each entry carries a `name` and sets
    its own `parameters` (including the required `poolGUID` and optional
    `datasetPrefix`), `reclaimPolicy`, `volumeBindingMode`, etc.
 
@@ -758,6 +758,12 @@ free-space picking and no CSI topology awareness in this step.
   without changing the CRD contract.
 
 #### 2. `CreateVolume` creates **both** `ZfsDataset` and `ZfsShare` (provision-time share)
+
+> **Superseded by ADR-0010 (attach-stage zero-trust share lifecycle).** The share
+> lifecycle moved to the attach stage: `CreateVolume` now writes only the
+> `ZfsDataset`; the `ZfsShare` is created on demand at `ControllerPublishVolume`
+> via a `ZfsShareAttachRequest` (aggregated by the operator) and torn down on
+> unpublish. The provision-time-share reasoning below is retained for history.
 
 `CreateVolume` writes the `ZfsDataset`, waits for it to reach `Ready`, writes the
 `ZfsShare`, and returns `volume_context = { poolGUID, dataset, protocol }`.
@@ -820,6 +826,10 @@ from some layer). `poolGUID` and `datasetPrefix` are **StorageClass-only** — s
 | `nfsClients` | ZfsShare | comma list, e.g. `10.0.0.0/8:rw` |
 | `nvmeofAllowedHosts` | ZfsShare | comma list of host NQNs (empty = allow-all) |
 | `property.<zfsprop>` | ZfsDataset | pass-through to `spec.properties` |
+
+> Note: `nfsClients` and `nvmeofAllowedHosts` were later removed (ADR-0010/0011);
+> client allow-lists and host NQNs are now derived per attach, not supplied as
+> parameters.
 
 Capacity: `CreateVolumeRequest.capacity_range` maps to the zvol `spec.volume.size`
 and to the filesystem `spec.filesystem.quota`.

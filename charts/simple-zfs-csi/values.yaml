@@ -358,13 +358,13 @@ maintenance:
       #   schedule: "0 3 * * 6"
 
 # -------- Example StorageClasses --------
-# -- StorageClasses to install with the chart. Each entry becomes a StorageClass
-# -- named "<fullname>-<key>". By default none are installed. `poolGUID` and
-# -- `datasetPrefix` are StorageClass-only parameters and must be set here (they
-# -- are never inherited from defaultParameters or PVC annotations). `poolGUID`
-# -- is required per StorageClass.
-storageClasses: {}
-  # nfs:
+# -- StorageClasses to install with the chart. A list; each entry becomes a
+# -- StorageClass named "<fullname>-<name>". By default none are installed.
+# -- `poolGUID` and `datasetPrefix` are StorageClass-only parameters and must be
+# -- set here (they are never inherited from defaultParameters or PVC
+# -- annotations). `poolGUID` is required per StorageClass.
+storageClasses: []
+  # - name: nfs
   #   isDefault: false
   #   reclaimPolicy: Delete
   #   volumeBindingMode: Immediate
@@ -373,7 +373,7 @@ storageClasses: {}
   #     poolGUID: "1234567890"   # required; identifies the target ZFS pool
   #     datasetPrefix: k8s        # optional; prefixes every provisioned dataset
   #     protocol: nfs
-  # nvmeof:
+  # - name: nvmeof
   #   reclaimPolicy: Delete
   #   parameters:
   #     poolGUID: "1234567890"
@@ -382,12 +382,12 @@ storageClasses: {}
   #     volblocksize: 16k
 
 # -------- Example VolumeSnapshotClasses --------
-# -- VolumeSnapshotClasses to install with the chart. Each entry becomes a
-# -- VolumeSnapshotClass named "<fullname>-<key>". By default none are installed.
-# -- Requires the snapshot CRDs + snapshot-controller installed cluster-wide and
-# -- `csiController.snapshotter.enabled: true`.
-volumeSnapshotClasses: {}
-  # nfs:
+# -- VolumeSnapshotClasses to install with the chart. A list; each entry becomes
+# -- a VolumeSnapshotClass named "<fullname>-<name>". By default none are
+# -- installed. Requires the snapshot CRDs + snapshot-controller installed
+# -- cluster-wide and `csiController.snapshotter.enabled: true`.
+volumeSnapshotClasses: []
+  # - name: nfs
   #   isDefault: false
   #   deletionPolicy: Delete
   #   parameters: {}

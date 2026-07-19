@@ -1,25 +1,25 @@
-{{- range $name, $sc := .Values.storageClasses }}
+{{- range .Values.storageClasses }}
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: {{ include "simple-zfs-csi.fullname" $ }}-{{ $name }}
+  name: {{ include "simple-zfs-csi.fullname" $ }}-{{ .name }}
   labels:
     {{- include "simple-zfs-csi.labels" $ | nindent 4 }}
     app.kubernetes.io/component: storageclass
-  {{- if $sc.isDefault }}
+  {{- if .isDefault }}
   annotations:
     storageclass.kubernetes.io/is-default-class: "true"
   {{- end }}
 provisioner: {{ $.Values.driverName }}
-reclaimPolicy: {{ $sc.reclaimPolicy | default "Delete" }}
-volumeBindingMode: {{ $sc.volumeBindingMode | default "Immediate" }}
-allowVolumeExpansion: {{ $sc.allowVolumeExpansion | default false }}
-{{- with $sc.parameters }}
+reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
+volumeBindingMode: {{ .volumeBindingMode | default "Immediate" }}
+allowVolumeExpansion: {{ .allowVolumeExpansion | default false }}
+{{- with .parameters }}
 parameters:
   {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with $sc.mountOptions }}
+{{- with .mountOptions }}
 mountOptions:
   {{- toYaml . | nindent 2 }}
 {{- end }}

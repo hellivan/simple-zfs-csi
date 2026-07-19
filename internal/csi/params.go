@@ -1,8 +1,9 @@
 // Package csi implements the simple-zfs-csi CSI controller plugin: a thin,
-// unprivileged gRPC adapter that translates CSI CreateVolume/DeleteVolume calls
-// into the ZFS-centric CRDs (ZfsDataset + ZfsShare) and returns a routing-only
-// volume_context. It contains no reconcile loops; the agent and operator do the
-// actual work.
+// unprivileged gRPC adapter that translates CSI CreateVolume/DeleteVolume and
+// ControllerPublish/Unpublish calls into the ZFS-centric CRDs (a ZfsDataset at
+// provision, plus a ZfsShareAttachRequest per node at attach) and returns a
+// routing-only volume_context. It contains no reconcile loops; the agent and
+// operator do the actual work.
 package csi
 
 import (

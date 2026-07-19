@@ -12,23 +12,25 @@ node-pinned *exports*, and per-node aggregators execute those exports.
 
 | Component | Image | Kind | Reconciles | Mechanism |
 |-----------|-------|------|------------|-----------|
-| `csi-controller` | `simple-zfs-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` | thin gRPC adapter: writes `ZfsDataset` (+ `ZfsShare`), returns a routing-only volume context |
+| `csi-controller` | `simple-zfs-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` + `ControllerPublish`/`Unpublish` | thin gRPC adapter: writes `ZfsDataset`; at attach writes one `ZfsShareAttachRequest` per node; returns a routing-only volume context |
 | `csi-node` | `simple-zfs-csi-node` | DaemonSet (all nodes) | CSI `NodePublishVolume` | resolves `ZfsPool.status`, `mount -t nfs` / `nvme connect`; refuses `NODE_OFFLINE` |
 | `zpool-discovery` (agent) | `simple-zfs-csi-discovery` | DaemonSet (storage nodes) | local pools (Tier 1) + `ZfsDataset` | polls `zpool`/`zfs` into `ZfsPool`; `zfs create/destroy` for datasets/zvols |
-| `operator` | `simple-zfs-csi-operator` | Deployment (x1, leader-elected) | `Node` (Tier 2) + `ZfsShare` | forces dead nodes' `ZfsPool` to `NODE_OFFLINE`; compiles `ZfsShare` → `NetworkExport` |
+| `operator` | `simple-zfs-csi-operator` | Deployment (x1, leader-elected) | `Node` (Tier 2) + `ZfsShareAttachRequest` + `ZfsShare` | offlines dead nodes' `ZfsPool`; aggregates attach requests into a lazy `ZfsShare` → `NetworkExport` |
 | `nfs-controller` | `simple-zfs-csi-nfs` | DaemonSet (storage nodes) | `protocol: nfs` `NetworkExport` | writes `/etc/exports`, runs `exportfs -ra`, supervises the NFS server |
 | `nvmeof-controller` | `simple-zfs-csi-nvmeof` | DaemonSet (storage nodes) | `protocol: nvmeof` `NetworkExport` | programs the kernel NVMe target via `configfs` (`/sys/kernel/config/nvmet`) |
 
-The CRDs form a compile-down chain — a PVC turns into a `ZfsDataset` +
-`ZfsShare`, and the `ZfsShare` renders a `NetworkExport`; separately, a
-`VolumeSnapshot` turns into a `ZfsSnapshot`:
+The CRDs form a compile-down chain — a PVC turns into a `ZfsDataset` at
+provisioning; at attach time each consuming node adds a `ZfsShareAttachRequest`,
+which the operator aggregates into a lazy `ZfsShare`, and the `ZfsShare` renders a
+`NetworkExport`; separately, a `VolumeSnapshot` turns into a `ZfsSnapshot`:
 
 | CRD | Scope | Keyed on | Written by | Purpose |
 |-----|-------|----------|------------|---------|
 | `ZfsPool` | Cluster | pool GUID (`metadata.name`) | discovery + operator | routing + health of a physical pool |
 | `ZfsDataset` | Cluster | `spec.poolGUID` | csi-controller (creates), agent (reconciles) | dataset/zvol allocation intent |
 | `ZfsSnapshot` | Cluster | `spec.poolGUID` + source dataset | csi-controller (creates), agent (reconciles) | point-in-time `dataset@snap` for restore/clone |
-| `ZfsShare` | Cluster | `spec.poolGUID` + `spec.dataset` | csi-controller (creates), operator (reconciles) | ZFS-centric "intent to share"; renders a `NetworkExport` |
+| `ZfsShareAttachRequest` | Cluster | `spec.volumeName` + `spec.nodeName` | csi-controller (creates/deletes) | per-node "attach intent"; ref-counts the aggregated `ZfsShare` |
+| `ZfsShare` | Cluster | `spec.poolGUID` + `spec.dataset` | operator (aggregates from attach requests) | ZFS-centric "intent to share"; renders a `NetworkExport` |
 | `NetworkExport` | Cluster | `spec.nodeName` + `spec.path` | operator (owns) or admin (standalone) | generic, ZFS-agnostic node-local export executor contract |
 
 Key rule: **`ZfsShare` compiles down to `NetworkExport`.** Only `NetworkExport`
@@ -41,23 +43,30 @@ it can still be authored by hand for non-ZFS paths.
 ### Provisioning flow (PVC → mounted pod)
 
 ```
-kubelet ──► csi-controller ──► ZfsDataset  ──► agent: zfs create dataset/zvol
-(CreateVolume)   (writes CRDs)  └► ZfsShare ──► operator ──► NetworkExport
-                                                                   │
-                                              ┌────────────────────┴───────────┐
-                                              ▼                                ▼
-                                       nfs-controller                   nvmeof-controller
-                                       (/etc/exports)                   (nvmet configfs)
+kubelet ──► csi-controller ──► ZfsDataset ──► agent: zfs create dataset/zvol
+(CreateVolume)   (writes CRD)                  (no export yet — the share is lazy)
+
+kubelet ─────────► csi-controller ──► ZfsShareAttachRequest ──► operator aggregates ──► ZfsShare ──► NetworkExport
+(ControllerPublish,  (one per            (ref-counted node allow-list)                     │
+ via external-attacher) volume+node)                                                       │
+                                                          ┌────────────────────────────────┴───────────┐
+                                                          ▼                                            ▼
+                                                   nfs-controller                             nvmeof-controller
+                                                   (/etc/exports)                             (nvmet configfs)
 
 kubelet ──► csi-node (NodePublishVolume) ──► reads ZfsPool.status (currentIP, baseMountPath)
                                               └► mount -t nfs  /  nvme connect + mount
 ```
 
 The CSI plane is deliberately **thin**: `csi-controller` performs no ZFS work —
-it only records intent as `ZfsDataset` + `ZfsShare` and returns a routing-only
-volume context (`poolGUID`, `dataset`, `protocol`). All ZFS allocation happens in
-the per-node agent; all export execution happens in the `NetworkExport`
-aggregators; `csi-node` only resolves the live `ZfsPool.status` and mounts.
+at `CreateVolume` it records a `ZfsDataset` (the export stays lazy), and at
+`ControllerPublishVolume` (driven by `external-attacher`) it records one
+`ZfsShareAttachRequest` per consuming node, then waits for the export to go live.
+It returns only a routing-only volume context (`poolGUID`, `dataset`,
+`protocol`). All ZFS allocation happens in the per-node agent; the operator
+aggregates attach requests into a ref-counted `ZfsShare` → `NetworkExport` (torn
+down at the last detach); `csi-node` only resolves the live `ZfsPool.status` and
+mounts.
 
 ### Export execution
 
@@ -89,8 +98,9 @@ Each `NetworkExport` controller:
 dropping all active NVMe connections whenever any single volume changes. The
 controller writes `configfs` directly so it can reconcile **incrementally** —
 only the changed subsystem is touched; unrelated connected subsystems are left
-alone. Host NQN allow-lists are supported today; DH-CHAP auth can be layered on
-later via the same `attr_*` files.
+alone. Access control is zero-trust: each attach derives a per-node host NQN
+allow-list and applies a per-attach DH-CHAP in-band key, both written through the
+same `configfs` files (see `docs/design-decisions.md` ADR-0011).
 
 ### Why the NFS controller supervises the daemons
 
@@ -193,9 +203,11 @@ chart defaultParameters  <  StorageClass.parameters  <  PVC annotations
 | `datasetPrefix` | **StorageClass only** | dataset namespace prepended to the volume name |
 | `protocol` | any layer | `nfs` (→ filesystem) or `nvmeof` (→ zvol) |
 | `volblocksize` | any layer | zvol block size (NVMe-oF only) |
-| `nfsClients` / `nfsOptions` | any layer | NFS export allow-list + options |
-| `nvmeofAllowedHosts` | any layer | NVMe-oF host NQN allow-list |
 | `property.<name>` | any layer | passed through as a ZFS `-o` property |
+
+> NFS client allow-lists and NVMe-oF host NQNs are **not** parameters — they are
+> derived automatically at attach time from the consuming node(s) under a
+> zero-trust model (see `docs/design-decisions.md` ADR-0010/0011).
 
 `poolGUID` and `datasetPrefix` are **StorageClass-only** on purpose (ADR-0002):
 they define tenancy/placement, so a PVC author cannot redirect a claim to another
@@ -206,13 +218,13 @@ pool or dataset namespace via annotations — those keys are stripped from the
 zvol); `volumeMode` (`Filesystem` vs `Block`) is orthogonal and resolved at the
 node. The only rejected combination is `Block` + `nfs`.
 
-StorageClasses are declared in the chart under `storageClasses:` (Ceph-style —
-none are created by default):
+StorageClasses are declared in the chart under `storageClasses:` (a list; none
+are created by default):
 
 ```yaml
 # values.yaml
 storageClasses:
-  nfs:
+  - name: nfs
     reclaimPolicy: Delete
     volumeBindingMode: Immediate
     allowVolumeExpansion: true
@@ -220,7 +232,7 @@ storageClasses:
       poolGUID: "12140134988506841113"   # required
       datasetPrefix: k8s/nfs
       protocol: nfs
-  nvmeof:
+  - name: nvmeof
     parameters:
       poolGUID: "12140134988506841113"
       datasetPrefix: k8s/block
@@ -229,13 +241,13 @@ storageClasses:
 ```
 
 ```yaml
-# A PVC that overrides the NFS options for just this claim:
+# A PVC that overrides a ZFS property for just this claim:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: media-movies
   annotations:
-    param.simple-zfs-csi.io/nfsOptions: "rw,sync,no_root_squash"
+    param.simple-zfs-csi.io/property.compression: "zstd"
 spec:
   accessModes: ["ReadWriteMany"]
   storageClassName: simple-zfs-csi-nfs
@@ -297,7 +309,7 @@ Common values (see [charts/simple-zfs-csi/values.yaml](charts/simple-zfs-csi/val
 | Value | Default | Purpose |
 |-------|---------|---------|
 | `driverName` | `simple-zfs-csi.io` | CSI driver / StorageClass provisioner name |
-| `storageClasses` | `{}` | map of StorageClasses to create (see above; none by default) |
+| `storageClasses` | `[]` | list of StorageClasses to create (see above; none by default) |
 | `csiController.enabled` | `true` | provisioner Deployment (+ external-provisioner sidecar) |
 | `csiController.defaultParameters` | `{}` | lowest-priority parameter layer (`poolGUID`/`datasetPrefix` ignored here) |
 | `csiNode.enabled` | `true` | node-publish DaemonSet (+ node-driver-registrar sidecar) |
@@ -312,7 +324,7 @@ Common values (see [charts/simple-zfs-csi/values.yaml](charts/simple-zfs-csi/val
 
 ### CRD management & upgrades
 
-The five CRDs (`ZfsPool`, `ZfsDataset`, `ZfsSnapshot`, `ZfsShare`, `NetworkExport`) are generated
+The six CRDs (`ZfsPool`, `ZfsDataset`, `ZfsSnapshot`, `ZfsShareAttachRequest`, `ZfsShare`, `NetworkExport`) are generated
 from the Go types (`make manifests`) and shipped in the chart's Helm-native
 [charts/simple-zfs-csi/crds](charts/simple-zfs-csi/crds) directory. Helm treats `crds/`
 specially:
@@ -343,7 +355,11 @@ specially:
 
 ### Host prerequisites (Talos system extensions)
 
-- **Storage nodes (exports):**
+- **Storage nodes (exports + discovery):** must carry the
+  `simple-zfs-csi.io/storage=true` label (see [Deploy](#deploy)).
+  - **ZFS userland:** host `zpool`/`zfs` binaries (Talos `siderolabs/zfs`
+    extension). The discovery agent runs them via `chroot /host` and ships **no**
+    ZFS tools of its own, so the CLI can never drift from the host kernel module.
   - **NFS:** `nfsd` + `sunrpc` kernel modules available on the host.
   - **NVMe-oF:** `nvmet` + `nvmet-tcp` kernel modules loaded; `configfs` mounted
     at `/sys/kernel/config`.
@@ -354,6 +370,13 @@ specially:
   - **NVMe-oF initiator:** `nvme_tcp` (+ `nvme_fabrics`) modules loaded; the
     plugin shells `nvme connect`/`nvme disconnect` against the host via
     `csiNode.hostExec` (`chroot /host` by default).
+  - **Mount propagation:** the kubelet must allow rshared bind-mount propagation
+    (the default on Talos) so the node plugin's mounts reach consuming pods.
+- **Cluster-wide (optional):**
+  - **Snapshots:** the external snapshot CRDs (`VolumeSnapshot`,
+    `VolumeSnapshotClass`, `VolumeSnapshotContent`) and the `snapshot-controller`
+    must be installed **before** using `volumeSnapshotClasses` / snapshotting;
+    this chart does not ship them.
 
 ## CI/CD
 

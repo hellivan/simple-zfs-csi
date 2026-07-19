@@ -60,7 +60,8 @@ type ControllerServer struct {
 	Log          logr.Logger
 }
 
-// CreateVolume provisions a ZfsDataset (+ ZfsShare) and returns the volume context.
+// CreateVolume provisions a ZfsDataset (the export stays lazy until attach) and
+// returns the volume context.
 func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	name := req.GetName()
 	if name == "" {
