@@ -219,7 +219,9 @@ zvol); `volumeMode` (`Filesystem` vs `Block`) is orthogonal and resolved at the
 node. The only rejected combination is `Block` + `nfs`.
 
 StorageClasses are declared in the chart under `storageClasses:` (a list; none
-are created by default):
+are created by default). Each entry's `name` is used **verbatim** as the
+StorageClass name (it is not prefixed with the release name), so it is exactly
+what PVCs reference in `spec.storageClassName`:
 
 ```yaml
 # values.yaml
@@ -250,7 +252,7 @@ metadata:
     param.simple-zfs-csi.io/property.compression: "zstd"
 spec:
   accessModes: ["ReadWriteMany"]
-  storageClassName: simple-zfs-csi-nfs
+  storageClassName: nfs
   resources:
     requests:
       storage: 100Gi

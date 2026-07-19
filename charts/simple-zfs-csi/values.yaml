@@ -402,11 +402,13 @@ toolbox:
   podAnnotations: {}
 
 # -------- Example StorageClasses --------
-# -- StorageClasses to install with the chart. A list; each entry becomes a
-# -- StorageClass named "<fullname>-<name>". By default none are installed.
-# -- `poolGUID` and `datasetPrefix` are StorageClass-only parameters and must be
-# -- set here (they are never inherited from defaultParameters or PVC
-# -- annotations). `poolGUID` is required per StorageClass.
+# -- StorageClasses to install with the chart. A list; each entry is created
+# -- with its `name` used verbatim as the StorageClass name (NOT prefixed with
+# -- the release name), so `name` is exactly what PVCs reference. By default none
+# -- are installed. `poolGUID` and `datasetPrefix` are StorageClass-only
+# -- parameters and must be set here (they are never inherited from
+# -- defaultParameters or PVC annotations). `poolGUID` is required per
+# -- StorageClass.
 storageClasses: []
   # - name: nfs
   #   isDefault: false
@@ -426,10 +428,11 @@ storageClasses: []
   #     volblocksize: 16k
 
 # -------- Example VolumeSnapshotClasses --------
-# -- VolumeSnapshotClasses to install with the chart. A list; each entry becomes
-# -- a VolumeSnapshotClass named "<fullname>-<name>". By default none are
-# -- installed. Requires the snapshot CRDs + snapshot-controller installed
-# -- cluster-wide and `csiController.snapshotter.enabled: true`.
+# -- VolumeSnapshotClasses to install with the chart. A list; each entry is
+# -- created with its `name` used verbatim as the VolumeSnapshotClass name (NOT
+# -- prefixed with the release name). By default none are installed. Requires the
+# -- snapshot CRDs + snapshot-controller installed cluster-wide and
+# -- `csiController.snapshotter.enabled: true`.
 volumeSnapshotClasses: []
   # - name: nfs
   #   isDefault: false

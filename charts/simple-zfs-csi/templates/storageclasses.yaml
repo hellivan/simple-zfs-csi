@@ -3,7 +3,7 @@
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: {{ include "simple-zfs-csi.fullname" $ }}-{{ .name }}
+  name: {{ .name }}
   labels:
     {{- include "simple-zfs-csi.labels" $ | nindent 4 }}
     app.kubernetes.io/component: storageclass
