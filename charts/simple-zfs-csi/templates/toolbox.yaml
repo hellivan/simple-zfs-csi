@@ -1,0 +1,98 @@
+{{- if .Values.toolbox.enabled }}
+{{- $isDaemonSet := eq .Values.toolbox.kind "DaemonSet" }}
+apiVersion: apps/v1
+kind: {{ .Values.toolbox.kind }}
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-toolbox
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: toolbox
+spec:
+  {{- if not $isDaemonSet }}
+  replicas: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "simple-zfs-csi.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: toolbox
+  template:
+    metadata:
+      labels:
+        {{- include "simple-zfs-csi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: toolbox
+      {{- with .Values.toolbox.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      # The toolbox only runs host zpool/zfs; it needs no Kubernetes API access.
+      automountServiceAccountToken: false
+      {{- if and .Values.toolbox.hostExec.enabled (eq .Values.toolbox.hostExec.mode "nsenter") }}
+      # hostPID lets nsenter reach the target PID's namespaces to run host tools.
+      hostPID: true
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and (not $isDaemonSet) .Values.toolbox.nodeName }}
+      # Pin the single toolbox pod to a specific node (Deployment kind only). ZFS
+      # is node-local, so target the node that imported the pool you want to
+      # service (ZfsPool.status.currentNode).
+      nodeName: {{ .Values.toolbox.nodeName }}
+      {{- else }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: toolbox
+          image: {{ include "simple-zfs-csi.image" (dict "root" . "component" "toolbox" "suffix" "discovery") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Keep the pod alive; operators `kubectl exec` in to run commands.
+          command: ["tail", "-f", "/dev/null"]
+          env:
+            # Put the host-tool wrappers first so `zpool`/`zfs`/`zdb` resolve to
+            # them in interactive `kubectl exec` sessions.
+            - name: PATH
+              value: /opt/toolbox/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          securityContext:
+            privileged: true
+          {{- with .Values.toolbox.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: toolbox-bin
+              mountPath: /opt/toolbox/bin
+            - name: dev
+              mountPath: /dev
+              mountPropagation: HostToContainer
+            {{- if and .Values.toolbox.hostExec.enabled (eq .Values.toolbox.hostExec.mode "chroot") }}
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+            {{- end }}
+      volumes:
+        - name: toolbox-bin
+          configMap:
+            name: {{ include "simple-zfs-csi.fullname" . }}-toolbox
+            defaultMode: 0755
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+        {{- if and .Values.toolbox.hostExec.enabled (eq .Values.toolbox.hostExec.mode "chroot") }}
+        - name: host-root
+          hostPath:
+            path: {{ .Values.toolbox.hostExec.hostRootPath }}
+            type: Directory
+        {{- end }}
+{{- end }}

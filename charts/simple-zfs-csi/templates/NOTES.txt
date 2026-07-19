@@ -13,6 +13,9 @@ Enabled controllers:
 {{- if .Values.operator.enabled }}
   - Operator  (Deployment {{ include "simple-zfs-csi.fullname" . }}-operator, cluster-wide control plane: node-death detection)
 {{- end }}
+{{- if .Values.toolbox.enabled }}
+  - Toolbox   ({{ .Values.toolbox.kind }} {{ include "simple-zfs-csi.fullname" . }}-toolbox, interactive host zpool/zfs maintenance shell)
+{{- end }}
 
 Next steps:
 
@@ -35,6 +38,27 @@ Next steps:
 4. Watch discovered pools appear as ZfsPool objects (name = ZFS pool GUID):
 
      kubectl get zfspools
+{{- end }}
+{{- if .Values.toolbox.enabled }}
+
+TOOLBOX ({{ .Values.toolbox.kind }}): run host zpool/zfs/zdb maintenance commands.
+{{- if eq .Values.toolbox.kind "DaemonSet" }}
+   One toolbox runs per storage node. ZFS is node-local, so exec into the pod on
+   the node that owns the target pool:
+
+     NODE=$(kubectl get zfspool <guid> -o jsonpath='{.status.currentNode}')
+     POD=$(kubectl -n {{ .Release.Namespace }} get pod -l app.kubernetes.io/component=toolbox \
+       --field-selector spec.nodeName=$NODE -o jsonpath='{.items[0].metadata.name}')
+     kubectl -n {{ .Release.Namespace }} exec -it $POD -- zpool status
+{{- else }}
+     kubectl -n {{ .Release.Namespace }} exec -it deploy/{{ include "simple-zfs-csi.fullname" . }}-toolbox -- zpool status
+     kubectl -n {{ .Release.Namespace }} exec -it deploy/{{ include "simple-zfs-csi.fullname" . }}-toolbox -- sh   # interactive
+{{- if not .Values.toolbox.nodeName }}
+   The single toolbox lands on any storage node. ZFS is node-local, so to service
+   a specific pool pin it with toolbox.nodeName to that pool's owner:
+     kubectl get zfspool <guid> -o jsonpath='{.status.currentNode}'
+{{- end }}
+{{- end }}
 {{- end }}
 
 NOTE ON UPGRADES: the NetworkExport and ZfsPool CRDs are installed from the chart's

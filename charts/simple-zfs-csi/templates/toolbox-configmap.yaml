@@ -1,0 +1,30 @@
+{{- if .Values.toolbox.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "simple-zfs-csi.fullname" . }}-toolbox
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: toolbox
+data:
+  # Thin wrappers that expose the HOST's zpool/zfs/zdb inside the toolbox pod.
+  # ZFS is node-local (it talks to the host kernel module, not the network), so
+  # the toolbox never bundles its own tools \u2014 it runs the host binaries via the
+  # same host-exec seam as discovery. Mounted onto PATH, so `zpool status` etc.
+  # just work in an interactive shell.
+  {{- $he := .Values.toolbox.hostExec }}
+  {{- range $bin := list "zpool" "zfs" "zdb" }}
+  {{ $bin }}: |
+    #!/bin/sh
+    {{- if $he.enabled }}
+    {{- if eq $he.mode "chroot" }}
+    exec chroot /host {{ $bin }} "$@"
+    {{- else }}
+    exec nsenter -t {{ $he.targetPid }} -m -u -i -n -p {{ $bin }} "$@"
+    {{- end }}
+    {{- else }}
+    exec {{ $bin }} "$@"
+    {{- end }}
+  {{- end }}
+{{- end }}

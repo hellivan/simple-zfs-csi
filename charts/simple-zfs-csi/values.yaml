@@ -357,6 +357,50 @@ maintenance:
       # - guid: "1234567890"
       #   schedule: "0 3 * * 6"
 
+# -------- Maintenance toolbox --------
+# An interactive pod for running ad-hoc ZFS maintenance commands against a
+# storage node's pools (analogous to the Rook Ceph toolbox). Unlike Ceph client
+# tools, `zpool`/`zfs` are NOT network clients: they act on the host kernel
+# module of the node that imported the pool. The toolbox therefore reuses the
+# discovery image (which ships no ZFS tools of its own) and execs the HOST's
+# `zpool`/`zfs`/`zdb` via the same host-exec seam as discovery, exposing them on
+# PATH so `kubectl exec ... -- zpool status` works. Disabled by default.
+toolbox:
+  # -- Deploy the maintenance toolbox.
+  enabled: false
+  # -- Workload kind. "DaemonSet" (default) runs one toolbox on every storage
+  # -- node, so each node's local pools are reachable via the pod on that node —
+  # -- recommended when pools live on multiple nodes (ZFS is node-local). On a
+  # -- single storage node this is just one pod. "Deployment" runs a single pod
+  # -- (Rook-style) that you pin with `nodeName`.
+  kind: DaemonSet
+  image:
+    # -- Override the full toolbox image (registry/repo:tag). Empty reuses the
+    # -- discovery image.
+    repository: ""
+    tag: ""
+  # -- Pin the single toolbox pod to a specific node (Deployment kind only). ZFS
+  # -- is node-local, so target the node that imported the pool you want to
+  # -- service: `kubectl get zfspool <guid> -o jsonpath='{.status.currentNode}'`.
+  # -- Ignored when kind is DaemonSet (which already runs on every storage node).
+  nodeName: ""
+  # Run the host's zpool/zfs/zdb, exposed inside the pod as plain commands. Keep
+  # enabled unless you supply a custom image bundling matching ZFS userspace
+  # tools (mirrors discovery.hostExec).
+  hostExec:
+    # -- Enable running the host's ZFS tools via chroot/nsenter.
+    enabled: true
+    # -- "chroot" (bind-mount host root at /host) or "nsenter" (enter targetPid namespaces).
+    mode: chroot
+    # -- Host PID whose namespaces are entered in nsenter mode.
+    targetPid: 1
+    # -- Host root path bind-mounted to /host in chroot mode.
+    hostRootPath: /
+  # -- Resource requests/limits.
+  resources: {}
+  # -- Pod annotations.
+  podAnnotations: {}
+
 # -------- Example StorageClasses --------
 # -- StorageClasses to install with the chart. A list; each entry becomes a
 # -- StorageClass named "<fullname>-<name>". By default none are installed.
