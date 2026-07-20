@@ -50,8 +50,8 @@ spec:
             - --nfs-v4-only={{ .Values.nfs.v4Only }}
             - --metrics-bind-address=:{{ .Values.nfs.ports.metrics }}
             - --health-probe-bind-address=:{{ .Values.nfs.ports.health }}
-            {{- if .Values.logLevel }}
-            - --zap-log-level={{ .Values.logLevel }}
+            {{- with (.Values.nfs.logLevel | default .Values.logLevel) }}
+            - --zap-log-level={{ . }}
             {{- end }}
             {{- with .Values.nfs.extraArgs }}
             {{- toYaml . | nindent 12 }}

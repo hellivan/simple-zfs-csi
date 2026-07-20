@@ -350,11 +350,15 @@ helm upgrade simple-zfs-csi ... --set logLevel=debug
 ```
 
 Or for a single component without touching the rest (handy for the provisioning
-agent that runs `zfs create`):
+agent that runs `zfs create`) — each component takes a `logLevel` override that
+falls back to the global one:
 
 ```sh
 # the discovery DaemonSet is the agent that creates datasets
-helm upgrade simple-zfs-csi ... --set 'discovery.extraArgs={--zap-log-level=debug}'
+helm upgrade simple-zfs-csi ... --set discovery.logLevel=debug
+
+# quiet an otherwise-global debug for one noisy component:
+helm upgrade simple-zfs-csi ... --set logLevel=debug --set csiNode.logLevel=info
 ```
 
 Then watch the agent on the node hosting the pool:

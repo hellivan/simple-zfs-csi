@@ -63,8 +63,8 @@ spec:
             {{- end }}
             - --metrics-bind-address=:{{ .Values.discovery.ports.metrics }}
             - --health-probe-bind-address=:{{ .Values.discovery.ports.health }}
-            {{- if .Values.logLevel }}
-            - --zap-log-level={{ .Values.logLevel }}
+            {{- with (.Values.discovery.logLevel | default .Values.logLevel) }}
+            - --zap-log-level={{ . }}
             {{- end }}
             {{- with .Values.discovery.extraArgs }}
             {{- toYaml . | nindent 12 }}

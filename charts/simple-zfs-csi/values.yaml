@@ -12,8 +12,8 @@ driverName: simple-zfs-csi.io
 # -- Log level for all components. Set to `debug` to log every host command the
 # agents run (zfs/zpool/mount/nvme), including the fully resolved chroot/nsenter
 # invocation, to hunt down provisioning failures. Empty keeps the component
-# default (info). Maps to `--zap-log-level`; per-component overrides are still
-# possible via `<component>.extraArgs`.
+# default (info). Maps to `--zap-log-level`. Any component can override this with
+# its own `<component>.logLevel` (e.g. `discovery.logLevel: debug`).
 logLevel: ""
 
 image:
@@ -65,6 +65,8 @@ nfs:
     hostPath: /tank
     # -- Mount path of the pool inside the container (must match dataset paths).
     mountPath: /tank
+  # -- Log level override for this component (falls back to the global `logLevel`).
+  logLevel: ""
   # -- Extra CLI args for the nfs-controller.
   extraArgs: []
   # -- Resource requests/limits.
@@ -108,6 +110,8 @@ nvmeof:
     serviceId: "4420"
     # -- nvmet port directory id.
     portId: "1"
+  # -- Log level override for this component (falls back to the global `logLevel`).
+  logLevel: ""
   # -- Extra CLI args for the nvmeof-controller.
   extraArgs: []
   # -- Resource requests/limits.
@@ -151,6 +155,8 @@ discovery:
     targetPid: 1
     # -- Host root path bind-mounted to /host in chroot mode.
     hostRootPath: /
+  # -- Log level override for this component (falls back to the global `logLevel`).
+  logLevel: ""
   # -- Extra CLI args for the zpool-discovery binary.
   extraArgs: []
   # -- Resource requests/limits.
@@ -176,6 +182,8 @@ operator:
     tag: ""
   # -- Enable leader election across operator replicas.
   leaderElect: true
+  # -- Log level override for this component (falls back to the global `logLevel`).
+  logLevel: ""
   # -- Extra CLI args for the operator binary.
   extraArgs: []
   # -- Resource requests/limits.
@@ -271,6 +279,8 @@ csiController:
     extraArgs: []
     # -- Resource requests/limits for the sidecar.
     resources: {}
+  # -- Log level override for this component (falls back to the global `logLevel`).
+  logLevel: ""
   # -- Extra CLI args for the csi-controller binary.
   extraArgs: []
   # -- Resource requests/limits for the plugin container.
@@ -321,6 +331,8 @@ csiNode:
     tag: v2.13.0
     # -- Resource requests/limits for the sidecar.
     resources: {}
+  # -- Log level override for this component (falls back to the global `logLevel`).
+  logLevel: ""
   # -- Extra CLI args for the csi-node binary.
   extraArgs: []
   # -- Resource requests/limits for the plugin container.

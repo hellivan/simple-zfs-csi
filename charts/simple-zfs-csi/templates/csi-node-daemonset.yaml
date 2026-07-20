@@ -61,8 +61,8 @@ spec:
             - --nsenter-target-pid={{ .Values.csiNode.hostExec.targetPid }}
             {{- end }}
             {{- end }}
-            {{- if .Values.logLevel }}
-            - --zap-log-level={{ .Values.logLevel }}
+            {{- with (.Values.csiNode.logLevel | default .Values.logLevel) }}
+            - --zap-log-level={{ . }}
             {{- end }}
             {{- with .Values.csiNode.extraArgs }}
             {{- toYaml . | nindent 12 }}

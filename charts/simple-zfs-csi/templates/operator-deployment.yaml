@@ -51,8 +51,8 @@ spec:
             {{- if .Values.maintenance.scrub.enabled }}
             - --scrub-config-map={{ include "simple-zfs-csi.fullname" . }}-scrub
             {{- end }}
-            {{- if .Values.logLevel }}
-            - --zap-log-level={{ .Values.logLevel }}
+            {{- with (.Values.operator.logLevel | default .Values.logLevel) }}
+            - --zap-log-level={{ . }}
             {{- end }}
             {{- with .Values.operator.extraArgs }}
             {{- toYaml . | nindent 12 }}

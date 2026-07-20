@@ -44,9 +44,10 @@ parent datasets with `-p` — the missing parent being the actual root cause.
 2. **Debug logging is opt-in via a Helm `logLevel` value.** A global `logLevel`
    (default empty = info) renders `--zap-log-level=<level>` on all six components;
    the flag was already bound by controller-runtime's zap options but never surfaced
-   in the chart. Per-component overrides remain possible via `<component>.extraArgs`.
-   Off by default keeps logs quiet; `--set logLevel=debug` turns on full command
-   tracing when hunting a problem.
+   in the chart. Each component takes a `<component>.logLevel` override that falls
+   back to the global (so you can raise just the discovery agent, or lower one noisy
+   component under a global debug). Off by default keeps logs quiet; `--set
+   logLevel=debug` turns on full command tracing when hunting a problem.
 
 3. **`zfs create` stays strict — no `-p`.** The agent creates a dataset only when its
    parent already exists. `-p` was rejected: it is implicit, and a typo in a
