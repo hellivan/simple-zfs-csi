@@ -1,0 +1,27 @@
+---
+# Prefix / namespace parent dataset.
+#
+# `zfs create` is strict — it does NOT use `-p`, so it never auto-creates missing
+# intermediate datasets (a typo in a StorageClass `datasetPrefix` should fail
+# loudly, not silently spawn a stray dataset tree — see ADR-0013). Declare the
+# prefix once as its own ZfsDataset so CSI-provisioned datasets nested under it
+# (e.g. "k8s/pvc-<uid>") find their parent.
+#
+# Ordering needs no orchestration: if a PVC's dataset reconciles before this
+# parent exists, it errors and requeues until the parent is Ready (eventual
+# consistency). Unlike `zfs create -p`, declaring the parent here lets you set
+# explicit properties (quota, compression, mountpoint) on the namespace dataset.
+apiVersion: storage.simple-zfs-csi.io/v1alpha1
+kind: ZfsDataset
+metadata:
+  # Corresponds to the StorageClass parameter datasetPrefix: k8s
+  name: prefix-k8s
+spec:
+  poolGUID: "12140134988506841113"   # ZfsPool metadata.name without the "zpool-" prefix
+  dataset: k8s                       # logical path under the pool root (the prefix)
+  type: filesystem
+  properties:
+    compression: lz4
+  # A quota here caps the whole prefix namespace; omit for unlimited.
+  filesystem:
+    quota: 500Gi

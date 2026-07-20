@@ -242,6 +242,16 @@ storageClasses:
       volblocksize: "16k"
 ```
 
+> **The `datasetPrefix` parent must exist.** `zfs create` runs strict (no `-p`),
+> so it never auto-creates missing intermediate datasets — a typo'd prefix fails
+> loudly instead of silently spawning a stray dataset tree (ADR-0013). Declare
+> each prefix once as a `ZfsDataset` (see
+> [config/samples/zfsdataset-samples.yaml](config/samples/zfsdataset-samples.yaml)),
+> which also lets you set explicit properties (quota, compression) on the
+> namespace dataset. A PVC whose parent isn't there yet just requeues until it
+> is. Multi-level prefixes (`k8s/nfs`) need each level declared; the pool root
+> always exists.
+
 ```yaml
 # A PVC that overrides a ZFS property for just this claim:
 apiVersion: v1
@@ -354,9 +364,11 @@ kubectl -n simple-zfs-csi logs -l app.kubernetes.io/component=discovery -f | gre
 ```
 
 > A `zfs create ... parent does not exist` error means the parent dataset (the
-> StorageClass `datasetPrefix`, e.g. `tank/k8s`) does not exist — `zfs create`
-> is not run with `-p`, so intermediate datasets are not auto-created. Create
-> the prefix dataset once (`zfs create tank/k8s`) or drop the prefix.
+> StorageClass `datasetPrefix`, e.g. `k8s`) has not been declared — `zfs create`
+> is strict (no `-p`), so intermediate datasets are not auto-created (ADR-0013).
+> Declare the prefix as a `ZfsDataset`
+> ([config/samples/zfsdataset-samples.yaml](config/samples/zfsdataset-samples.yaml)),
+> or drop the prefix.
 
 ### CRD management & upgrades
 

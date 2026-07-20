@@ -8,6 +8,75 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0013 — Host-command observability & strict dataset creation (parents via `ZfsDataset`, no `-p`)
+
+**Status:** Accepted (2026-07-20) · **Scope:** new `internal/zpool.LoggingRunner` (wired into `cmd/zpool-discovery` + `cmd/csi-node`), Helm global `logLevel` on all six components, and the create-time behavior of the `ZfsDataset` agent · **Builds on** the `Runner` host-exec indirection (ADR-0003) and the `ZfsDataset` allocation CRD (ADR-0006).
+
+### Context
+
+A provisioning failure surfaced only as `dataset create failed: … parent does not
+exist`, with no record of the exact command the agent ran against the host. Because
+every `zfs`/`zpool` call is rewritten by `HostExec` (chroot/nsenter + the
+version-matched host binary), the *effective* command line is invisible, and there
+was no switch to turn on verbose tracing — so the failing invocation could not be
+inspected.
+
+Two questions fell out of the investigation: **(a)** how to make host commands
+observable on demand, and **(b)** whether `zfs create` should auto-create missing
+parent datasets with `-p` — the missing parent being the actual root cause.
+
+### Decisions
+
+1. **One command-logging wrapper at the `Runner` choke point.** `LoggingRunner(base
+   Runner, log)` wraps the single `Runner` seam every ZFS/pool/mount/nvme call flows
+   through and logs each invocation plus its outcome (duration, trimmed output or
+   error) at **V(1) debug**. It is passed as the *base* to `HostExec.BuildRunner`, so
+   it logs the **fully resolved** host command including the chroot/nsenter prefix
+   and resolved binary path (e.g. `chroot /host /usr/sbin/zfs create tank/k8s/pvc-…`).
+   Wired into the two long-running host-exec agents: `cmd/zpool-discovery` (runs
+   `zfs create`) and `cmd/csi-node` (mount/nvme). Kept at debug, **not** error,
+   on purpose: several ZFS calls fail by design (the `zfs get` existence probe
+   returns `ErrNotExist` before a create), so logging every failure at error level
+   would be misleading noise. The `Runner` indirection — originally introduced for
+   testability — now doubles as the observability seam, so no per-call-site logging
+   is needed.
+
+2. **Debug logging is opt-in via a Helm `logLevel` value.** A global `logLevel`
+   (default empty = info) renders `--zap-log-level=<level>` on all six components;
+   the flag was already bound by controller-runtime's zap options but never surfaced
+   in the chart. Per-component overrides remain possible via `<component>.extraArgs`.
+   Off by default keeps logs quiet; `--set logLevel=debug` turns on full command
+   tracing when hunting a problem.
+
+3. **`zfs create` stays strict — no `-p`.** The agent creates a dataset only when its
+   parent already exists. `-p` was rejected: it is implicit, and a typo in a
+   StorageClass `datasetPrefix` would silently materialize a whole stray dataset tree
+   (with inherited defaults) instead of failing. Strict create makes misconfiguration
+   **fail loudly**, which is the safer default for a storage provisioner.
+
+4. **Parents are declared, not implied — via `ZfsDataset`.** The prefix/namespace
+   dataset is declared as its own `ZfsDataset` object, with explicit properties
+   (quota, compression, mountpoint) rather than the defaults `-p` would inherit. This
+   fits the existing declarative model (you already declare the pool and label the
+   node). Ordering needs no orchestration: a child PVC dataset reconciled before its
+   parent simply errors and requeues until the parent `ZfsDataset` exists (eventual
+   consistency). Multi-level prefixes declare each level; the pool root always exists,
+   so the common single-level prefix is trivial.
+
+### Consequences
+
+- Every host command is traceable on demand, in its fully-resolved chroot/nsenter
+  form, without redeploying different images — and silent by default.
+- Provisioning is fail-loud on a missing or mistyped parent; the parent dataset
+  becomes a declarative prerequisite managed through the same CRD flow, with
+  first-class properties.
+- Trade-off accepted: admins must pre-declare each prefix dataset; the driver will
+  never conjure parents. Having the operator auto-create a prefix `ZfsDataset` from a
+  StorageClass `datasetPrefix` is a possible future convenience, deliberately
+  deferred to keep creation explicit.
+
+---
+
 ## ADR-0012 — Pool maintenance: operator-reconciled scrub CronJobs
 
 **Status:** Accepted (2026-07-18) · **Scope:** new `cmd/zpool-scrub` (bundled in the discovery image), operator `ScrubReconciler` + config ConfigMap, `ZfsPool` watch, Helm values + RBAC · **Builds on** the `ZfsPool` discovery/takeover model (ADR-0003).
