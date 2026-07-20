@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // NVMeConnectOptions carries the parameters for an `nvme connect`. HostNQN/HostID
@@ -184,6 +185,14 @@ func (m *hostMounter) Unmount(target string) error {
 	return err
 }
 
+// nvmeConnectTimeout / nvmeDevicePoll bound the wait for the namespace block
+// device to appear after `nvme connect` returns (controller enumeration + udev
+// are slightly asynchronous).
+const (
+	nvmeConnectTimeout = 10 * time.Second
+	nvmeDevicePoll     = 500 * time.Millisecond
+)
+
 func (m *hostMounter) NVMeConnect(ctx context.Context, o NVMeConnectOptions) (string, error) {
 	if dev, _ := m.nvmeDevice(ctx, o.NQN); dev != "" {
 		return dev, nil
@@ -199,9 +208,16 @@ func (m *hostMounter) NVMeConnect(ctx context.Context, o NVMeConnectOptions) (st
 		args = append(args, "--dhchap-secret", o.DHChapKey)
 	}
 	if _, err := m.run(ctx, "nvme", args...); err != nil {
-		return "", fmt.Errorf("nvme connect %s: %w", o.NQN, err)
+		// "already connected" means a previous attempt created the controller but we
+		// failed to resolve its block device afterwards; don't get wedged — fall
+		// through and resolve the existing connection idempotently.
+		if !strings.Contains(strings.ToLower(err.Error()), "already connected") {
+			return "", fmt.Errorf("nvme connect %s: %w", o.NQN, err)
+		}
 	}
-	dev, err := m.nvmeDevice(ctx, o.NQN)
+	// The namespace block device can appear a moment after `nvme connect` returns,
+	// so poll rather than looking exactly once.
+	dev, err := m.waitNVMeDevice(ctx, o.NQN, nvmeConnectTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -209,6 +225,25 @@ func (m *hostMounter) NVMeConnect(ctx context.Context, o NVMeConnectOptions) (st
 		return "", fmt.Errorf("nvme device for %s not found after connect", o.NQN)
 	}
 	return dev, nil
+}
+
+// waitNVMeDevice polls for the block device backing nqn until it appears or the
+// timeout elapses (returns "" on timeout, matching nvmeDevice's absent case).
+func (m *hostMounter) waitNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if dev, _ := m.nvmeDevice(ctx, nqn); dev != "" {
+			return dev, nil
+		}
+		if time.Now().After(deadline) {
+			return "", nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(nvmeDevicePoll):
+		}
+	}
 }
 
 func (m *hostMounter) NVMeDisconnect(ctx context.Context, nqn string) error {
@@ -274,19 +309,53 @@ func (m *hostMounter) nvmeDevice(ctx context.Context, nqn string) (string, error
 	if err != nil {
 		return "", nil
 	}
+	return parseNVMeListDevice([]byte(out), nqn), nil
+}
+
+// parseNVMeListDevice extracts the block device backing nqn from `nvme list -o
+// json` output. It tolerates both the flat schema (nvme-cli 1.x, one entry per
+// namespace) and the nested schema (nvme-cli 2.x, one entry per host with
+// subsystems/namespaces within). Returns "" when the subsystem is not present.
+func parseNVMeListDevice(out []byte, nqn string) string {
 	var parsed struct {
 		Devices []struct {
+			// Flat schema (nvme-cli 1.x): one entry per namespace block device.
 			DevicePath   string `json:"DevicePath"`
 			SubsystemNQN string `json:"SubsystemNQN"`
+			// Nested schema (nvme-cli 2.x): one entry per host, subsystems within.
+			Subsystems []struct {
+				SubsystemNQN string `json:"SubsystemNQN"`
+				Namespaces   []struct {
+					NameSpace string `json:"NameSpace"`
+					Namespace string `json:"Namespace"`
+				} `json:"Namespaces"`
+			} `json:"Subsystems"`
 		} `json:"Devices"`
 	}
-	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
-		return "", nil
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return ""
 	}
 	for _, d := range parsed.Devices {
-		if d.SubsystemNQN == nqn {
-			return d.DevicePath, nil
+		// Flat schema.
+		if d.SubsystemNQN == nqn && d.DevicePath != "" {
+			return d.DevicePath
+		}
+		// Nested schema: the subsystem-level namespace name is the block device
+		// (e.g. "nvme0n1") — prefix it with /dev/.
+		for _, s := range d.Subsystems {
+			if s.SubsystemNQN != nqn {
+				continue
+			}
+			for _, ns := range s.Namespaces {
+				name := ns.NameSpace
+				if name == "" {
+					name = ns.Namespace
+				}
+				if name != "" {
+					return "/dev/" + name
+				}
+			}
 		}
 	}
-	return "", nil
+	return ""
 }
