@@ -20,9 +20,14 @@ import (
 // the kernel NVMe target (nvmet) configfs tree.
 type NVMeoFReconciler struct {
 	client.Client
-	NodeName  string
-	Target    *nvmet.Target
-	NQNPrefix string
+	// SecretReader reads DH-CHAP secrets directly from the API server (uncached).
+	// Using a non-cached reader avoids starting a cluster-wide Secret informer,
+	// so a namespaced secrets Role suffices (ADR-0011) and the controller never
+	// caches every Secret in the cluster. Defaults to r.Client when nil.
+	SecretReader client.Reader
+	NodeName     string
+	Target       *nvmet.Target
+	NQNPrefix    string
 }
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=networkexports,verbs=get;list;watch
@@ -92,8 +97,12 @@ func (r *NVMeoFReconciler) dhchapKey(ctx context.Context, namespace, name, dataK
 	if namespace == "" {
 		return "", fmt.Errorf("dhchap secret %q has no namespace", name)
 	}
+	reader := client.Reader(r.Client)
+	if r.SecretReader != nil {
+		reader = r.SecretReader
+	}
 	var sec corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec); err != nil {
 		return "", fmt.Errorf("get dhchap secret %s/%s: %w", namespace, name, err)
 	}
 	k := nvmeauth.ResolveSecretKey(dataKey)

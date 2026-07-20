@@ -85,10 +85,11 @@ func main() {
 	}
 
 	if err := (&controller.NVMeoFReconciler{
-		Client:    mgr.GetClient(),
-		NodeName:  nodeName,
-		Target:    target,
-		NQNPrefix: nqnPrefix,
+		Client:       mgr.GetClient(),
+		SecretReader: mgr.GetAPIReader(),
+		NodeName:     nodeName,
+		Target:       target,
+		NQNPrefix:    nqnPrefix,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up NVMe-oF reconciler")
 		os.Exit(1)

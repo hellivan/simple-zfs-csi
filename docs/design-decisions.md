@@ -8,6 +8,93 @@ the build plan is [implementation-strategy.md](implementation-strategy.md).
 
 ---
 
+## ADR-0014 — NVMe-oF DH-CHAP secret handling: uncached namespaced reads, immutable per-attach keys, rotate-by-reattach
+
+**Status:** Accepted (2026-07-20) · **Scope:** `internal/controller/nvmeof_controller.go` secret read path (new `SecretReader` on `NVMeoFReconciler`, wired to `mgr.GetAPIReader()` in `cmd/nvmeof-controller`), and the operational contract for DH-CHAP key rotation · **Builds on** the NVMe-oF zero-trust per-attach DH-CHAP design (ADR-0011) and the incremental nvmet configfs reconcile (ADR-0009).
+
+### Context
+
+On the live cluster all three NVMe-oF volumes were stuck: `ZfsShare` never left
+`Exporting`, the `NetworkExport` had no phase, the `ZfsShareAttachRequest` never went
+Ready, and pods hung in `ContainerCreating` with `FailedAttachVolume … DeadlineExceeded`.
+The NFS volume on the same pod attached fine. The nvmeof controller was spamming:
+
+```
+secrets is forbidden: User "system:serviceaccount:zfs-shares:…-nvmeof"
+cannot list resource "secrets" in API group "" at the cluster scope
+```
+
+The reconciler read the DH-CHAP secret with the manager's **cached** client
+(`r.Get(secret)`). Per ADR-0011 the secrets RBAC is intentionally a **namespaced
+`Role`** (`-dhchap-reader`, least privilege). But a cached read is not a targeted
+GET: the first Secret read through the cached client lazily starts a Secret
+**informer**, which does a **cluster-wide LIST+WATCH** to populate its cache — and
+that cluster-scoped list is exactly what the namespaced Role forbids. The informer
+never synced, `dhchapKey()` never returned, the nvmet target was never programmed,
+and the whole NVMe-oF attach chain stalled. csi-node was unaffected because its CSI
+server uses a **direct (uncached)** client.
+
+Investigating the fix raised two follow-on questions that turned into durable
+contract: **(a)** can a DH-CHAP key be rotated while a volume is attached, and
+**(b)** what happens to a mounted volume / its pod when the NVMe-oF connection dies.
+
+### Decisions
+
+1. **Read DH-CHAP secrets uncached, via `mgr.GetAPIReader()`.** `NVMeoFReconciler`
+   gained a `SecretReader client.Reader` field set to the manager's API reader; only
+   the `dhchapKey()` read uses it (falls back to the cached client when nil, for
+   tests). This issues a **direct namespaced GET** to the API server — no informer,
+   no cluster-wide LIST — so the existing namespaced `Role` is sufficient and no
+   Secret type is ever cached. This matches how csi-node already reads the secret.
+   RBAC was **not** broadened to a cluster-scoped ClusterRole: that would violate
+   ADR-0011's least-privilege posture (a node-local component able to list every
+   Secret in the cluster) to work around a client-caching detail.
+
+2. **Do not watch the Secret / do not rotate the target key under a live client.**
+   A Secret watch was rejected even scoped to the namespace. The nvmet configfs
+   reconcile *is* incremental and would let us rewrite `hosts/<h>/dhchap_key` without
+   disturbing an established association — but the Linux **host reconnects with the
+   key it was given at connect time** (stored in the controller options; csi-node is
+   not consulted on a kernel-level reconnect). So rotating the target key under a
+   connected client is a latent footgun: the connection works until the first
+   transport blip, then the kernel auto-reconnect presents the **old** key against
+   the **new** target key → auth fails → controller lost → device dropped. A normally
+   invisible blip becomes a permanent volume failure.
+
+3. **DH-CHAP keys are per-attach and immutable; rotate by re-attach.** The operator
+   mints one `dhchap-pvc-…` Secret per attachment and deletes it at detach; the key
+   never changes during an attachment's lifetime. The correct rotation path is to
+   **tear down and re-establish the attachment** (fresh connect re-reads the current
+   Secret on both target and host), not to edit the Secret in place. Because the
+   secret is immutable, an uncached read loses nothing (there is no update to react
+   to) and a watch would fire ~never; drift after a node reboot is already handled by
+   the controller rebuilding nvmet from the **watched** `NetworkExport`s on startup.
+
+### Consequences
+
+- **NVMe-oF attaches work under the namespaced Role.** No RBAC change, no cluster-wide
+  Secret exposure; ADR-0011 least-privilege preserved. Requires rebuilding/redeploying
+  the nvmeof image for the fix to take effect on a cluster.
+- **Editing a `dhchap-pvc-…` Secret is unsupported and unsafe.** It does not
+  re-key a live connection, and it will break the kernel's transparent reconnect for
+  any client still connected with the old key. Rotate by re-attaching the volume.
+- **Connection-death behavior (operational expectation).** On an NVMe-oF/TCP transport
+  drop the host retries every `reconnect_delay` (~10 s) up to `ctrl_loss_tmo` (~10 min,
+  kernel defaults, tunable). Within that window I/O **blocks** and recovery is
+  transparent (reconnect re-auths with the connect-time key). If `ctrl_loss_tmo`
+  expires the controller is removed, the block device disappears, and I/O fails with
+  **EIO** → the filesystem goes read-only/errors. **kubelet does not health-check
+  volume I/O**, so the pod is *not* auto-rescheduled — it keeps running on a broken
+  mount until it is deleted/rescheduled (CSI then `NodeUnstage`→`NodeStage` and issues
+  a fresh `nvme connect`) or a volume-touching **liveness probe** forces a restart. A
+  container restart alone does not remount the volume. Recommendation: give NVMe-oF
+  workloads a liveness probe that exercises the volume.
+- **Future rotation, if ever needed,** would require a coordinated drain: quiesce/detach
+  the client first, then reprogram the target, then reconnect — i.e. still re-attach,
+  never an in-place edit under a live client.
+
+---
+
 ## ADR-0013 — Host-command observability & strict dataset creation (parents via `ZfsDataset`, no `-p`)
 
 **Status:** Accepted (2026-07-20) · **Scope:** new `internal/zpool.LoggingRunner` (wired into `cmd/zpool-discovery` + `cmd/csi-node`), Helm global `logLevel` on all six components, and the create-time behavior of the `ZfsDataset` agent · **Builds on** the `Runner` host-exec indirection (ADR-0003) and the `ZfsDataset` allocation CRD (ADR-0006).
