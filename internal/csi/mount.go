@@ -227,13 +227,19 @@ func (m *hostMounter) NVMeConnect(ctx context.Context, o NVMeConnectOptions) (st
 	return dev, nil
 }
 
-// waitNVMeDevice polls for the block device backing nqn until it appears or the
-// timeout elapses (returns "" on timeout, matching nvmeDevice's absent case).
+// waitNVMeDevice polls for the namespace block device backing nqn until it
+// appears or the timeout elapses (returns "" on timeout). Each miss nudges the
+// controller with `nvme ns-rescan`: a client can connect just before the target
+// enables the namespace, or a live controller may have missed the
+// add-namespace notification, leaving it with zero namespaces until rescanned.
 func (m *hostMounter) waitNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		if dev, _ := m.nvmeDevice(ctx, nqn); dev != "" {
 			return dev, nil
+		}
+		if ctrl := nvmeControllerFromSysfs(sysClassNVMe, nqn); ctrl != "" {
+			_, _ = m.run(ctx, "nvme", "ns-rescan", ctrl)
 		}
 		if time.Now().After(deadline) {
 			return "", nil
@@ -302,14 +308,73 @@ func (m *hostMounter) detectFS(device string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// nvmeDevice returns the block device path (e.g. "/dev/nvme1n1") for a connected
-// subsystem NQN, or "" if not connected. It parses `nvme list-subsys -o json`.
+// sysClassNVMe is the sysfs directory listing connected NVMe controllers. It is
+// the source of truth for NQN->device resolution: version-independent, unlike
+// `nvme list -o json`, whose schema varies across nvme-cli releases (2.13 emits
+// a flat list with DevicePath but no SubsystemNQN once a namespace is present).
+const sysClassNVMe = "/sys/class/nvme"
+
+// nvmeDevice returns the namespace block device (e.g. "/dev/nvme1n1") exported
+// by the connected subsystem nqn, or "" if not connected / no namespace yet. It
+// reads sysfs (authoritative) and only falls back to parsing `nvme list -o
+// json` when sysfs is unavailable.
 func (m *hostMounter) nvmeDevice(ctx context.Context, nqn string) (string, error) {
+	if dev := nvmeNamespaceFromSysfs(sysClassNVMe, nqn); dev != "" {
+		return dev, nil
+	}
 	out, err := m.run(ctx, "nvme", "list", "-o", "json")
 	if err != nil {
 		return "", nil
 	}
 	return parseNVMeListDevice([]byte(out), nqn), nil
+}
+
+// nvmeControllersForNQN lists controller directory names under root (e.g.
+// "nvme0") whose subsystem NQN matches nqn.
+func nvmeControllersForNQN(root, nqn string) []string {
+	ctrls, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, c := range ctrls {
+		b, err := os.ReadFile(filepath.Join(root, c.Name(), "subsysnqn"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(b)) == nqn {
+			out = append(out, c.Name())
+		}
+	}
+	return out
+}
+
+// nvmeNamespaceFromSysfs returns the namespace block device exported by nqn by
+// scanning the matching controllers' namespace directories (e.g. nvme0 ->
+// nvme0n1), or "" if none is present yet.
+func nvmeNamespaceFromSysfs(root, nqn string) string {
+	for _, ctrl := range nvmeControllersForNQN(root, nqn) {
+		entries, err := os.ReadDir(filepath.Join(root, ctrl))
+		if err != nil {
+			continue
+		}
+		prefix := ctrl + "n" // "nvme0n" matches nvme0n1, excludes multipath nvme0c0n1
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), prefix) {
+				return "/dev/" + e.Name()
+			}
+		}
+	}
+	return ""
+}
+
+// nvmeControllerFromSysfs returns the controller char device (e.g. "/dev/nvme0")
+// serving nqn, for `nvme ns-rescan`; "" if none is connected.
+func nvmeControllerFromSysfs(root, nqn string) string {
+	for _, ctrl := range nvmeControllersForNQN(root, nqn) {
+		return "/dev/" + ctrl
+	}
+	return ""
 }
 
 // parseNVMeListDevice extracts the block device backing nqn from `nvme list -o

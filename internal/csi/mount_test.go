@@ -1,9 +1,59 @@
 package csi
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // nqn used across the parsing cases.
 const testNQN = "nqn.2025-01.io.simple-zfs-csi:talos-1:pvc-abc"
+
+// writeFile is a test helper creating a file with parents.
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNVMeNamespaceFromSysfs(t *testing.T) {
+	root := t.TempDir()
+	// nvme0 -> the target subsystem, with namespace nvme0n1 (and a multipath
+	// nvme0c0n1 path that must be ignored).
+	writeFile(t, filepath.Join(root, "nvme0", "subsysnqn"), testNQN+"\n")
+	if err := os.MkdirAll(filepath.Join(root, "nvme0", "nvme0c0n1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "nvme0", "nvme0n1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// nvme1 -> an unrelated subsystem.
+	writeFile(t, filepath.Join(root, "nvme1", "subsysnqn"), "nqn.other\n")
+	if err := os.MkdirAll(filepath.Join(root, "nvme1", "nvme1n1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := nvmeNamespaceFromSysfs(root, testNQN); got != "/dev/nvme0n1" {
+		t.Errorf("nvmeNamespaceFromSysfs() = %q, want /dev/nvme0n1", got)
+	}
+	if got := nvmeControllerFromSysfs(root, testNQN); got != "/dev/nvme0" {
+		t.Errorf("nvmeControllerFromSysfs() = %q, want /dev/nvme0", got)
+	}
+	// Subsystem present but namespace not yet enumerated -> "".
+	root2 := t.TempDir()
+	writeFile(t, filepath.Join(root2, "nvme0", "subsysnqn"), testNQN+"\n")
+	if got := nvmeNamespaceFromSysfs(root2, testNQN); got != "" {
+		t.Errorf("no-namespace nvmeNamespaceFromSysfs() = %q, want empty", got)
+	}
+	// Not connected at all -> "".
+	if got := nvmeControllerFromSysfs(root2, "nqn.missing"); got != "" {
+		t.Errorf("missing nvmeControllerFromSysfs() = %q, want empty", got)
+	}
+}
 
 func TestParseNVMeListDevice(t *testing.T) {
 	cases := []struct {
