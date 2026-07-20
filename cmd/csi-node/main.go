@@ -71,7 +71,8 @@ func main() {
 	}
 
 	hostExec := zpool.HostExec{Mode: hostExecMode, HostRoot: hostRoot, TargetPID: nsenterPID}
-	mounter := zfscsi.NewHostMounter(hostExec.BuildRunner(nil))
+	// Log the fully resolved mount/nvme host commands at debug (--zap-log-level=debug).
+	mounter := zfscsi.NewHostMounter(hostExec.BuildRunner(zpool.LoggingRunner(nil, ctrl.Log.WithName("hostcmd"))))
 
 	ids := &zfscsi.IdentityServer{DriverName: driverName, Version: version}
 	ns := &zfscsi.NodeServer{

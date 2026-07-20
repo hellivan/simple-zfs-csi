@@ -84,7 +84,10 @@ func main() {
 		HostRoot:  hostRoot,
 		TargetPID: nsenterPID,
 	}
-	hostRunner := hostExec.BuildRunner(nil)
+	// Wrap the base runner so LoggingRunner sees the fully resolved host command
+	// (chroot/nsenter prefix + version-matched binary). Enable with
+	// --zap-log-level=debug to see every zfs/zpool invocation the agent runs.
+	hostRunner := hostExec.BuildRunner(zpool.LoggingRunner(nil, ctrl.Log.WithName("hostcmd")))
 	reporter := &controller.PoolReporter{
 		Client:   mgr.GetClient(),
 		NodeName: nodeName,

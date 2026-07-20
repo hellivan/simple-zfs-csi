@@ -64,6 +64,9 @@ spec:
             {{- if .Values.csiController.defaultParameters }}
             - --default-parameters-configmap={{ include "simple-zfs-csi.fullname" . }}-csi-controller-defaults
             {{- end }}
+            {{- if .Values.logLevel }}
+            - --zap-log-level={{ .Values.logLevel }}
+            {{- end }}
             {{- with .Values.csiController.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

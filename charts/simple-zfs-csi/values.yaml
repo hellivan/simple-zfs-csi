@@ -9,6 +9,13 @@ fullnameOverride: ""
 # `provisioner` field.
 driverName: simple-zfs-csi.io
 
+# -- Log level for all components. Set to `debug` to log every host command the
+# agents run (zfs/zpool/mount/nvme), including the fully resolved chroot/nsenter
+# invocation, to hunt down provisioning failures. Empty keeps the component
+# default (info). Maps to `--zap-log-level`; per-component overrides are still
+# possible via `<component>.extraArgs`.
+logLevel: ""
+
 image:
   # -- Container registry hosting the controller images.
   registry: ghcr.io

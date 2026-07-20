@@ -311,6 +311,7 @@ Common values (see [charts/simple-zfs-csi/values.yaml](charts/simple-zfs-csi/val
 | Value | Default | Purpose |
 |-------|---------|---------|
 | `driverName` | `simple-zfs-csi.io` | CSI driver / StorageClass provisioner name |
+| `logLevel` | `""` (info) | set to `debug` to log every host `zfs`/`zpool`/`mount`/`nvme` command |
 | `storageClasses` | `[]` | list of StorageClasses to create (see above; none by default) |
 | `csiController.enabled` | `true` | provisioner Deployment (+ external-provisioner sidecar) |
 | `csiController.defaultParameters` | `{}` | lowest-priority parameter layer (`poolGUID`/`datasetPrefix` ignored here) |
@@ -323,6 +324,39 @@ Common values (see [charts/simple-zfs-csi/values.yaml](charts/simple-zfs-csi/val
 | `nvmeof.nqnPrefix` | `nqn.2025-01.io.simple-zfs-csi` | derived subsystem NQN prefix |
 | `nodeSelector` | `simple-zfs-csi.io/storage: "true"` | where the storage-node DaemonSets run |
 | `image.tag` | chart `appVersion` | image tag override |
+
+### Debug logging
+
+Every `zfs`/`zpool`/`mount`/`nvme` command the agents run against the host goes
+through a single runner, which logs each invocation — and its outcome (duration,
+trimmed output or error) — at debug verbosity. It logs the **fully resolved**
+command, including the `chroot /host` / `nsenter` prefix and version-matched host
+binary, e.g. `chroot /host /usr/sbin/zfs create tank/k8s/pvc-abc123`.
+
+Debug logging is off by default. Turn it on for all components:
+
+```sh
+helm upgrade simple-zfs-csi ... --set logLevel=debug
+```
+
+Or for a single component without touching the rest (handy for the provisioning
+agent that runs `zfs create`):
+
+```sh
+# the discovery DaemonSet is the agent that creates datasets
+helm upgrade simple-zfs-csi ... --set 'discovery.extraArgs={--zap-log-level=debug}'
+```
+
+Then watch the agent on the node hosting the pool:
+
+```sh
+kubectl -n simple-zfs-csi logs -l app.kubernetes.io/component=discovery -f | grep hostcmd
+```
+
+> A `zfs create ... parent does not exist` error means the parent dataset (the
+> StorageClass `datasetPrefix`, e.g. `tank/k8s`) does not exist — `zfs create`
+> is not run with `-p`, so intermediate datasets are not auto-created. Create
+> the prefix dataset once (`zfs create tank/k8s`) or drop the prefix.
 
 ### CRD management & upgrades
 

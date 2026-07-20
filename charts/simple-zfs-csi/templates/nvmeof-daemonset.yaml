@@ -52,6 +52,9 @@ spec:
             - --port-id={{ .Values.nvmeof.transport.portId }}
             - --metrics-bind-address=:{{ .Values.nvmeof.ports.metrics }}
             - --health-probe-bind-address=:{{ .Values.nvmeof.ports.health }}
+            {{- if .Values.logLevel }}
+            - --zap-log-level={{ .Values.logLevel }}
+            {{- end }}
             {{- with .Values.nvmeof.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
