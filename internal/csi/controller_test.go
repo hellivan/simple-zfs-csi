@@ -322,6 +322,30 @@ func TestControllerPublishVolume_NVMeoFMultiNodeRejected(t *testing.T) {
 	}
 }
 
+func TestControllerPublishVolume_SingleNodeAlreadyAttachedElsewhere(t *testing.T) {
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-13"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-13", Type: storagev1alpha1.DatasetTypeVolume},
+	}
+	// pvc-13 is already published to node-a.
+	ar := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: attachRequestName("pvc-13", "node-a")},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-13", NodeName: "node-a"},
+	}
+	cs := newController(newTestClient(t, ds, ar))
+
+	// Publishing the same single-node volume to a different node must be rejected
+	// so the zvol is never exported read-write to two nodes at once.
+	_, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{
+		VolumeId:         "pvc-13",
+		NodeId:           "node-b",
+		VolumeCapability: mountCaps()[0],
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("err = %v, want FailedPrecondition", err)
+	}
+}
+
 func TestControllerPublishVolume_MissingVolume(t *testing.T) {
 	cs := newController(newTestClient(t))
 	_, err := cs.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{

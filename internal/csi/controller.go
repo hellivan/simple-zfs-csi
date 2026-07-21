@@ -187,6 +187,24 @@ func (c *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			"protocol nvmeof is single-node only; multi-node (RWX) access modes are not supported")
 	}
 
+	// Enforce single-node publication for single-node (RWO) volumes: never export
+	// the same volume to two nodes at once. For a zvol that would attach the block
+	// device read-write on both nodes and corrupt it. If the volume is already
+	// published elsewhere (e.g. a forced pod move that attaches to the new node
+	// before the old node detaches), return FailedPrecondition so
+	// external-attacher retries once the prior attachment is released.
+	if !hasMultiNodeAccessMode([]*csi.VolumeCapability{req.GetVolumeCapability()}) {
+		other, err := c.attachedNode(ctx, volumeID, nodeID)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "list attach requests for %q: %v", volumeID, err)
+		}
+		if other != "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"volume %q is already published to node %q; single-node (RWO) volumes cannot be attached to %q simultaneously",
+				volumeID, other, nodeID)
+		}
+	}
+
 	name := attachRequestName(volumeID, nodeID)
 	if err := c.ensureAttachRequest(ctx, name, volumeID, nodeID); err != nil {
 		return nil, err
@@ -436,6 +454,25 @@ func (c *ControllerServer) waitAttachReady(ctx context.Context, name string) err
 		case <-ticker.C:
 		}
 	}
+}
+
+// attachedNode returns the name of a node other than `exclude` that currently
+// holds an attach request for `volume`, or "" if none. Terminating requests are
+// counted on purpose: the aggregated share still lists that node until its
+// finalizer clears, so publishing elsewhere before then could momentarily
+// dual-export the volume.
+func (c *ControllerServer) attachedNode(ctx context.Context, volume, exclude string) (string, error) {
+	var list storagev1alpha1.ZfsShareAttachRequestList
+	if err := c.Client.List(ctx, &list); err != nil {
+		return "", err
+	}
+	for i := range list.Items {
+		ar := &list.Items[i]
+		if ar.Spec.VolumeName == volume && ar.Spec.NodeName != exclude {
+			return ar.Spec.NodeName, nil
+		}
+	}
+	return "", nil
 }
 
 // deleteAttachRequests best-effort removes every attach request for a volume,
