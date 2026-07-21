@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -183,6 +184,53 @@ func TestAttachRequest_NVMeoFSingleNodeShare(t *testing.T) {
 	}
 	if share.Spec.NFS != nil {
 		t.Errorf("nfs export spec must be nil for nvmeof")
+	}
+}
+
+func TestAttachRequest_NVMeoFRaceExportsOldestNodeOnly(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-9"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-9", Type: storagev1alpha1.DatasetTypeVolume},
+	}
+	// node-a attached first (older); node-b is a racing newcomer.
+	older := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-9-node-a", CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour))},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-9", NodeName: "node-a"},
+	}
+	newer := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-9-node-b", CreationTimestamp: metav1.NewTime(time.Now())},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-9", NodeName: "node-b"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, older, newer).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme}
+	reconcileAttach(t, r, "pvc-9-node-b") // finalizer
+	reconcileAttach(t, r, "pvc-9-node-b") // aggregate
+
+	// The share must be exported only to the oldest node (node-a).
+	share := &storagev1alpha1.ZfsShare{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-9"}, share); err != nil {
+		t.Fatalf("get share: %v", err)
+	}
+	wantNQN, _ := nvmeauth.HostIdentity("node-a", "pvc-9")
+	if share.Spec.NVMeoF == nil || len(share.Spec.NVMeoF.AllowedHosts) != 1 || share.Spec.NVMeoF.AllowedHosts[0] != wantNQN {
+		t.Fatalf("allowedHosts = %+v, want [%s] (oldest node)", share.Spec.NVMeoF, wantNQN)
+	}
+
+	// The racing newcomer's request must NOT be marked ready.
+	got := &storagev1alpha1.ZfsShareAttachRequest{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-9-node-b"}, got); err != nil {
+		t.Fatalf("get newer request: %v", err)
+	}
+	if got.Status.Ready {
+		t.Errorf("racing node-b request marked Ready; want not ready (volume exported to node-a)")
 	}
 }
 
