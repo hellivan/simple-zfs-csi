@@ -88,8 +88,8 @@ func (f *fakeMounter) NVMeDevice(_ context.Context, nqn string) (string, error) 
 	}
 	return "", nil
 }
-func (f *fakeMounter) RescanNVMe(_ context.Context, device string) error {
-	f.rescanned = append(f.rescanned, device)
+func (f *fakeMounter) RescanNVMe(_ context.Context, nqn string) error {
+	f.rescanned = append(f.rescanned, nqn)
 	return nil
 }
 func (f *fakeMounter) ResizeFS(device, volumePath string) error {
@@ -359,8 +359,8 @@ func TestNodeExpand_NVMeoFFilesystem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NodeExpandVolume: %v", err)
 	}
-	if len(m.rescanned) != 1 || m.rescanned[0] != "/dev/nvme1n1" {
-		t.Errorf("rescanned = %v, want [/dev/nvme1n1]", m.rescanned)
+	if len(m.rescanned) != 1 || m.rescanned[0] != "nqn.exp" {
+		t.Errorf("rescanned = %v, want [nqn.exp]", m.rescanned)
 	}
 	if m.resized["/dev/nvme1n1"] != "/target/fs" {
 		t.Errorf("resized = %v, want /dev/nvme1n1 -> /target/fs", m.resized)

@@ -58,9 +58,10 @@ type NodeMounter interface {
 	// NVMeDevice returns the current block device path for a connected NQN, or
 	// "" when the subsystem is not connected.
 	NVMeDevice(ctx context.Context, nqn string) (string, error)
-	// RescanNVMe asks the kernel to re-read a namespace's size after the backing
-	// zvol has been grown, so the block device reflects the new capacity.
-	RescanNVMe(ctx context.Context, device string) error
+	// RescanNVMe asks the controller(s) backing nqn to re-read the namespace size
+	// after the backing zvol has been grown, so the block device reflects the new
+	// capacity.
+	RescanNVMe(ctx context.Context, nqn string) error
 	// ResizeFS grows the filesystem on device (mounted at volumePath) to fill the
 	// device. It is a no-op when the device carries no filesystem (raw block).
 	ResizeFS(device, volumePath string) error
@@ -267,13 +268,24 @@ func (m *hostMounter) NVMeDevice(ctx context.Context, nqn string) (string, error
 }
 
 // RescanNVMe re-reads the namespace size after a zvol grow. `nvme ns-rescan`
-// accepts the namespace block device and rescans its controller.
-func (m *hostMounter) RescanNVMe(ctx context.Context, device string) error {
-	if device == "" {
-		return fmt.Errorf("device is empty")
+// requires a controller char device (e.g. /dev/nvme0); the multipath namespace
+// head block device (/dev/nvme0n1) is not a valid target ("Block device
+// required"). A subsystem may be reached through several controllers/paths, so
+// rescan every controller backing nqn.
+func (m *hostMounter) RescanNVMe(ctx context.Context, nqn string) error {
+	if nqn == "" {
+		return fmt.Errorf("nqn is empty")
 	}
-	_, err := m.run(ctx, "nvme", "ns-rescan", device)
-	return err
+	ctrls := nvmeControllersForNQN(sysClassNVMe, nqn)
+	if len(ctrls) == 0 {
+		return fmt.Errorf("no nvme controller connected for nqn %q", nqn)
+	}
+	for _, ctrl := range ctrls {
+		if _, err := m.run(ctx, "nvme", "ns-rescan", "/dev/"+ctrl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ResizeFS grows the filesystem on device to fill it. ext* is grown by device

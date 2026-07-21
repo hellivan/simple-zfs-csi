@@ -179,7 +179,7 @@ func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 	if device == "" {
 		return nil, status.Errorf(codes.FailedPrecondition, "nvme device for volume %q is not connected", volumeID)
 	}
-	if err := n.Mounter.RescanNVMe(ctx, device); err != nil {
+	if err := n.Mounter.RescanNVMe(ctx, nqn); err != nil {
 		return nil, status.Errorf(codes.Internal, "rescan nvme device %q: %v", device, err)
 	}
 
