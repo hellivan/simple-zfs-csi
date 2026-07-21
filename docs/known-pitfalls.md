@@ -301,6 +301,40 @@ fullname prefix), so the `name` is exactly what PVCs must reference.
 
 ---
 
+## 13. Single-node (RWO) volume double-attached across nodes (attach race)
+
+**Symptom:** during a forced pod move / node failure an NVMe-oF (RWO) volume's
+attach request appears for a **new** node while the old node's attachment is
+still being torn down; the losing node's `ControllerPublish` "succeeds" but its
+mount never completes — or, unguarded, the same zvol is exported to two nodes.
+
+**Root cause:** distinct from class 7, which rejects multi-node *access modes* at
+admission. Here every attach carries a valid single-node cap, but the Kubernetes
+attach-detach controller can create a `VolumeAttachment` for node B before node
+A's detach completes (force-deleted / unreachable node). Left unchecked the
+operator aggregates both nodes, and — even though the export is capped to one
+host — the *losing* attach request is still marked `Ready` by share-level
+readiness, so its publish returns success and the subsequent mount then fails.
+
+**Guard (two layers):**
+
+- **CSI controller:** `ControllerPublishVolume` rejects a single-node volume
+  already published to a *different* node with **`FailedPrecondition`**, so
+  external-attacher retries once the prior attachment is released. See
+  `attachedNode` in [internal/csi/controller.go](../internal/csi/controller.go).
+- **Operator aggregator (defense in depth):** for a zvol it exports to **exactly
+  one** node — the **oldest** attach request wins, so an established export is
+  never stolen by a racing newcomer — and readiness is **node-level**: a request
+  whose node is not the exported one stays `Waiting`, so its publish times out and
+  retries. See `oldestAttachNode` / `reconcileVolume` in
+  [internal/controller/zfsshareattachrequest_controller.go](../internal/controller/zfsshareattachrequest_controller.go).
+  This is a deterministic, concurrency-safe selection (see the `SetupWithManager`
+  note), not a reliance on single-threaded reconciliation.
+
+**Guarded by:** the *"handle repeated attach of an RWO volume"* fix.
+
+---
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing

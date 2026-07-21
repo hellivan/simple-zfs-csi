@@ -94,6 +94,13 @@ contract: **(a)** can a DH-CHAP key be rotated while a volume is attached, and
 - **Future rotation, if ever needed,** would require a coordinated drain: quiesce/detach
   the client first, then reprogram the target, then reconnect — i.e. still re-attach,
   never an in-place edit under a live client.
+- **Secret cleanup is finalizer-guaranteed, not best-effort.** `deleteDHChapSecret`
+  runs in the last-detach reconcile, and the attach request's finalizer is released
+  only after it succeeds — so a controller crash or transient error retries rather
+  than orphaning the `dhchap-pvc-…` Secret. Residual leaks require manually
+  force-deleting the attach request / stripping its finalizer, or a persistent
+  `secrets delete` RBAC denial (which surfaces as a stuck `Terminating` object, not
+  a silent leak).
 
 ---
 
@@ -427,6 +434,15 @@ technically.
    volume always has exactly one attach request, so its share lifecycle is the
    trivial create-on-attach / delete-on-detach case; the ref-counting in decision
    3 only ever exercises for NFS RWX.
+
+   **Defended, not merely assumed (added later).** The "exactly one attach
+   request" invariant can be transiently violated by a forced pod move (the
+   attach-detach controller may attach node B before node A detaches). Two guards
+   keep a zvol single-node: `ControllerPublishVolume` returns `FailedPrecondition`
+   if the volume is already published to another node (`attachedNode`), and the
+   operator aggregator exports a zvol to exactly one node — the oldest attach
+   request wins, and a losing request stays not-ready (`oldestAttachNode`). See
+   known-pitfalls.md class 13.
 
 6. **Static provisioning asymmetry (documented, not a blocker).** Kubernetes has
    **no in-tree NVMe-oF volume plugin** (only `nfs`, `iscsi`, `fc`). So the "bypass
