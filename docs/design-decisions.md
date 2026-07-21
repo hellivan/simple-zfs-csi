@@ -4,7 +4,9 @@ An append-only log of architectural decisions (ADR-lite). Each entry records the
 decision, the context, the options weighed, and the consequences. Newest first.
 
 The complementary conventions doc is [api-conventions.md](api-conventions.md);
-the build plan is [implementation-strategy.md](implementation-strategy.md).
+the build plan is [implementation-strategy.md](implementation-strategy.md);
+recurring bug classes and their guards are catalogued in
+[known-pitfalls.md](known-pitfalls.md).
 
 ---
 
