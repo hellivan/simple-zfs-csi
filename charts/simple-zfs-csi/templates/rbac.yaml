@@ -240,6 +240,12 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims/status"]
     verbs: ["patch", "update"]
+  # The resizer watches Pods cluster-wide to handle volume-in-use errors
+  # (--handle-volume-inuse-errors defaults to true); without this its Pod
+  # informer never syncs and no resize is ever processed.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
   {{- if .Values.csiController.snapshotter.enabled }}
   # --- external-snapshotter sidecar ---
   - apiGroups: ["snapshot.storage.k8s.io"]
