@@ -68,6 +68,29 @@ func TestNVMeNamespaceFromSysfs(t *testing.T) {
 	}
 }
 
+func TestNVMeDeviceReady(t *testing.T) {
+	root := t.TempDir()
+	// A ready device: /sys/block/<dev>/size present and non-zero.
+	writeFile(t, filepath.Join(root, "nvme0n1", "size"), "204800\n")
+	// Present but zero-sized: namespace not yet usable (the connect-time race).
+	writeFile(t, filepath.Join(root, "nvme1n1", "size"), "0\n")
+
+	if !nvmeDeviceReady(root, "/dev/nvme0n1") {
+		t.Errorf("nvmeDeviceReady(nvme0n1) = false, want true")
+	}
+	if nvmeDeviceReady(root, "/dev/nvme1n1") {
+		t.Errorf("nvmeDeviceReady(nvme1n1) = true, want false (zero size)")
+	}
+	// No sysfs block entry at all (device node not created yet) -> not ready.
+	if nvmeDeviceReady(root, "/dev/nvme2n1") {
+		t.Errorf("nvmeDeviceReady(missing) = true, want false")
+	}
+	// Empty device path -> not ready.
+	if nvmeDeviceReady(root, "") {
+		t.Errorf("nvmeDeviceReady(\"\") = true, want false")
+	}
+}
+
 func TestParseNVMeListDevice(t *testing.T) {
 	cases := []struct {
 		name string

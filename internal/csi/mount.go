@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -196,7 +197,7 @@ const (
 )
 
 func (m *hostMounter) NVMeConnect(ctx context.Context, o NVMeConnectOptions) (string, error) {
-	if dev, _ := m.nvmeDevice(ctx, o.NQN); dev != "" {
+	if dev, _ := m.nvmeDevice(ctx, o.NQN); dev != "" && nvmeDeviceReady(sysBlock, dev) {
 		return dev, nil
 	}
 	args := []string{"connect", "-t", o.Transport, "-a", o.Addr, "-s", o.Port, "-n", o.NQN}
@@ -230,14 +231,17 @@ func (m *hostMounter) NVMeConnect(ctx context.Context, o NVMeConnectOptions) (st
 }
 
 // waitNVMeDevice polls for the namespace block device backing nqn until it
-// appears or the timeout elapses (returns "" on timeout). Each miss nudges the
-// controller with `nvme ns-rescan`: a client can connect just before the target
-// enables the namespace, or a live controller may have missed the
-// add-namespace notification, leaving it with zero namespaces until rescanned.
+// appears AND is usable or the timeout elapses (returns "" on timeout). Each
+// miss nudges the controller with `nvme ns-rescan`: a client can connect just
+// before the target enables the namespace, or a live controller may have missed
+// the add-namespace notification, leaving it with zero namespaces until
+// rescanned. Readiness (nvmeDeviceReady) is required because the sysfs name can
+// resolve a moment before the head block device is created and sized; returning
+// it early makes the caller's format/mount fail with ENOENT or EIO.
 func (m *hostMounter) waitNVMeDevice(ctx context.Context, nqn string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if dev, _ := m.nvmeDevice(ctx, nqn); dev != "" {
+		if dev, _ := m.nvmeDevice(ctx, nqn); dev != "" && nvmeDeviceReady(sysBlock, dev) {
 			return dev, nil
 		}
 		if ctrl := nvmeControllerFromSysfs(sysClassNVMe, nqn); ctrl != "" {
@@ -326,6 +330,29 @@ func (m *hostMounter) detectFS(device string) (string, error) {
 // `nvme list -o json`, whose schema varies across nvme-cli releases (2.13 emits
 // a flat list with DevicePath but no SubsystemNQN once a namespace is present).
 const sysClassNVMe = "/sys/class/nvme"
+
+// sysBlock is the sysfs directory of block devices. It backs nvmeDeviceReady:
+// a namespace's usable size is published at /sys/block/<dev>/size.
+const sysBlock = "/sys/block"
+
+// nvmeDeviceReady reports whether the namespace block device dev (e.g.
+// "/dev/nvme0n1") is present and usable, i.e. its sysfs block entry exists and
+// reports a non-zero size (in 512-byte sectors). Right after `nvme connect` the
+// sysfs *name* can resolve a moment before the head block device is created and
+// its size populated; formatting or mounting in that window fails with ENOENT
+// or EIO. Gating on a non-zero size closes both races.
+func nvmeDeviceReady(sysBlockRoot, dev string) bool {
+	base := strings.TrimPrefix(dev, "/dev/")
+	if base == "" {
+		return false
+	}
+	b, err := os.ReadFile(filepath.Join(sysBlockRoot, base, "size"))
+	if err != nil {
+		return false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	return err == nil && n > 0
+}
 
 // nvmeDevice returns the namespace block device (e.g. "/dev/nvme1n1") exported
 // by the connected subsystem nqn, or "" if not connected / no namespace yet. It
