@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -349,20 +350,45 @@ func nvmeControllersForNQN(root, nqn string) []string {
 	return out
 }
 
+// nvmePathDeviceRe matches a multipath "path" namespace device as it appears
+// under a controller in sysfs (e.g. "nvme0c0n1") and captures the shared head
+// block device name ("nvme0" + "n1" = "nvme0n1"). The leading instance number is
+// the subsystem/head instance, so dropping the "c<controller>" segment yields the
+// usable head device regardless of how many paths a controller has.
+var nvmePathDeviceRe = regexp.MustCompile(`^(nvme\d+)c\d+(n\d+)$`)
+
 // nvmeNamespaceFromSysfs returns the namespace block device exported by nqn by
-// scanning the matching controllers' namespace directories (e.g. nvme0 ->
-// nvme0n1), or "" if none is present yet.
+// scanning the matching controllers' children, or "" if none is present yet.
+// It handles both layouts:
+//   - non-multipath: the namespace head is a direct child of the controller
+//     (e.g. nvme0 -> nvme0n1).
+//   - multipath (CONFIG_NVME_MULTIPATH, the modern default): the controller only
+//     carries a per-path device (e.g. nvme0c0n1); the usable block device is the
+//     shared subsystem head (nvme0n1), derived by dropping the "c<controller>"
+//     path segment.
 func nvmeNamespaceFromSysfs(root, nqn string) string {
 	for _, ctrl := range nvmeControllersForNQN(root, nqn) {
 		entries, err := os.ReadDir(filepath.Join(root, ctrl))
 		if err != nil {
 			continue
 		}
-		prefix := ctrl + "n" // "nvme0n" matches nvme0n1, excludes multipath nvme0c0n1
+		directPrefix := ctrl + "n" // "nvme0n" matches the non-multipath head nvme0n1
+		var mpathHead string
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), prefix) {
-				return "/dev/" + e.Name()
+			name := e.Name()
+			// Non-multipath: namespace head is a direct child (nvme0n1). This also
+			// excludes the multipath path form, which starts with "nvme0c".
+			if strings.HasPrefix(name, directPrefix) {
+				return "/dev/" + name
 			}
+			// Multipath: the controller only exposes a path device (nvme0c0n1);
+			// resolve it to the shared head block device (nvme0n1).
+			if m := nvmePathDeviceRe.FindStringSubmatch(name); m != nil {
+				mpathHead = "/dev/" + m[1] + m[2]
+			}
+		}
+		if mpathHead != "" {
+			return mpathHead
 		}
 	}
 	return ""

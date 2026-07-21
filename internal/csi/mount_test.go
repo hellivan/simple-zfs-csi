@@ -53,6 +53,19 @@ func TestNVMeNamespaceFromSysfs(t *testing.T) {
 	if got := nvmeControllerFromSysfs(root2, "nqn.missing"); got != "" {
 		t.Errorf("missing nvmeControllerFromSysfs() = %q, want empty", got)
 	}
+
+	// Multipath-enabled kernel (CONFIG_NVME_MULTIPATH, the modern default): the
+	// controller carries ONLY the path device (nvme3c3n1); the usable head block
+	// device (nvme3n1) lives under the subsystem, not the controller. Resolution
+	// must derive and return the head.
+	root3 := t.TempDir()
+	writeFile(t, filepath.Join(root3, "nvme3", "subsysnqn"), testNQN+"\n")
+	if err := os.MkdirAll(filepath.Join(root3, "nvme3", "nvme3c3n1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := nvmeNamespaceFromSysfs(root3, testNQN); got != "/dev/nvme3n1" {
+		t.Errorf("multipath nvmeNamespaceFromSysfs() = %q, want /dev/nvme3n1", got)
+	}
 }
 
 func TestParseNVMeListDevice(t *testing.T) {
