@@ -335,6 +335,49 @@ readiness, so its publish returns success and the subsequent mount then fails.
 
 ---
 
+## 14. Empty PV `fsType` silently disables fsGroup on block volumes
+
+**Symptom:** a non-root pod (`securityContext.fsGroup` / `runAsNonRoot`) gets
+**permission denied** writing to a freshly provisioned NVMe-oF (RWO) volume; the
+mount succeeds and the filesystem is fine, but its root stays `root:root` — no
+recursive chown ever runs. NFS (RWX) volumes are unaffected.
+
+**Root cause:** kubelet's default fsGroup policy is
+**`ReadWriteOnceWithFSType`** — it applies `fsGroup` ownership **only** to RWO
+volumes whose **`pv.spec.csi.fsType` is non-empty**. external-provisioner records
+`fsType` from the StorageClass `csi.storage.k8s.io/fstype` parameter (or its
+`--default-fstype` flag). With neither set, the node plugin still formats ext4
+(its own `FormatAndMount` fallback), so the volume *works* — but the PV's
+`fsType` is `""`, so kubelet **silently skips** the chown. The failure is
+per-workload (only non-root pods hit it) and easy to misread as an app bug.
+
+**Guard:** give external-provisioner **`--default-fstype`** (matching the node
+plugin's ext4 fallback so the PV's recorded type is truthful), via
+`csiController.provisioner.defaultFsType` in
+[charts/simple-zfs-csi/values.yaml](../charts/simple-zfs-csi/values.yaml) →
+[csi-controller-deployment.yaml](../charts/simple-zfs-csi/templates/csi-controller-deployment.yaml).
+Keep `fsGroupPolicy: ReadWriteOnceWithFSType` explicit on the CSIDriver
+([csidriver.yaml](../charts/simple-zfs-csi/templates/csidriver.yaml),
+`csiDriver.fsGroupPolicy`). This is the standard **block**-driver posture; NFS is
+left to server-side ownership like every other NFS driver.
+
+**NFS is out of scope by design, not by accident:** `ReadWriteOnceWithFSType`
+never touches RWX volumes, so shared NFS exports are never recursively chowned
+(which would be slow and fails under `root_squash`). The `--default-fstype` also
+stamps `fsType` on NFS PVs cosmetically, but the node plugin's `publishNFS`
+ignores `fsType` and the policy excludes RWX, so it is inert. The one case that
+*would* invite a chown is an **RWO NFS** PVC — an unusual configuration this
+driver doesn't restrict; treat NFS as RWX.
+
+**Two-side consistency:** the provisioner default and the node's
+`FormatAndMount` fallback (both ext4) must stay in sync — if you change one,
+change the other, or the PV will advertise a filesystem type the node didn't
+create.
+
+**Guarded by:** the *"fsgroup does not work"* fix.
+
+---
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing

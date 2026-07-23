@@ -234,6 +234,13 @@ csiController:
     image: registry.k8s.io/sig-storage/csi-provisioner
     # -- external-provisioner image tag.
     tag: v5.1.0
+    # -- Default filesystem type recorded on every provisioned filesystem PV
+    # -- (pv.spec.csi.fsType) when the StorageClass does not set
+    # -- `csi.storage.k8s.io/fstype`. Populating it lets kubelet apply pod
+    # -- `securityContext.fsGroup` ownership to single-node NVMe-oF volumes (see
+    # -- `csiDriver.fsGroupPolicy`); it is harmless for NFS (RWX) volumes, which
+    # -- are never in scope for the fsGroup policy. Empty disables the default.
+    defaultFsType: ext4
     # -- Extra args for external-provisioner.
     extraArgs: []
     # -- Resource requests/limits for the sidecar.
@@ -349,6 +356,13 @@ csiNode:
 csiDriver:
   # -- Install the CSIDriver object for the driver.
   create: true
+  # -- fsGroup ownership policy. "ReadWriteOnceWithFSType" (the CSI default)
+  # -- makes kubelet apply pod `securityContext.fsGroup` only to single-node
+  # -- (RWO) volumes that record a filesystem type — the NVMe-oF zvol volumes,
+  # -- once `csiController.provisioner.defaultFsType` populates their PV fsType —
+  # -- while leaving shared NFS (RWX) exports untouched. Other values: "File"
+  # -- (apply to every volume, including NFS) or "None" (never apply fsGroup).
+  fsGroupPolicy: ReadWriteOnceWithFSType
 
 # -------- Pool maintenance --------
 # ZFS pools need periodic scrubbing. When enabled, the operator reconciles one

@@ -88,6 +88,13 @@ spec:
           args:
             - --csi-address={{ .Values.csiController.socketDir }}/csi.sock
             - --extra-create-metadata
+            {{- with .Values.csiController.provisioner.defaultFsType }}
+            # Record a fsType on every filesystem PV (pv.spec.csi.fsType) so
+            # kubelet's ReadWriteOnceWithFSType fsGroup policy applies pod fsGroup
+            # ownership to the single-node NVMe-oF volumes. NFS (RWX) volumes are
+            # inherently skipped by that policy. See csiDriver.fsGroupPolicy.
+            - --default-fstype={{ . }}
+            {{- end }}
             - --leader-election
             - --leader-election-namespace=$(POD_NAMESPACE)
             {{- with .Values.csiController.provisioner.extraArgs }}

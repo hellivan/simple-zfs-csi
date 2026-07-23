@@ -13,6 +13,13 @@ spec:
   attachRequired: true
   # The node plugin reads the volume_context at publish time.
   podInfoOnMount: false
+  # fsGroup ownership. ReadWriteOnceWithFSType (the CSI default, made explicit)
+  # makes kubelet apply pod.spec.securityContext.fsGroup only to single-node
+  # (RWO) volumes that carry a filesystem type — the NVMe-oF zvol volumes, once
+  # the provisioner's --default-fstype records a fsType on their PVs. Shared NFS
+  # (RWX) exports are never in scope for this policy, so they are never
+  # recursively chowned. See csiController.provisioner.defaultFsType.
+  fsGroupPolicy: {{ .Values.csiDriver.fsGroupPolicy }}
   volumeLifecycleModes:
     - Persistent
 {{- end }}
