@@ -31,6 +31,7 @@ type fakeZFS struct {
 	cloned         []string // records "snapshot -> dest" for each Clone
 	lastCloneProps map[string]string
 	setProps       []string // records "name property=value" for each SetProperty
+	ownership      []string // records "mountpoint uid:gid mode" for each ApplyOwnership
 }
 
 func newFakeZFS(existing ...string) *fakeZFS {
@@ -116,6 +117,18 @@ func (f *fakeZFS) SetProperty(_ context.Context, name, property, value string) e
 
 func (f *fakeZFS) List(context.Context, zpool.DatasetKind) ([]zpool.Dataset, error) {
 	return nil, nil
+}
+
+func (f *fakeZFS) ApplyOwnership(_ context.Context, mountpoint string, uid, gid *int64, mode string) error {
+	u, g := "", ""
+	if uid != nil {
+		u = strconv.FormatInt(*uid, 10)
+	}
+	if gid != nil {
+		g = strconv.FormatInt(*gid, 10)
+	}
+	f.ownership = append(f.ownership, fmt.Sprintf("%s %s:%s %s", mountpoint, u, g, mode))
+	return nil
 }
 
 func onlinePool() *storagev1alpha1.ZfsPool {
@@ -247,6 +260,59 @@ func TestZfsDatasetReconcile_CreatesDatasetAndSetsReady(t *testing.T) {
 	}
 	if got.Status.Path != "/mnt/tank/k8s/pvc-1" {
 		t.Errorf("path = %q, want /mnt/tank/k8s/pvc-1", got.Status.Path)
+	}
+	// No uid/gid/mode requested -> ownership must be left untouched.
+	if len(z.ownership) != 0 {
+		t.Errorf("expected no ApplyOwnership calls, got %v", z.ownership)
+	}
+}
+
+func TestZfsDatasetReconcile_AppliesRootOwnership(t *testing.T) {
+	scheme := newTestScheme(t)
+	uid := int64(1000)
+	gid := int64(2000)
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-own"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999",
+			Dataset:  "k8s/pvc-own",
+			Type:     storagev1alpha1.DatasetTypeFilesystem,
+			Filesystem: &storagev1alpha1.FilesystemConfig{
+				UID:  &uid,
+				GID:  &gid,
+				Mode: "0770",
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
+		Build()
+
+	z := newFakeZFS()
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-own"}}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+
+	want := "/mnt/tank/k8s/pvc-own 1000:2000 0770"
+	if len(z.ownership) != 1 || z.ownership[0] != want {
+		t.Fatalf("ApplyOwnership = %v, want [%q]", z.ownership, want)
+	}
+
+	var got storagev1alpha1.ZfsDataset
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-own"}, &got); err != nil {
+		t.Fatalf("get volume: %v", err)
+	}
+	if got.Status.Phase != storagev1alpha1.DatasetPhaseReady {
+		t.Errorf("phase = %q, want Ready", got.Status.Phase)
 	}
 }
 

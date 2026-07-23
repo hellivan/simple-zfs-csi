@@ -10,6 +10,89 @@ recurring bug classes and their guards are catalogued in
 
 ---
 
+## ADR-0015 — Provision-time POSIX root ownership for filesystem datasets via `uid`/`gid`/`mode` parameters
+
+**Status:** Accepted (2026-07-27) · **Scope:** `internal/csi/params.go` (new `uid`/`gid`/`mode` params), `internal/csi/controller.go` (`volumeSpec`), `api/v1alpha1/zfsdataset_types.go` (`FilesystemConfig.UID/GID/Mode`), `internal/zpool/zfs.go` (`ZFS.ApplyOwnership`), `internal/controller/zfsdataset_controller.go` (apply-once at create) · **Builds on** the three-layer parameter inheritance (ADR-0002) and complements the Helm `fsGroupPolicy`/`--default-fstype` fix (see [known-pitfalls.md](known-pitfalls.md) class 14).
+
+### Context
+
+Kubernetes applies a pod's `securityContext.fsGroup` by recursively `chown`-ing the
+volume at mount time — but **only for single-node (RWO) block volumes** whose PV
+carries an `fsType`. For an NFS (RWX) volume kubelet deliberately skips fsGroup: a
+recursive chown of a shared export is expensive and semantically wrong (many pods,
+possibly many nodes, share the tree). So a freshly provisioned NFS dataset is always
+`root:root 0755`, and a non-root workload cannot write to it without a manual
+`chown` on the server. There was no way to say "this share should be owned by uid
+1000" at provision time.
+
+fsGroup solves the block case; it cannot solve the share case. The share case has to
+be handled **server-side, once, at creation**.
+
+### Decision
+
+Introduce three optional CSI parameters — `uid`, `gid`, `mode` — that set the POSIX
+ownership and permission bits of a **filesystem (nfs) dataset's root**, applied
+exactly once immediately after the dataset is created:
+
+1. **Filesystem-only.** The params are parsed only when the resolved dataset type is
+   `filesystem`. For `nvmeof` (block) they are **silently ignored**, not rejected, so
+   a cluster-wide default (set in the provisioner `defaultParameters` layer) does not
+   break block provisioning. Block ownership is a fsGroup concern, not ours.
+
+2. **Inherited + PVC-overridable.** They flow through the existing three-layer
+   inheritance (`defaults → StorageClass → PVC annotations`, ADR-0002), so an admin
+   can set a cluster or StorageClass default and a PVC can override per-claim via the
+   `param.simple-zfs-csi.io/{uid,gid,mode}` annotations. They are ordinary params,
+   **not** StorageClass-only like `poolGUID`/`datasetPrefix`.
+
+3. **Opt-in / backward compatible.** Unset means *do nothing* — no chown, no chmod —
+   leaving the ZFS default (`root:root`, `0755`). Existing installs are unaffected.
+
+4. **Apply-once at creation, never re-applied.** The reconciler calls
+   `ZFS.ApplyOwnership` on the dataset mountpoint only in the create-absent branch,
+   right after `create()` succeeds. It is **not** reconciled on every pass: the values
+   are an initial seed, not an enforced invariant, so that a workload (or an admin)
+   remaining free to re-chown files inside the share is never fought by the operator.
+   A failure sets the dataset status to `OwnershipFailed` and requeues.
+
+5. **Executed on the host.** `CLI.ApplyOwnership` runs `chown`/`chmod` through the
+   same host runner (`HostExec.BuildRunner`) already used for `zfs`, so the ownership
+   change lands on the real mounted filesystem in the host mount namespace, not the
+   container's.
+
+Validation: `uid`/`gid` must parse as non-negative integers; `mode` must be a valid
+octal string (e.g. `0770`). Malformed values fail `CreateVolume` fast rather than
+silently doing the wrong thing.
+
+### Alternatives considered
+
+- **Rely on fsGroup for NFS too.** Rejected: kubelet does not apply fsGroup to RWX
+  volumes, and forcing it (via `--default-fstype` + `File` fsGroupPolicy on the
+  shared export) would trigger an expensive, semantically wrong recursive chown that
+  also fails under NFS `root_squash`. See known-pitfalls class 14.
+- **Reconcile ownership on every pass (enforce as invariant).** Rejected: it would
+  clobber legitimate in-share ownership changes made by the workload and add a
+  recursive-chown cost on a shared tree on every reconcile. Seed-once matches the
+  fsGroup mental model (set at provision, not policed).
+- **A single `owner` string (`uid:gid:mode`).** Rejected in favour of three discrete
+  params: they map cleanly onto the inheritance layers (a PVC can override just
+  `gid`), onto `chown` vs `chmod`, and onto individual validation errors.
+- **Name it `permissions` instead of `mode`.** Rejected: `mode` matches the POSIX /
+  `chmod` / Kubernetes `defaultMode` vocabulary and is unambiguously the octal bits.
+
+### Consequences
+
+- NFS shares can be provisioned owned by an arbitrary uid/gid/mode without any manual
+  server-side step, closing the gap fsGroup leaves for RWX volumes.
+- The knobs are inert for block volumes and inert when unset, so the change is safe to
+  ship on by default in the chart's commented defaults.
+- Because ownership is seeded once, an admin who later changes the StorageClass
+  `uid`/`gid`/`mode` will **not** see existing datasets re-chowned; only new datasets
+  pick up the new default. This is intentional (see decision 4) and documented in the
+  chart values.
+
+---
+
 ## ADR-0014 — NVMe-oF DH-CHAP secret handling: uncached namespaced reads, immutable per-attach keys, rotate-by-reattach
 
 **Status:** Accepted (2026-07-20) · **Scope:** `internal/controller/nvmeof_controller.go` secret read path (new `SecretReader` on `NVMeoFReconciler`, wired to `mgr.GetAPIReader()` in `cmd/nvmeof-controller`), and the operational contract for DH-CHAP key rotation · **Builds on** the NVMe-oF zero-trust per-attach DH-CHAP design (ADR-0011) and the incremental nvmet configfs reconcile (ADR-0009).

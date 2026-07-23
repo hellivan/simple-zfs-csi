@@ -401,6 +401,27 @@ delete the **`ZfsDataset` CR** (its finalizer destroys the on-disk object), then
 delete the `Released` PV. `Delete`-policy volumes are fully reclaimed
 automatically.
 
+### `uid`/`gid`/`mode` are seeded once, not reconciled
+
+The `uid`/`gid`/`mode` parameters set an NFS/filesystem dataset's root ownership
+and permissions **once, right after the dataset is created** (via host
+`chown`/`chmod`). They are an initial seed, not an enforced invariant, so:
+
+- **Changing a StorageClass's `uid`/`gid`/`mode` does not re-`chown` existing
+  datasets** — only datasets provisioned *after* the change pick up the new
+  values. To retro-fit an existing share, `chown`/`chmod` its mountpoint on the
+  host manually.
+- A workload (or admin) is free to re-`chown` files inside the share afterwards;
+  the operator never fights those changes.
+- They are the RWX/NFS analogue of a pod's `securityContext.fsGroup` (which
+  kubelet applies only to single-node block volumes, never to shared NFS
+  exports). They are **silently ignored for NVMe-oF** (block) volumes, whose
+  ownership is a fsGroup concern (see class 14). Unset leaves the ZFS default
+  `root:root 0755`. See `ApplyOwnership` in
+  [internal/zpool/zfs.go](../internal/zpool/zfs.go), `applyRootOwnership` in
+  [internal/controller/zfsdataset_controller.go](../internal/controller/zfsdataset_controller.go),
+  and ADR-0015 in [design-decisions.md](design-decisions.md).
+
 ---
 
 ## Pre-commit verification recipe

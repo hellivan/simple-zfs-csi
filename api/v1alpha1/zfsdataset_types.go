@@ -38,6 +38,25 @@ type FilesystemConfig struct {
 	// zero the dataset is unlimited.
 	// +optional
 	Quota *resource.Quantity `json:"quota,omitempty"`
+
+	// UID sets the numeric owner of the dataset's root directory, applied once
+	// with `chown` right after creation. Nil leaves the ZFS default (root, uid 0).
+	// It is a provision-time convenience for NFS shares, whose ownership is set
+	// server-side (kubelet's fsGroup does not apply to RWX volumes); the
+	// application remains free to change ownership of files it later creates.
+	// +optional
+	UID *int64 `json:"uid,omitempty"`
+
+	// GID sets the numeric group of the dataset's root directory, applied once
+	// with `chown` right after creation. Nil leaves the ZFS default (root, gid 0).
+	// +optional
+	GID *int64 `json:"gid,omitempty"`
+
+	// Mode sets the permission bits of the dataset's root directory as an octal
+	// string (e.g. "0770"), applied once with `chmod` right after creation. Empty
+	// leaves the ZFS default (0755).
+	// +optional
+	Mode string `json:"mode,omitempty"`
 }
 
 // VolumeConfig holds the options that apply only to a volume/zvol (type=volume).

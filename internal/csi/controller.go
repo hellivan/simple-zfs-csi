@@ -597,8 +597,18 @@ func volumeSpec(rp *ResolvedParams, dataset string, sizeBytes int64) storagev1al
 	}
 	switch rp.DatasetType {
 	case storagev1alpha1.DatasetTypeFilesystem:
+		fs := &storagev1alpha1.FilesystemConfig{
+			UID:  rp.UID,
+			GID:  rp.GID,
+			Mode: rp.Mode,
+		}
 		if sizeBytes > 0 {
-			spec.Filesystem = &storagev1alpha1.FilesystemConfig{Quota: resource.NewQuantity(sizeBytes, resource.BinarySI)}
+			fs.Quota = resource.NewQuantity(sizeBytes, resource.BinarySI)
+		}
+		// Only attach the arm when it carries intent, so an unbounded fs with no
+		// ownership stays nil (matching prior behaviour and volumeSpecCompatible).
+		if fs.Quota != nil || fs.UID != nil || fs.GID != nil || fs.Mode != "" {
+			spec.Filesystem = fs
 		}
 	case storagev1alpha1.DatasetTypeVolume:
 		spec.Volume = &storagev1alpha1.VolumeConfig{

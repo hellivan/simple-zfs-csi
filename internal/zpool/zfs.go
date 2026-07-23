@@ -64,6 +64,12 @@ type ZFS interface {
 	SetProperty(ctx context.Context, name, property, value string) error
 	// List enumerates datasets/zvols of the given kind.
 	List(ctx context.Context, kind DatasetKind) ([]Dataset, error)
+	// ApplyOwnership sets the POSIX owner/group (chown) and/or mode (chmod) of a
+	// filesystem dataset's mountpoint. uid/gid are applied when non-nil, mode when
+	// non-empty; an all-unset call is a no-op. It runs chown/chmod on the host
+	// through the same redirection as the zfs binary, so it operates on the real
+	// host mountpoint. Intended to be applied once, right after dataset creation.
+	ApplyOwnership(ctx context.Context, mountpoint string, uid, gid *int64, mode string) error
 }
 
 // CLI is the host-backed ZFS implementation. Run defaults to a real exec runner;
@@ -86,11 +92,55 @@ func (z *CLI) run(ctx context.Context, args ...string) (string, error) {
 	if bin == "" {
 		bin = "zfs"
 	}
+	return z.exec(ctx, bin, args...)
+}
+
+// exec runs an arbitrary binary through the configured runner (host-exec aware),
+// so host filesystem tools like chown/chmod are redirected to the host exactly
+// like the zfs binary.
+func (z *CLI) exec(ctx context.Context, name string, args ...string) (string, error) {
 	run := z.Run
 	if run == nil {
 		run = execRunner
 	}
-	return run(ctx, bin, args...)
+	return run(ctx, name, args...)
+}
+
+// ApplyOwnership sets POSIX owner/group and/or mode on a filesystem dataset's
+// mountpoint via host chown/chmod. It is a no-op when uid, gid and mode are all
+// unset, so callers can pass through optional spec fields unconditionally.
+func (z *CLI) ApplyOwnership(ctx context.Context, mountpoint string, uid, gid *int64, mode string) error {
+	if mountpoint == "" {
+		return fmt.Errorf("mountpoint is empty")
+	}
+	if uid != nil || gid != nil {
+		spec := chownSpec(uid, gid)
+		if _, err := z.exec(ctx, "chown", spec, mountpoint); err != nil {
+			return fmt.Errorf("chown %s %s: %w", spec, mountpoint, err)
+		}
+	}
+	if mode != "" {
+		if _, err := z.exec(ctx, "chmod", mode, mountpoint); err != nil {
+			return fmt.Errorf("chmod %s %s: %w", mode, mountpoint, err)
+		}
+	}
+	return nil
+}
+
+// chownSpec renders a chown OWNER[:GROUP] argument from optional uid/gid:
+// "uid:gid" when both are set, "uid" for owner-only, ":gid" for group-only.
+func chownSpec(uid, gid *int64) string {
+	var u, g string
+	if uid != nil {
+		u = strconv.FormatInt(*uid, 10)
+	}
+	if gid != nil {
+		g = strconv.FormatInt(*gid, 10)
+	}
+	if g == "" {
+		return u
+	}
+	return u + ":" + g
 }
 
 // CreateDataset creates a filesystem dataset with optional properties.

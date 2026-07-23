@@ -203,6 +203,8 @@ chart defaultParameters  <  StorageClass.parameters  <  PVC annotations
 | `datasetPrefix` | **StorageClass only** | dataset namespace prepended to the volume name |
 | `protocol` | any layer | `nfs` (→ filesystem) or `nvmeof` (→ zvol) |
 | `volblocksize` | any layer | zvol block size (NVMe-oF only) |
+| `uid` / `gid` | any layer | POSIX owner applied once to the dataset root at creation (NFS/filesystem only; ignored for NVMe-oF) |
+| `mode` | any layer | octal permission bits (e.g. `0770`) applied once to the dataset root at creation (NFS/filesystem only) |
 | `property.<name>` | any layer | passed through as a ZFS `-o` property |
 
 > NFS client allow-lists and NVMe-oF host NQNs are **not** parameters — they are
@@ -217,6 +219,16 @@ pool or dataset namespace via annotations — those keys are stripped from the
 `protocol` also fixes the ZFS object type (`nfs` → filesystem, `nvmeof` →
 zvol); `volumeMode` (`Filesystem` vs `Block`) is orthogonal and resolved at the
 node. The only rejected combination is `Block` + `nfs`.
+
+`uid`/`gid`/`mode` seed the POSIX ownership and permission bits of an NFS
+dataset's root **once, at creation** (via `chown`/`chmod` on the host). They are
+the RWX/NFS analogue of a pod's `securityContext.fsGroup`, which kubelet applies
+only to single-node block volumes and never to shared NFS exports. They are
+opt-in (unset leaves the ZFS default `root:root 0755`), overridable per-PVC via
+the `param.simple-zfs-csi.io/{uid,gid,mode}` annotations, and silently ignored
+for NVMe-oF volumes (whose ownership is an fsGroup concern). Ownership is seeded
+once and never re-applied, so a workload can freely re-`chown` files inside the
+share (see ADR-0015).
 
 StorageClasses are declared in the chart under `storageClasses:` (a list; none
 are created by default). Each entry's `name` is used **verbatim** as the

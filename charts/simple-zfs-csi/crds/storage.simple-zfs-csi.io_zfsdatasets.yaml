@@ -84,6 +84,18 @@ spec:
                   Filesystem holds filesystem-only options. Set it when (and only when)
                   type=filesystem.
                 properties:
+                  gid:
+                    description: |-
+                      GID sets the numeric group of the dataset's root directory, applied once
+                      with `chown` right after creation. Nil leaves the ZFS default (root, gid 0).
+                    format: int64
+                    type: integer
+                  mode:
+                    description: |-
+                      Mode sets the permission bits of the dataset's root directory as an octal
+                      string (e.g. "0770"), applied once with `chmod` right after creation. Empty
+                      leaves the ZFS default (0755).
+                    type: string
                   quota:
                     anyOf:
                     - type: integer
@@ -93,6 +105,15 @@ spec:
                       zero the dataset is unlimited.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  uid:
+                    description: |-
+                      UID sets the numeric owner of the dataset's root directory, applied once
+                      with `chown` right after creation. Nil leaves the ZFS default (root, uid 0).
+                      It is a provision-time convenience for NFS shares, whose ownership is set
+                      server-side (kubelet's fsGroup does not apply to RWX volumes); the
+                      application remains free to change ownership of files it later creates.
+                    format: int64
+                    type: integer
                 type: object
               poolGUID:
                 description: |-

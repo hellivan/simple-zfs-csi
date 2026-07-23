@@ -130,6 +130,10 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 				"CreateFailed", err.Error())
 		}
+		if err := r.applyRootOwnership(ctx, &vol, pool.Status.BaseMountPath, pool.Status.PoolName); err != nil {
+			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
+				"OwnershipFailed", err.Error())
+		}
 		logger.Info("created ZFS object", "dataset", full, "type", vol.Spec.Type)
 	}
 
@@ -176,6 +180,27 @@ func (r *ZfsDatasetReconciler) create(ctx context.Context, vol *storagev1alpha1.
 	default:
 		return fmt.Errorf("unknown volume type %q", vol.Spec.Type)
 	}
+}
+
+// applyRootOwnership sets the provision-time POSIX owner/mode on a freshly
+// created filesystem dataset's mountpoint (spec.filesystem.uid/gid/mode). It runs
+// exactly once, in the create-absent branch, so it never re-chowns a dataset the
+// application has since taken ownership of. Volume/zvol datasets and datasets
+// without any ownership field set are a no-op. `zfs create`/`zfs clone`
+// auto-mount the dataset, so the mountpoint exists by the time this runs.
+func (r *ZfsDatasetReconciler) applyRootOwnership(ctx context.Context, vol *storagev1alpha1.ZfsDataset, baseMountPath, poolName string) error {
+	if vol.Spec.Type != storagev1alpha1.DatasetTypeFilesystem {
+		return nil
+	}
+	fs := vol.Spec.Filesystem
+	if fs == nil || (fs.UID == nil && fs.GID == nil && fs.Mode == "") {
+		return nil
+	}
+	mountpoint, err := deriveVolumePath(storagev1alpha1.DatasetTypeFilesystem, baseMountPath, poolName, vol.Spec.Dataset)
+	if err != nil {
+		return err
+	}
+	return r.ZFS.ApplyOwnership(ctx, mountpoint, fs.UID, fs.GID, fs.Mode)
 }
 
 // clone provisions the dataset by cloning a source snapshot or volume. Sizing is

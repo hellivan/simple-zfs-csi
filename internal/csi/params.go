@@ -9,6 +9,7 @@ package csi
 import (
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
@@ -24,6 +25,14 @@ const (
 	ParamProtocol      = "protocol"
 	ParamDatasetPrefix = "datasetPrefix"
 	ParamVolblocksize  = "volblocksize"
+
+	// UID, GID and Mode set the POSIX ownership/permissions of a filesystem
+	// dataset's root directory at provision time (applied once by the agent with
+	// chown/chmod). They are the NFS analogue of kubelet's fsGroup, which does not
+	// apply to RWX volumes; they are ignored for nvmeof (block) volumes.
+	ParamUID  = "uid"
+	ParamGID  = "gid"
+	ParamMode = "mode"
 
 	// PropertyPrefix marks a pass-through ZFS property, e.g.
 	// "property.compression" -> spec.properties["compression"].
@@ -59,6 +68,13 @@ type ResolvedParams struct {
 	DatasetPrefix string
 	Volblocksize  string
 	Properties    map[string]string
+
+	// UID/GID/Mode carry the optional provision-time root ownership for
+	// filesystem datasets. They are nil/"" when unset and are only populated for
+	// the nfs (filesystem) protocol; nvmeof ignores them.
+	UID  *int64
+	GID  *int64
+	Mode string
 }
 
 // ResolveParameters merges the three inheritance layers into a single flat map,
@@ -127,6 +143,23 @@ func ParseParams(p map[string]string) (*ResolvedParams, error) {
 	rp.DatasetPrefix = strings.Trim(strings.TrimSpace(p[ParamDatasetPrefix]), "/")
 	rp.Volblocksize = strings.TrimSpace(p[ParamVolblocksize])
 
+	// Root ownership/permissions apply only to filesystem (nfs) datasets. For
+	// nvmeof they are silently ignored rather than rejected, so a cluster-wide
+	// default (uid/gid/mode in the provisioner defaults layer) does not break
+	// block provisioning; ownership of a formatted zvol is a fsGroup concern.
+	if rp.DatasetType == storagev1alpha1.DatasetTypeFilesystem {
+		var err error
+		if rp.UID, err = parseOptionalID(p[ParamUID], ParamUID); err != nil {
+			return nil, err
+		}
+		if rp.GID, err = parseOptionalID(p[ParamGID], ParamGID); err != nil {
+			return nil, err
+		}
+		if rp.Mode, err = parseOptionalMode(p[ParamMode]); err != nil {
+			return nil, err
+		}
+	}
+
 	for k, v := range p {
 		if name := strings.TrimPrefix(k, PropertyPrefix); name != k && name != "" {
 			if rp.Properties == nil {
@@ -137,6 +170,35 @@ func ParseParams(p map[string]string) (*ResolvedParams, error) {
 	}
 
 	return rp, nil
+}
+
+// parseOptionalID parses an optional non-negative POSIX uid/gid. An empty value
+// yields nil (leave the ZFS default); a malformed or negative value is an error.
+func parseOptionalID(raw, key string) (*int64, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, nil
+	}
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || id < 0 {
+		return nil, fmt.Errorf("parameter %q must be a non-negative integer, got %q", key, raw)
+	}
+	return &id, nil
+}
+
+// parseOptionalMode validates an optional octal permission string (e.g. "0770")
+// and returns it normalised without surrounding whitespace. An empty value
+// yields "" (leave the ZFS default 0755).
+func parseOptionalMode(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", nil
+	}
+	if _, err := strconv.ParseUint(s, 8, 32); err != nil {
+		return "", fmt.Errorf("parameter %q must be an octal permission string (e.g. %q), got %q",
+			ParamMode, "0770", raw)
+	}
+	return s, nil
 }
 
 // Dataset returns the logical dataset path for a CSI volume name, honouring the

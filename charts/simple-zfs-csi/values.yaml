@@ -228,6 +228,16 @@ csiController:
   defaultParameters: {}
     # protocol: nfs
     # property.compression: lz4
+    # -- Root ownership/permissions applied once to a filesystem (nfs) dataset
+    # -- right after creation via chown/chmod on the host. These are the NFS
+    # -- (RWX) analogue of pod `securityContext.fsGroup`, which kubelet does not
+    # -- apply to shared volumes. They are silently ignored for nvmeof (block)
+    # -- volumes, so setting them cluster-wide here is safe. Unset leaves the ZFS
+    # -- default (root:root, 0755). All three are overridable per-PVC via the
+    # -- `param.simple-zfs-csi.io/{uid,gid,mode}` annotations.
+    # uid: "1000"          # numeric POSIX uid
+    # gid: "1000"          # numeric POSIX gid
+    # mode: "0770"         # octal permission string
   # external-provisioner sidecar.
   provisioner:
     # -- external-provisioner image repository.
@@ -452,6 +462,11 @@ storageClasses: []
   #     poolGUID: "1234567890"   # required; identifies the target ZFS pool
   #     datasetPrefix: k8s        # optional; prefixes every provisioned dataset
   #     protocol: nfs
+  #     # Optional root ownership/permissions applied once at creation. Overridable
+  #     # per-PVC via the param.simple-zfs-csi.io/{uid,gid,mode} annotations.
+  #     uid: "1000"
+  #     gid: "1000"
+  #     mode: "0770"
   # - name: nvmeof
   #   reclaimPolicy: Delete
   #   parameters:

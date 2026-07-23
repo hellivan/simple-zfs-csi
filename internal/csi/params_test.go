@@ -167,3 +167,73 @@ func TestParseParams_Errors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseParams_Ownership(t *testing.T) {
+	rp, err := ParseParams(map[string]string{
+		"poolGUID": "999",
+		"protocol": "nfs",
+		"uid":      "1000",
+		"gid":      "2000",
+		"mode":     "0770",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rp.UID == nil || *rp.UID != 1000 {
+		t.Errorf("UID = %v, want 1000", rp.UID)
+	}
+	if rp.GID == nil || *rp.GID != 2000 {
+		t.Errorf("GID = %v, want 2000", rp.GID)
+	}
+	if rp.Mode != "0770" {
+		t.Errorf("Mode = %q, want 0770", rp.Mode)
+	}
+}
+
+func TestParseParams_OwnershipUnset(t *testing.T) {
+	rp, err := ParseParams(map[string]string{
+		"poolGUID": "999",
+		"protocol": "nfs",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rp.UID != nil || rp.GID != nil || rp.Mode != "" {
+		t.Errorf("expected unset ownership, got uid=%v gid=%v mode=%q", rp.UID, rp.GID, rp.Mode)
+	}
+}
+
+func TestParseParams_OwnershipIgnoredForNVMeoF(t *testing.T) {
+	// uid/gid/mode from a cluster-wide defaults layer must not break block
+	// provisioning: they are silently ignored for nvmeof (volume) datasets.
+	rp, err := ParseParams(map[string]string{
+		"poolGUID": "999",
+		"protocol": "nvmeof",
+		"uid":      "1000",
+		"gid":      "2000",
+		"mode":     "0770",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rp.UID != nil || rp.GID != nil || rp.Mode != "" {
+		t.Errorf("expected ownership ignored for nvmeof, got uid=%v gid=%v mode=%q", rp.UID, rp.GID, rp.Mode)
+	}
+}
+
+func TestParseParams_OwnershipErrors(t *testing.T) {
+	cases := map[string]map[string]string{
+		"non-integer uid": {"poolGUID": "999", "protocol": "nfs", "uid": "root"},
+		"negative uid":    {"poolGUID": "999", "protocol": "nfs", "uid": "-1"},
+		"non-integer gid": {"poolGUID": "999", "protocol": "nfs", "gid": "wheel"},
+		"non-octal mode":  {"poolGUID": "999", "protocol": "nfs", "mode": "0999"},
+		"garbage mode":    {"poolGUID": "999", "protocol": "nfs", "mode": "rwx"},
+	}
+	for name, params := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseParams(params); err == nil {
+				t.Errorf("expected error for %s", name)
+			}
+		})
+	}
+}
