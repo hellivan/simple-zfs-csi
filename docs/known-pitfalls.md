@@ -596,6 +596,50 @@ tradeoff is accepted) instead — those bound the wait based on elapsed time, no
 on guessing pod-termination intent, so a quick transient restart stays
 transparent while a truly dead server still eventually unblocks.
 
+### Rejected option: detach `rpc.mountd` into the host PID namespace via `nsenter`
+
+Considered and **rejected**: re-exec `rpc.mountd` via `nsenter -t 1` (the same
+host-namespace-entry trick this project already uses for `hostExec.mode:
+nsenter`, ADR-0016) so it would keep running independent of the
+`nfs-controller` pod's own container lifecycle — mirroring how `nvmet`
+configfs state and `nfsd` kernel threads already survive pod restarts.
+
+**Why it doesn't actually work:** `nsenter -t 1` only changes which
+*namespaces* (mount, PID, ...) the process is attached to. It does **not**
+move the process to a different **cgroup**. Container runtimes (containerd,
+via kubelet) tear a container down by killing (SIGKILL / freeze+kill) every
+process in that container's **cgroup**, not by looking at which namespaces a
+process happens to be nsenter'd into. A `rpc.mountd` forked from inside the
+`nfs-controller` container is still a member of that container's cgroup
+regardless of `nsenter`, so it would almost certainly still be reaped when the
+pod is torn down — the trick doesn't buy the survival property it's meant to.
+
+This is exactly why `nvmet`/`nfsd` *do* survive: they aren't processes at all.
+`nvmet` subsystems are directory entries in host configfs; `nfsd` "threads"
+are real kernel threads created once by a one-shot `rpc.nfsd` invocation and
+owned by the kernel, not by any container's cgroup. Neither has anything for
+the container runtime's cgroup-kill to reap. A long-lived userspace daemon
+like `rpc.mountd` has no equivalent free ride — keeping it alive independent
+of its pod would require it to run as a genuinely separate, non-Kubernetes-
+managed host service (e.g. a systemd unit), which is precisely what **Talos
+does not support** (immutable, no host package manager, no ability to install
+host-level daemons — see [THOUGHTS.md](../THOUGHTS.md) and ADR-0016's
+`hostExec.mode` rationale). **Do not pursue this.**
+
+**What mature CSI/storage projects actually do instead**, since this isn't a
+solved problem in the wild either: cloud-managed NFS/SMB CSI drivers (EFS,
+Azure Files, Filestore) sidestep the whole class of bug architecturally — the
+server is an externally managed, always-up service that is *never* colocated
+with, or torn down as part of, any Kubernetes node's lifecycle. Projects that
+do run an in-cluster NFS server (Rook's NFS operator, Longhorn's
+share-manager, Democratic-CSI's NFS-Ganesha mode) generally don't solve this
+either — they document the limitation and lean on the same two levers
+available here: bounding the client's wait via mount/transport options, and
+accepting that a genuinely dead server means a slow, monitorable teardown
+rather than an eliminated one. There is no widely-used trick that makes an
+in-cluster network-filesystem server's helper daemon immune to its own pod's
+termination; **client-side bounded timeouts remain the only practical fix.**
+
 ---
 
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
