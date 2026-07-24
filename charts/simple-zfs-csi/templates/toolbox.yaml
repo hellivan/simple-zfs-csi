@@ -78,6 +78,26 @@ spec:
             {{- if and .Values.toolbox.hostExec.enabled (eq .Values.toolbox.hostExec.mode "chroot") }}
             - name: host-root
               mountPath: /host
+              # Bidirectional (not HostToContainer): the zfs/zpool wrappers run
+              # `chroot /host zfs ...`. chroot changes path resolution but NOT
+              # the mount namespace, so a dataset mounted this way materializes
+              # inside THIS subtree (container path /host/<mountpoint>). This is
+              # the ONLY volume a toolbox-created mount lands in, so it is the
+              # one that must propagate OUT to the host to be visible to the
+              # host and other pods.
+              mountPropagation: Bidirectional
+            {{- end }}
+            {{- with .Values.toolbox.datasetMountRoot }}
+            - name: dataset-mount-root
+              mountPath: {{ . }}
+              # HostToContainer (receive-only) in BOTH host-exec modes — never
+              # Bidirectional. A mount is only born inside the container in
+              # chroot mode, and it lands under /host (see host-root), not here.
+              # In nsenter mode the wrapper enters the host mount namespace, so
+              # `zfs mount` creates the mount ON THE HOST directly — again not in
+              # this subtree. Either way (and for CSI-agent / manual host
+              # mounts) this volume only RECEIVES: the host's mount propagates
+              # in and becomes browsable at this path. rslave suffices.
               mountPropagation: HostToContainer
             {{- end }}
       volumes:
@@ -93,6 +113,12 @@ spec:
         - name: host-root
           hostPath:
             path: {{ .Values.toolbox.hostExec.hostRootPath }}
+            type: Directory
+        {{- end }}
+        {{- with .Values.toolbox.datasetMountRoot }}
+        - name: dataset-mount-root
+          hostPath:
+            path: {{ . }}
             type: Directory
         {{- end }}
 {{- end }}

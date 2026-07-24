@@ -437,8 +437,58 @@ toolbox:
     mode: chroot
     # -- Host PID whose namespaces are entered in nsenter mode.
     targetPid: 1
-    # -- Host root path bind-mounted to /host in chroot mode.
+    # -- Host root path bind-mounted to /host in chroot mode. On Talos the
+    # -- kubelet runs in its own sandboxed mount namespace and does not see
+    # -- arbitrary host paths (incl. "/") without a matching
+    # -- machine.kubelet.extraMounts entry for this exact path — impractical
+    # -- to do for the whole root. Prefer hostExec.mode: nsenter on Talos: with
+    # -- hostPID it enters the host's mount namespace directly via
+    # -- /proc/1/ns/mnt, so it needs no hostPath volume and no Talos
+    # -- extraMounts at all.
     hostRootPath: /
+  # -- Optional host directory bind-mounted into the toolbox at the SAME path
+  # -- (unlike hostExec's /host chroot), with HostToContainer propagation, so
+  # -- dataset mountpoints are directly browsable (`ls`, `du`, `rsync`, ...)
+  # -- without the /host prefix. Becomes the hostPath `path` of the volume.
+  # --
+  # -- This does NOT need to equal your pool's exact mountpoint — it may be a
+  # -- PARENT of it (e.g. "/var/mnt" when the pool is at
+  # -- "/var/mnt/spinning-archive"). A parent is the recommended,
+  # -- node-independent choice: the same chart value works on every storage
+  # -- node even though each node's pools/mountpoints differ, and newly
+  # -- provisioned PVCs under it appear without restarting the toolbox.
+  # --
+  # -- On plain systemd-managed hosts, visibility is automatic (kubelet runs in
+  # -- the host mount namespace) — this value just needs to already be a
+  # -- "shared" mount (verify: `findmnt -o TARGET,PROPAGATION <path>`; if
+  # -- "private", `mount --make-rshared <path>`, persisted via a systemd mount
+  # -- unit).
+  # --
+  # -- On Talos the kubelet runs in its OWN isolated mount namespace and only
+  # -- sees host paths added via `machine.kubelet.extraMounts`. You do NOT have
+  # -- to widen extraMounts to match a parent datasetMountRoot: keep the
+  # -- specific per-pool entry in MachineConfig and set datasetMountRoot to the
+  # -- parent. It still works because Talos creates the parent dir ("/var/mnt")
+  # -- in the kubelet namespace to host the "/var/mnt/spinning-archive" bind
+  # -- mount, so a hostPath at the parent recursively (rbind) picks that
+  # -- submount up, and its rshared→rslave propagation carries datasets
+  # -- provisioned later into the pod. The rest of the parent shows up empty in
+  # -- the pod (harmless). Typical split:
+  # --   # MachineConfig (per node): specific mountpoint
+  # --   machine:
+  # --     kubelet:
+  # --       extraMounts:
+  # --         - destination: /var/mnt/spinning-archive
+  # --           type: bind
+  # --           source: /var/mnt/spinning-archive
+  # --           options: [rbind, rshared, rw]   # rshared drives propagation
+  # --   # this chart (all nodes): generic parent
+  # --   toolbox: { datasetMountRoot: /var/mnt }
+  # -- (If a node has NO extraMounts entry under datasetMountRoot, its toolbox
+  # -- pod just sees an empty dir.) After changing extraMounts, apply with
+  # -- `talosctl apply-config` (expect the kubelet to restart).
+  # -- Leave empty to disable (default).
+  datasetMountRoot: ""
   # -- Resource requests/limits.
   resources: {}
   # -- Pod annotations.
