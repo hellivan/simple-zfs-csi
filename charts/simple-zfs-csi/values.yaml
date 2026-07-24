@@ -147,19 +147,23 @@ discovery:
     # -- Enable running the host's zpool/zfs. Disable only with a custom image
     # that bundles matching ZFS userspace tools.
     enabled: true
-    # -- How to reach the host binaries: "chroot" (Talos-documented, bind-mounts
-    # the host root at /host) or "nsenter" (enters the host mount namespace of
-    # targetPid; requires hostPID).
-    # -- CAVEAT (chroot): this agent runs `zfs create`/`clone`, which AUTO-MOUNT
-    # the new dataset. In chroot mode that mount is born inside the pod under
-    # /host, so the /host volume is mounted Bidirectional to propagate it out to
-    # the host and the NFS DaemonSet (see docs/known-pitfalls.md class 15). A
-    # Bidirectional mount REQUIRES the host `/` to be a SHARED mount, or the pod
-    # fails to start — verify with `findmnt -o TARGET,PROPAGATION /` (want
-    # "shared"). If `/` is not shared, use mode: nsenter, which creates the
-    # mount directly in the host namespace and needs no /host volume or shared
-    # root. nsenter is the recommended choice on Talos.
-    mode: chroot
+    # -- How to reach the host binaries: "nsenter" (default; enters the host
+    # mount namespace of targetPid, requires hostPID) or "chroot" (bind-mounts
+    # the host root at /host).
+    #
+    # WARNING: use "nsenter". "chroot" does NOT work correctly on Talos for this
+    # agent. discovery runs `zfs create`/`clone`, which AUTO-MOUNT the new
+    # dataset. chroot changes path resolution, not the mount namespace, so that
+    # mount is born inside the pod under /host and can only reach the host if the
+    # /host volume is Bidirectional AND host `/` is a SHARED mount. On Talos the
+    # kubelet only shares paths listed in machine.kubelet.extraMounts, and `/` is
+    # not (and cannot practically) be among them — so the created mount is
+    # trapped in the pod and lost on restart. Observed effect: every NFS PVC
+    # dataset ends up UNMOUNTED on the host and reads/writes land in the PARENT
+    # dataset. nsenter creates the mount directly in the host namespace under the
+    # already-shared pool path, so it propagates to the NFS pod and consumers.
+    # See docs/known-pitfalls.md class 15 and docs/design-decisions.md ADR-0016.
+    mode: nsenter
     # -- Host PID whose namespaces are entered in nsenter mode.
     targetPid: 1
     # -- Host root path bind-mounted to /host in chroot mode.
@@ -343,15 +347,17 @@ csiNode:
   hostExec:
     # -- Enable running the host's mount/nvme binaries via chroot/nsenter.
     enabled: false
-    # -- "chroot" (bind-mount host root at /host) or "nsenter" (enter targetPid namespaces).
-    # -- CAVEAT (chroot): when enabled, the node mounter runs `mount`/`mkfs` via
-    # `chroot /host`, so the volume mount is created inside the pod under /host
-    # and its /host volume is mounted Bidirectional to reach the host/kubelet
-    # (see docs/known-pitfalls.md class 15). Bidirectional REQUIRES host `/` to
-    # be a SHARED mount (`findmnt -o TARGET,PROPAGATION /` → "shared") or the pod
-    # fails to start. Prefer mode: nsenter (no /host volume, no shared-root
-    # requirement) on Talos.
-    mode: chroot
+    # -- "nsenter" (default; enter targetPid namespaces) or "chroot" (bind-mount
+    # host root at /host).
+    #
+    # WARNING: use "nsenter". When host-exec is enabled the node mounter runs
+    # `mount`/`mkfs`, which CREATE mounts. Under chroot those mounts are born in
+    # the pod under /host and only reach the kubelet if /host is Bidirectional
+    # and host `/` is SHARED — which does not hold on Talos (see the discovery
+    # note above, known-pitfalls.md class 15, design-decisions.md ADR-0016). A
+    # consumer volume then comes up EMPTY. nsenter creates the mount on the host
+    # directly and needs no /host volume or shared-root.
+    mode: nsenter
     # -- Host PID whose namespaces are entered in nsenter mode.
     targetPid: 1
     # -- Host root path bind-mounted to /host in chroot mode.
@@ -449,8 +455,16 @@ toolbox:
   hostExec:
     # -- Enable running the host's ZFS tools via chroot/nsenter.
     enabled: true
-    # -- "chroot" (bind-mount host root at /host) or "nsenter" (enter targetPid namespaces).
-    mode: chroot
+    # -- "nsenter" (default; enter targetPid namespaces) or "chroot" (bind-mount
+    # host root at /host).
+    #
+    # WARNING: prefer "nsenter" — "chroot" cannot create host mounts on Talos
+    # (see discovery.hostExec.mode, known-pitfalls.md class 15, ADR-0016), so a
+    # `zfs mount`/`zfs create` run from a chroot toolbox will NOT affect the
+    # host. Trade-off: nsenter drops the `/host` browse volume (it exists only in
+    # chroot mode). To browse dataset mountpoints under nsenter, set
+    # `toolbox.datasetMountRoot` (below) or use `nsenter -t 1 -m -- ls ...`.
+    mode: nsenter
     # -- Host PID whose namespaces are entered in nsenter mode.
     targetPid: 1
     # -- Host root path bind-mounted to /host in chroot mode. On Talos the

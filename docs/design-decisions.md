@@ -10,6 +10,91 @@ recurring bug classes and their guards are catalogued in
 
 ---
 
+## ADR-0016 — Default `hostExec.mode` to `nsenter`; `chroot` cannot create host mounts on Talos
+
+**Status:** Accepted (2026-07-24) · **Scope:** Helm `values.yaml` defaults for `discovery.hostExec.mode`, `csiNode.hostExec.mode` and `toolbox.hostExec.mode` (`chroot` → `nsenter`), and the operational guidance in [known-pitfalls.md](known-pitfalls.md) class 15 · **Builds on** the `Runner` host-exec indirection (ADR-0003) and the host-exec observability/mode work (ADR-0013).
+
+### Context
+
+Host-exec runs the host's `zpool`/`zfs`/`mount`/`mkfs` from inside a pod, in one of
+two modes:
+
+- **`chroot`** bind-mounts the host root at `/host` and runs `chroot /host <tool>`.
+  This changes *path resolution* but **not the mount namespace** — the process stays
+  in the pod's namespace.
+- **`nsenter`** enters the target PID's (PID 1) **mount namespace** via `hostPID` +
+  `/proc/1/ns/mnt`, so the tool runs as if on the host.
+
+For read-only commands (`zpool status`, `zfs list`, `zpool scrub`) the two are
+equivalent. The difference bites for commands that **create a mount**: discovery's
+`zfs create`/`zfs clone` auto-mount the new dataset; an enabled csi-node runs
+`mount`/`mkfs`.
+
+Field finding (Talos, single storage node, pool at `/var/mnt/spinning-archive`):
+with `discovery.hostExec.mode: chroot`, **every NFS (filesystem) PVC dataset was
+left `mounted no` on the host**. `zfs create` auto-mounted each dataset inside the
+discovery pod's namespace under `/host`, that mount never propagated to the host, and
+it vanished when the pod restarted. Reads/writes to the "mounted" path (via the NFS
+export and via the toolbox `/host` path) therefore landed in the **parent** dataset —
+data silently written to the wrong dataset, child `USED` staying at 96K. zvols
+(NVMe-oF) were unaffected (block export, no filesystem mount).
+
+Why chroot cannot be fixed on Talos: escaping the pod requires the `/host` volume to
+be `Bidirectional` (rshared) **and** the host source to be a shared mount. The
+discovery `/host` source is `hostPath: /`. The Talos kubelet only propagates paths
+declared in `machine.kubelet.extraMounts` (here only `/var/mnt/spinning-archive`,
+`rshared`); `/` is not — and rsharing the entire root into the kubelet is
+impractical. So `Bidirectional` either fails pod startup (non-shared source) or, as
+observed, creates the mount but leaves it trapped.
+
+### Decision
+
+Default `hostExec.mode` to **`nsenter`** for every component that uses host-exec
+(`discovery`, `csiNode`, `toolbox`; the scrub CronJob follows `discovery.hostExec`).
+`nsenter` creates the mount **directly in the host's mount namespace**, under the
+pool path Talos already shares via `extraMounts`, so it propagates to the NFS server
+pod and consumers with no `/host` volume, no Bidirectional plumbing, and no
+whole-root rshare. `chroot` remains selectable but is documented as **read-only-safe
+only**, and as **incorrect on Talos for any mount-creating operation**.
+
+### Alternatives considered
+
+- **Keep `chroot` default + `Bidirectional` `/host` (the prior guard).** Rejected: it
+  only works where host `/` is rshared, which is not the case on Talos and cannot be
+  arranged cleanly; it fails loudly (pod won't start) or, worse, silently traps the
+  mount. It also mounts the entire host root Bidirectional — heavy and risky.
+- **Per-pool `hostPath` at the pool mountpoint with in-container Bidirectional.**
+  Rejected for the generic agent: discovery/csi-node don't know the pool path a
+  priori, and it would still require bundling matching ZFS userspace in-image.
+- **Bundle ZFS userspace in the image and mount in-container (drop host-exec).**
+  Rejected per the ADR-0003 rationale: in-image tools drift from the host ZFS kernel
+  module version; host-exec exists precisely to avoid that drift.
+- **`nsenter` only for discovery, keep `chroot` for the toolbox (`/host` browse).**
+  Partially valid — chroot is fine for the toolbox's read-only use — but a `zfs mount`
+  run from a chroot toolbox silently fails to affect the host, a footgun. We default
+  the toolbox to `nsenter` for correctness and document that browsing moves to
+  `toolbox.datasetMountRoot` or `nsenter -t 1 -m -- ls`.
+
+### Consequences
+
+- Dynamically provisioned NFS datasets mount on the host and export correctly on
+  Talos out of the box; the silent "data lands in the parent" class is closed for new
+  provisioning.
+- All host-exec pods now request `hostPID: true` (already required for nsenter) — an
+  acceptable posture for privileged, node-local storage agents.
+- The toolbox no longer bind-mounts `/host` by default (that volume is chroot-only).
+  Browse dataset mountpoints via `toolbox.datasetMountRoot` (may be a parent of the
+  pool mountpoint) or `nsenter -t 1 -m -- ls`.
+- **Not retroactive:** the reconciler is idempotent-create, so switching an existing
+  cluster to `nsenter` fixes *future* provisioning only. Datasets already created
+  under `chroot` remain unmounted until explicitly `zfs mount`-ed in the host
+  namespace, and any data written into a parent while a child was unmounted is
+  shadowed once the child mounts and must be reconciled by hand.
+- `chroot` stays available for non-Talos hosts / read-only use; the chart values and
+  known-pitfalls class 15 carry the warning.
+
+---
+
 ## ADR-0015 — Provision-time POSIX root ownership for filesystem datasets via `uid`/`gid`/`mode` parameters
 
 **Status:** Accepted (2026-07-27) · **Scope:** `internal/csi/params.go` (new `uid`/`gid`/`mode` params), `internal/csi/controller.go` (`volumeSpec`), `api/v1alpha1/zfsdataset_types.go` (`FilesystemConfig.UID/GID/Mode`), `internal/zpool/zfs.go` (`ZFS.ApplyOwnership`), `internal/controller/zfsdataset_controller.go` (apply-once at create) · **Builds on** the three-layer parameter inheritance (ADR-0002) and complements the Helm `fsGroupPolicy`/`--default-fstype` fix (see [known-pitfalls.md](known-pitfalls.md) class 14).
