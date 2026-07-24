@@ -26,6 +26,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "csi-node") }}
+      {{- with (include "simple-zfs-csi.priorityClassName" (dict "root" . "component" "csiNode")) }}
+      priorityClassName: {{ . }}
+      {{- end }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- if and .Values.csiNode.hostExec.enabled (eq .Values.csiNode.hostExec.mode "nsenter") }}

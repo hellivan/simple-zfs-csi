@@ -449,11 +449,12 @@ above. See [design-decisions.md](design-decisions.md) ADR-0016.
 
 ---
 
-## 16. Node shutdown/reboot can hang on unmount when the NFS/NVMe-oF server dies first (no guard yet — open risk)
+## 16. Node shutdown/reboot can hang on unmount when the NFS/NVMe-oF server dies first (partially mitigated)
 
-**Status:** identified 2026-07-24, **not yet fixed**. No code guard exists for
-this class; it is documented here so the risk is tracked even though the
-`Guarded by:` slot below is empty.
+**Status:** identified 2026-07-24; a partial mitigation (`priorityClassName`)
+landed 2026-07-24. The core race (no shutdown-ordering guarantee between the
+server and its client) is **still open** — see `Guarded by:` below for exactly
+what is and isn't covered.
 
 **Symptom:** a `talos reboot`/shutdown (or plain `kubectl drain`) of a storage
 node takes a very long time to complete, sometimes appearing to hang
@@ -483,17 +484,36 @@ itself is stuck.
 
 **Why it's not just a multi-node problem:** there is no ordering guarantee
 between the NFS/NVMe-oF server DaemonSets and the CSI node plugin today — no
-`priorityClassName`, no `preStop` hook, no `PodDisruptionBudget`, no
-terminationGracePeriod tuning in any of the chart templates. Kubernetes gives
-no cross-DaemonSet shutdown ordering by default, so "server disappears first"
-is not an edge case to defend against, it's the coin-flip default on a
-single-node (or storage+compute-colocated) deployment.
+`preStop` hook, no `PodDisruptionBudget`, no terminationGracePeriod tuning in
+any of the chart templates. Kubernetes gives no cross-DaemonSet shutdown
+ordering by default, so "server disappears first" is not an edge case to
+defend against, it's the coin-flip default on a single-node (or
+storage+compute-colocated) deployment.
 
-**Guarded by:** nothing yet — open risk. Candidate fixes (soft/`timeo` NFS
-mount options, bounded-timeout unmount with lazy fallback in
-[internal/csi/mount.go](../internal/csi/mount.go), chart-level
-`priorityClassName`/`preStop` ordering) are being evaluated; update this entry
-with the `Guarded by:` fix once one lands.
+**Guarded by (partial):** the nfs, nvmeof and csi-node DaemonSets default to
+`priorityClassName: system-node-critical` (overridable per component via
+`<component>.priorityClassName`, or cluster-wide via the top-level
+`priorityClassName`), wired through `simple-zfs-csi.priorityClassName` in
+[_helpers.tpl](../charts/simple-zfs-csi/templates/_helpers.tpl) and rendered in
+[nfs-daemonset.yaml](../charts/simple-zfs-csi/templates/nfs-daemonset.yaml),
+[nvmeof-daemonset.yaml](../charts/simple-zfs-csi/templates/nvmeof-daemonset.yaml)
+and
+[csi-node-daemonset.yaml](../charts/simple-zfs-csi/templates/csi-node-daemonset.yaml).
+`system-node-critical` protects these pods from **kubelet eviction under node
+pressure** (they are never picked as eviction candidates ahead of ordinary
+pods) and from the **OOM killer's** score adjustment, and it makes a `kubectl
+drain` schedule their eviction relative to lower-priority pods more
+predictably. **What it does not fix:** it has no effect on a voluntary
+`talos reboot`/shutdown's SIGTERM ordering across DaemonSets — kubelet still
+has no built-in "stop server after client" (or reverse) sequencing on plain
+pod termination, so the underlying blocking-`umount` race (no timeout, no
+`-f`/`-l`, `context.Background()` in `unmount`,
+[internal/csi/mount.go](../internal/csi/mount.go)) is unchanged. Treat this as
+raising the odds the server pod survives incidental node pressure long enough
+for clients to unmount cleanly, not as a fix for the ordering race itself.
+Candidate fixes for the remaining gap (soft/`timeo` NFS mount options,
+bounded-timeout unmount with lazy fallback in
+[internal/csi/mount.go](../internal/csi/mount.go)) are still being evaluated.
 
 ### NVMe-oF vs NFS: why the risk is asymmetric
 

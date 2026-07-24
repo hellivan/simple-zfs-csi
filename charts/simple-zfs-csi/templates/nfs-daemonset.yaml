@@ -24,6 +24,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "nfs") }}
+      {{- with (include "simple-zfs-csi.priorityClassName" (dict "root" . "component" "nfs")) }}
+      priorityClassName: {{ . }}
+      {{- end }}
       # hostNetwork so other nodes reach the server on the node IP (2049/111/20048).
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

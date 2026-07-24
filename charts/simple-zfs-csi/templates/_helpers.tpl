@@ -62,3 +62,14 @@ ServiceAccount name for a component.
 {{- define "simple-zfs-csi.serviceAccountName" -}}
 {{- printf "%s-%s" (include "simple-zfs-csi.fullname" .root) .component | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
+
+{{/*
+Resolve the PriorityClass name for a component ("nfs", "nvmeof", "csiNode").
+Falls back to the top-level `priorityClassName` when the component override is
+unset. Usage: {{ include "simple-zfs-csi.priorityClassName" (dict "root" . "component" "nfs") }}
+*/}}
+{{- define "simple-zfs-csi.priorityClassName" -}}
+{{- $root := .root -}}
+{{- $comp := index $root.Values .component -}}
+{{- $comp.priorityClassName | default $root.Values.priorityClassName -}}
+{{- end -}}

@@ -24,6 +24,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "nvmeof") }}
+      {{- with (include "simple-zfs-csi.priorityClassName" (dict "root" . "component" "nvmeof")) }}
+      priorityClassName: {{ . }}
+      {{- end }}
       # hostNetwork so initiators reach the NVMe/TCP port on the node IP.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

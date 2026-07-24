@@ -36,6 +36,16 @@ nodeSelector:
 tolerations:
   - operator: Exists
 
+# -- Default PriorityClass for the NFS/NVMe-oF target DaemonSets and the CSI
+# -- node plugin DaemonSet. These are the pods most likely to be co-located with
+# -- the workloads that depend on them (see docs/known-pitfalls.md class 16), so
+# -- `system-node-critical` reduces the odds the kubelet evicts/starves the
+# -- server or node plugin ahead of the ordinary pods that need them during node
+# -- pressure. Override per component via `<component>.priorityClassName`, or set
+# -- this to "" to fall back to no PriorityClass. The named class must already
+# -- exist in the cluster (`system-node-critical` is built in).
+priorityClassName: system-node-critical
+
 serviceAccount:
   # -- Create the ServiceAccounts (one per controller).
   create: true
@@ -73,6 +83,9 @@ nfs:
   resources: {}
   # -- Pod annotations.
   podAnnotations: {}
+  # -- PriorityClass override for this DaemonSet. Empty falls back to the
+  # -- top-level `priorityClassName`.
+  priorityClassName: ""
   # -- Host ports for metrics and health probes. With hostNetwork these bind on
   # the node, so they must not clash with the nvmeof controller on the same node.
   ports:
@@ -118,6 +131,9 @@ nvmeof:
   resources: {}
   # -- Pod annotations.
   podAnnotations: {}
+  # -- PriorityClass override for this DaemonSet. Empty falls back to the
+  # -- top-level `priorityClassName`.
+  priorityClassName: ""
   # -- Host ports for metrics and health probes. With hostNetwork these bind on
   # the node, so they must differ from the nfs controller on the same node.
   ports:
@@ -378,6 +394,9 @@ csiNode:
   resources: {}
   # -- Pod annotations.
   podAnnotations: {}
+  # -- PriorityClass override for this DaemonSet. Empty falls back to the
+  # -- top-level `priorityClassName`.
+  priorityClassName: ""
   # -- Node selector limiting which nodes run the plugin (empty = all nodes).
   nodeSelector: {}
   # -- Tolerations; defaults to tolerating everything so the plugin runs on every node.
