@@ -81,6 +81,10 @@ data:
                       {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "chroot") }}
                       - name: host-root
                         mountPath: /host
+                        # HostToContainer is correct here (unlike the discovery
+                        # DaemonSet): scrub only runs `zpool scrub`, which creates
+                        # NO mounts, so nothing needs to propagate out. See
+                        # known-pitfalls.md class 15.
                         mountPropagation: HostToContainer
                       {{- end }}
                 volumes:

@@ -86,7 +86,16 @@ spec:
             {{- if and .Values.csiNode.hostExec.enabled (eq .Values.csiNode.hostExec.mode "chroot") }}
             - name: host-root
               mountPath: /host
-              mountPropagation: HostToContainer
+              # Bidirectional (NOT HostToContainer): with host-exec on, the node
+              # mounter runs `chroot /host mount|mkfs`, so the NFS/block mount is
+              # created inside this container under /host (chroot keeps the same
+              # mount namespace) at the kubelet target path. It must propagate
+              # OUT to the host or kubelet never sees the staged/published mount
+              # and the consumer pod's volume is empty. See known-pitfalls.md
+              # class 15. (Default hostExec off: `mount` runs in-container onto
+              # pods-mount-dir, which is already Bidirectional; nsenter mode
+              # creates the mount on the host directly.)
+              mountPropagation: Bidirectional
             {{- end }}
           {{- with .Values.csiNode.resources }}
           resources:

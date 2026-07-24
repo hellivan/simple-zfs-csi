@@ -106,7 +106,15 @@ spec:
             {{- if and .Values.discovery.hostExec.enabled (eq .Values.discovery.hostExec.mode "chroot") }}
             - name: host-root
               mountPath: /host
-              mountPropagation: HostToContainer
+              # Bidirectional (NOT HostToContainer): the ZfsDataset/ZfsSnapshot
+              # reconcilers run `chroot /host zfs create|clone`, which AUTO-MOUNT
+              # the new dataset. chroot changes path resolution, not the mount
+              # namespace, so that mount is born inside this container under
+              # /host and must propagate OUT to the host peer group — otherwise
+              # the NFS DaemonSet (its `pool` mount is rslave) never sees it and
+              # `exportfs` fails. See known-pitfalls.md class 15. (nsenter mode
+              # needs no /host volume: the mount is created on the host directly.)
+              mountPropagation: Bidirectional
             {{- end }}
       volumes:
         - name: dev

@@ -378,6 +378,69 @@ create.
 
 ---
 
+## 15. chroot host-exec creates mounts that can't escape the pod (propagation)
+
+**Symptom:** with `hostExec.mode: chroot`, dynamically provisioned datasets are
+invisible outside the pod that created them. Concretely: a newly provisioned
+NFS PVC never exports (`exportfs` on the NFS DaemonSet can't find the path,
+because the dataset the **discovery** agent just `zfs create`d is not in the
+host mount table); or, if `csiNode.hostExec` is enabled, a consumer pod's volume
+comes up **empty** because the node plugin's `mount`/`mkfs` never reached the
+host. `nsenter` mode does not exhibit this.
+
+**Root cause:** `chroot /host <tool>` changes only **path resolution**, not the
+**mount namespace**. So any mount the tool creates (`zfs create`/`zfs clone`
+auto-mount; `mount -t nfs`; `mkfs`+`mount`; bind mounts) is born **inside the
+pod's** mount namespace, materialising under the `/host` bind at
+`/host/<mountpoint>`. If that `host-root` volume is `HostToContainer` (rslave),
+a mount **created** in the slave subtree does **not** propagate up to the host
+peer group (slaves receive, never send). The host — and therefore every other
+pod (NFS server, kubelet) whose view is also a slave of the host — never sees
+it. The mount is trapped in the creating pod and dies with it.
+
+**Guard:** any component that **creates** mounts *and* uses `hostExec.mode:
+chroot` must mount `host-root` **`Bidirectional`** (rshared) so new mounts flow
+out to the host peer group; downstream receivers stay `HostToContainer`. Current
+placement:
+
+- **Bidirectional `host-root`** (mount *creators*): the ZfsDataset/ZfsSnapshot
+  reconcilers in the discovery DaemonSet
+  ([discovery-daemonset.yaml](../charts/simple-zfs-csi/templates/discovery-daemonset.yaml)),
+  the node plugin
+  ([csi-node-daemonset.yaml](../charts/simple-zfs-csi/templates/csi-node-daemonset.yaml)),
+  and the maintenance toolbox
+  ([toolbox.yaml](../charts/simple-zfs-csi/templates/toolbox.yaml)).
+- **HostToContainer `host-root`** (run host tools but create **no** mounts):
+  the scrub CronJob
+  ([scrub-configmap.yaml](../charts/simple-zfs-csi/templates/scrub-configmap.yaml))
+  runs only `zpool scrub`. The nvmeof controller manipulates configfs and the
+  nfs controller only *receives* the pool mount — neither creates a VFS mount
+  that must escape, so both stay receive-only.
+- **HostToContainer** for pure browse/receive volumes even on creators: the
+  toolbox `datasetMountRoot` and the nfs `pool` mount only ever *receive* the
+  round-tripped mount; never make these `Bidirectional`.
+
+**Two escape hatches, both avoid the trap:**
+
+- `hostExec.mode: nsenter` — the tool enters the **host's** mount namespace, so
+  the mount is created on the host directly and needs no `/host` volume and no
+  Bidirectional plumbing. Recommended on Talos (where binding host `/` for
+  chroot is awkward anyway).
+- On plain hosts, chroot + Bidirectional works **only if the host path is
+  `rshared`**. A `Bidirectional` mount of a non-shared host path fails pod
+  startup (fail-loud, which is better than the silent data bug above). On Talos
+  the pool path is made shared via the kubelet `extraMounts` (`rshared`); see
+  [design-decisions.md](design-decisions.md) and the propagation notes in
+  `THOUGHTS.md`.
+
+**Rule of thumb for new components:** *creates mounts + chroot ⇒ Bidirectional
+host-root; otherwise HostToContainer.* When in doubt, prefer `nsenter`.
+
+**Guarded by:** the *"toolbox does not see zfs dataset mounts"* fix (extended
+to the discovery and csi-node mount-creation paths).
+
+---
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing
