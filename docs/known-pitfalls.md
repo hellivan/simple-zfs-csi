@@ -449,6 +449,54 @@ above. See [design-decisions.md](design-decisions.md) ADR-0016.
 
 ---
 
+## 16. Node shutdown/reboot can hang on unmount when the NFS/NVMe-oF server dies first (no guard yet — open risk)
+
+**Status:** identified 2026-07-24, **not yet fixed**. No code guard exists for
+this class; it is documented here so the risk is tracked even though the
+`Guarded by:` slot below is empty.
+
+**Symptom:** a `talos reboot`/shutdown (or plain `kubectl drain`) of a storage
+node takes a very long time to complete, sometimes appearing to hang
+indefinitely, when that node hosts both a pool's NFS/NVMe-oF server DaemonSet
+pod *and* a CSI-node-mounted consumer of that same export.
+
+**Root cause:** the NFS and NVMe-oF target DaemonSets are `hostNetwork` and
+node-pinned to the pool's owner node (`pool.Status.currentNode`) — see
+[nfs-daemonset.yaml](../charts/simple-zfs-csi/templates/nfs-daemonset.yaml) and
+[nvmeof-daemonset.yaml](../charts/simple-zfs-csi/templates/nvmeof-daemonset.yaml)
+— while the CSI node plugin that mounts those exports runs on **every** node
+([csi-node-daemonset.yaml](../charts/simple-zfs-csi/templates/csi-node-daemonset.yaml)).
+On a single-node cluster, or whenever a workload happens to land on the node
+that also owns the pool, the NFS/NVMe-oF server and its own client are
+co-located. If the server pod is torn down (or the whole node goes offline)
+before the client unmounts, the client is in the same position as any NFS
+client whose server vanished: `NodeUnpublishVolume`'s `unmount()` shells out to
+a plain `umount <target>` with **no `-f`/`-l`, no timeout, and
+`context.Background()`** — see `unmount` in
+[internal/csi/mount.go](../internal/csi/mount.go). A hard NFS mount to a
+now-unreachable server blocks in `umount` (and often in any process with an
+open fd on it) indefinitely, which in turn blocks kubelet's volume teardown and
+therefore pod/node termination. NVMe-oF's disconnect-by-NQN step in
+`NodeUnpublishVolume` ([internal/csi/node.go](../internal/csi/node.go)) runs
+*after* this same blocking `umount` call, so it does not help once the umount
+itself is stuck.
+
+**Why it's not just a multi-node problem:** there is no ordering guarantee
+between the NFS/NVMe-oF server DaemonSets and the CSI node plugin today — no
+`priorityClassName`, no `preStop` hook, no `PodDisruptionBudget`, no
+terminationGracePeriod tuning in any of the chart templates. Kubernetes gives
+no cross-DaemonSet shutdown ordering by default, so "server disappears first"
+is not an edge case to defend against, it's the coin-flip default on a
+single-node (or storage+compute-colocated) deployment.
+
+**Guarded by:** nothing yet — open risk. Candidate fixes (soft/`timeo` NFS
+mount options, bounded-timeout unmount with lazy fallback in
+[internal/csi/mount.go](../internal/csi/mount.go), chart-level
+`priorityClassName`/`preStop` ordering) are being evaluated; update this entry
+with the `Guarded by:` fix once one lands.
+
+---
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing
