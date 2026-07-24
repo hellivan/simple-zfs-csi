@@ -9,6 +9,7 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -33,14 +34,16 @@ func init() {
 
 func main() {
 	var (
-		endpoint      string
-		driverName    string
-		nodeName      string
-		nvmeTransport string
-		nvmePort      string
-		hostExecMode  string
-		hostRoot      string
-		nsenterPID    int
+		endpoint         string
+		driverName       string
+		nodeName         string
+		nvmeTransport    string
+		nvmePort         string
+		hostExecMode     string
+		hostRoot         string
+		nsenterPID       int
+		unmountTimeout   time.Duration
+		unmountForceLazy bool
 	)
 	flag.StringVar(&endpoint, "endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint the plugin listens on.")
 	flag.StringVar(&driverName, "driver-name", "simple-zfs-csi.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
@@ -50,6 +53,8 @@ func main() {
 	flag.StringVar(&hostExecMode, "host-exec-mode", "", "How to run mount/nvme binaries: \"chroot\" (enter the host root at --host-root), \"nsenter\" (enter --nsenter-target-pid namespaces), or empty to run the in-image tools directly.")
 	flag.StringVar(&hostRoot, "host-root", "/host", "Container-visible mount of the host root filesystem (chroot mode).")
 	flag.IntVar(&nsenterPID, "nsenter-target-pid", 1, "Host PID whose namespaces are entered (nsenter mode).")
+	flag.DurationVar(&unmountTimeout, "unmount-timeout", 90*time.Second, "How long Unmount waits for a plain umount before giving up (or falling back, with --unmount-force-lazy-fallback). See docs/known-pitfalls.md class 16.")
+	flag.BoolVar(&unmountForceLazy, "unmount-force-lazy-fallback", false, "After a plain umount fails or times out, force a lazy unmount (umount -f -l) so NodeUnpublishVolume can't be blocked indefinitely by a dead NFS/NVMe-oF server. Opt-in: can detach a mount before outstanding I/O has drained. See docs/known-pitfalls.md class 16.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -72,7 +77,10 @@ func main() {
 
 	hostExec := zpool.HostExec{Mode: hostExecMode, HostRoot: hostRoot, TargetPID: nsenterPID}
 	// Log the fully resolved mount/nvme host commands at debug (--zap-log-level=debug).
-	mounter := zfscsi.NewHostMounter(hostExec.BuildRunner(zpool.LoggingRunner(nil, ctrl.Log.WithName("hostcmd"))))
+	mounter := zfscsi.NewHostMounter(
+		hostExec.BuildRunner(zpool.LoggingRunner(nil, ctrl.Log.WithName("hostcmd"))),
+		zfscsi.HostMounterOptions{UnmountTimeout: unmountTimeout, ForceLazyUnmount: unmountForceLazy},
+	)
 
 	ids := &zfscsi.IdentityServer{DriverName: driverName, Version: version}
 	ns := &zfscsi.NodeServer{

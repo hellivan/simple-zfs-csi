@@ -1,9 +1,14 @@
 package csi
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // nqn used across the parsing cases.
@@ -157,4 +162,124 @@ func TestParseNVMeListDevice(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHostMounterUnmount covers docs/known-pitfalls.md class 16: Unmount must
+// never block indefinitely on a hard NFS/NVMe-oF mount to a vanished server, so
+// it bounds the plain `umount` with a timeout and falls back to a lazy
+// force-unmount (`umount -f -l`) rather than waiting on a call that may be
+// stuck in uninterruptible (D-state) sleep.
+func TestHostMounterUnmount(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		var calls []string
+		m := &hostMounter{
+			unmountTimeout: 50 * time.Millisecond,
+			run: func(ctx context.Context, name string, args ...string) (string, error) {
+				calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+				return "", nil
+			},
+		}
+		if err := m.Unmount("/mnt/x"); err != nil {
+			t.Fatalf("Unmount() = %v, want nil", err)
+		}
+		if want := []string{"umount /mnt/x"}; len(calls) != 1 || calls[0] != want[0] {
+			t.Errorf("calls = %v, want %v", calls, want)
+		}
+	})
+
+	t.Run("already unmounted", func(t *testing.T) {
+		m := &hostMounter{
+			unmountTimeout: 50 * time.Millisecond,
+			run: func(ctx context.Context, name string, args ...string) (string, error) {
+				return "", errors.New("umount: /mnt/x: not mounted.")
+			},
+		}
+		if err := m.Unmount("/mnt/x"); err != nil {
+			t.Fatalf("Unmount() = %v, want nil", err)
+		}
+	})
+
+	t.Run("plain umount fails, lazy fallback succeeds", func(t *testing.T) {
+		var mu sync.Mutex
+		var calls []string
+		m := &hostMounter{
+			unmountTimeout:   50 * time.Millisecond,
+			forceLazyUnmount: true,
+			run: func(ctx context.Context, name string, args ...string) (string, error) {
+				mu.Lock()
+				calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+				mu.Unlock()
+				if len(args) == 1 {
+					// plain `umount <target>`
+					return "", errors.New("umount: /mnt/x: target is busy.")
+				}
+				return "", nil
+			},
+		}
+		if err := m.Unmount("/mnt/x"); err != nil {
+			t.Fatalf("Unmount() = %v, want nil", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		want := []string{"umount /mnt/x", "umount -f -l /mnt/x"}
+		if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+			t.Errorf("calls = %v, want %v", calls, want)
+		}
+	})
+
+	t.Run("plain umount fails, lazy fallback disabled by default returns the error", func(t *testing.T) {
+		var mu sync.Mutex
+		var calls []string
+		m := &hostMounter{
+			unmountTimeout: 50 * time.Millisecond,
+			run: func(ctx context.Context, name string, args ...string) (string, error) {
+				mu.Lock()
+				calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+				mu.Unlock()
+				return "", errors.New("umount: /mnt/x: target is busy.")
+			},
+		}
+		if err := m.Unmount("/mnt/x"); err == nil {
+			t.Fatal("Unmount() = nil, want an error (ForceLazyUnmount defaults to false)")
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if want := []string{"umount /mnt/x"}; len(calls) != 1 || calls[0] != want[0] {
+			t.Errorf("calls = %v, want %v (no lazy fallback)", calls, want)
+		}
+	})
+
+	t.Run("plain umount hangs past timeout, lazy fallback unblocks", func(t *testing.T) {
+		var mu sync.Mutex
+		var calls []string
+		m := &hostMounter{
+			unmountTimeout:   20 * time.Millisecond,
+			forceLazyUnmount: true,
+			run: func(ctx context.Context, name string, args ...string) (string, error) {
+				mu.Lock()
+				calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+				mu.Unlock()
+				if len(args) == 1 {
+					// Simulate a hard NFS mount stuck in uninterruptible sleep:
+					// this deliberately never returns, even after ctx is done, so
+					// Unmount must not wait on it.
+					select {}
+				}
+				return "", nil
+			},
+		}
+		start := time.Now()
+		if err := m.Unmount("/mnt/x"); err != nil {
+			t.Fatalf("Unmount() = %v, want nil", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("Unmount() took %s, want bounded by unmountTimeout", elapsed)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		want := []string{"umount /mnt/x", "umount -f -l /mnt/x"}
+		if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+			t.Errorf("calls = %v, want %v", calls, want)
+		}
+	})
 }

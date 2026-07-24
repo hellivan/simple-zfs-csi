@@ -449,12 +449,11 @@ above. See [design-decisions.md](design-decisions.md) ADR-0016.
 
 ---
 
-## 16. Node shutdown/reboot can hang on unmount when the NFS/NVMe-oF server dies first (partially mitigated)
+## 16. Node shutdown/reboot can hang on unmount when the NFS/NVMe-oF server dies first (fixed)
 
-**Status:** identified 2026-07-24; a partial mitigation (`priorityClassName`)
-landed 2026-07-24. The core race (no shutdown-ordering guarantee between the
-server and its client) is **still open** — see `Guarded by:` below for exactly
-what is and isn't covered.
+**Status:** identified 2026-07-24; `priorityClassName` mitigation landed the
+same day (eviction/OOM hardening only); the actual blocking-`umount` race is
+**fixed** as of the bounded-timeout + lazy-fallback `Unmount` below.
 
 **Symptom:** a `talos reboot`/shutdown (or plain `kubectl drain`) of a storage
 node takes a very long time to complete, sometimes appearing to hang
@@ -506,14 +505,61 @@ drain` schedule their eviction relative to lower-priority pods more
 predictably. **What it does not fix:** it has no effect on a voluntary
 `talos reboot`/shutdown's SIGTERM ordering across DaemonSets — kubelet still
 has no built-in "stop server after client" (or reverse) sequencing on plain
-pod termination, so the underlying blocking-`umount` race (no timeout, no
-`-f`/`-l`, `context.Background()` in `unmount`,
-[internal/csi/mount.go](../internal/csi/mount.go)) is unchanged. Treat this as
-raising the odds the server pod survives incidental node pressure long enough
-for clients to unmount cleanly, not as a fix for the ordering race itself.
-Candidate fixes for the remaining gap (soft/`timeo` NFS mount options,
-bounded-timeout unmount with lazy fallback in
-[internal/csi/mount.go](../internal/csi/mount.go)) are still being evaluated.
+pod termination. Note this is **not** a gap that Kubernetes' own
+priority-aware shutdown sequencing (`GracefulNodeShutdownBasedOnPodPriority` /
+`shutdownGracePeriodByPodPriority`) can close either: that kubelet feature
+"depends on systemd since it takes advantage of systemd inhibitor locks to
+delay the node shutdown" (upstream docs), and Talos runs no systemd/logind at
+all (see the "detach rpc.mountd" rejected option below) — so kubelet on Talos
+has no mechanism to detect the shutdown and sequence pod termination by
+priority in the first place. `priorityClassName` here is strictly an
+eviction/OOM safeguard, not a shutdown-ordering fix.
+
+**Guarded by (the actual fix):** `Unmount` in
+[internal/csi/mount.go](../internal/csi/mount.go) no longer waits
+unboundedly on `umount`. It races the plain `umount` against a configurable
+timeout (`HostMounterOptions.UnmountTimeout`, default 90s — matching
+systemd's own `DefaultTimeoutStopSec`, the same order of magnitude operators
+already expect a stop to be given before it's considered stuck; chart knob:
+`csiNode.unmount.timeout` → `--unmount-timeout` in
+[csi-node-daemonset.yaml](../charts/simple-zfs-csi/templates/csi-node-daemonset.yaml))
+using a goroutine + `select` — not a bare `context.WithTimeout` on the child
+process, because a hard NFS mount to a dead server blocks `umount` in
+uninterruptible (D-state) sleep, and **not even SIGKILL can interrupt
+D-state**, so relying on `exec.CommandContext`'s kill-on-cancel alone would
+still hang the calling goroutine forever waiting on `Wait()`. Racing the
+result on a channel instead means `Unmount` stops waiting once the timeout
+fires, regardless of whether the abandoned goroutine's `umount` process ever
+actually exits.
+
+Once the plain call fails or times out, `Unmount` **optionally** falls back to
+`umount -f -l` (force + lazy/`MNT_DETACH`), which detaches the mount point
+from the namespace immediately without waiting for outstanding I/O to the dead
+server to drain, so this call itself does not hang. This fallback is **opt-in**
+(`HostMounterOptions.ForceLazyUnmount`, default `false`; chart knob:
+`csiNode.unmount.forceLazyFallback` → `--unmount-force-lazy-fallback`) rather
+than always-on: `MNT_DETACH` can detach the mount before outstanding writes
+have necessarily finished draining to the target, which is a real (if narrow)
+data-safety tradeoff operators should choose deliberately rather than get
+silently by default. With the fallback left disabled, `Unmount` still never
+blocks forever — it just returns the timeout/error to the caller (which
+kubelet retries with backoff) instead of forcing the detach. With it enabled,
+`NodeUnpublishVolume` (and therefore kubelet's pod/volume teardown) unblocks
+within the bounded timeout even when the server is gone for good. See
+`TestHostMounterUnmount` in
+[internal/csi/mount_test.go](../internal/csi/mount_test.go) for the covered
+cases (success, already-unmounted, busy→lazy-fallback, hung→lazy-fallback,
+and the disabled-fallback default returning the plain error).
+**Residual/accepted tradeoffs:** the abandoned goroutine holding the stuck
+`umount` process leaks until its I/O eventually unblocks (harmless on an actual
+reboot, since the whole kernel goes away with it); a lazy-detached mount can
+still leave dirty data undelivered to a genuinely dead server, which matches
+the "accept a monitorable, bounded teardown over an eliminated one" position
+already adopted for the NFS-specific risks below. NVMe-oF's disconnect-by-NQN
+step in `NodeUnpublishVolume`
+([internal/csi/node.go](../internal/csi/node.go)) still runs after `Unmount`,
+so it now benefits from the same bound instead of being blocked behind an
+unbounded call.
 
 ### NVMe-oF vs NFS: why the risk is asymmetric
 

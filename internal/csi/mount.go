@@ -77,12 +77,55 @@ type hostMounter struct {
 	// Runner shape from the zpool package so the node plugin can invoke the
 	// host's nvme/mount binaries.
 	run func(ctx context.Context, name string, args ...string) (string, error)
+	// unmountTimeout bounds how long Unmount waits for a plain `umount` before
+	// giving up (or falling back, if forceLazyUnmount is set). Defaults to
+	// defaultUnmountTimeout; overridable in tests.
+	unmountTimeout time.Duration
+	// forceLazyUnmount, when true, falls back to `umount -f -l` (force +
+	// lazy/MNT_DETACH) after a plain umount fails or times out. Opt-in: see
+	// HostMounterOptions.ForceLazyUnmount.
+	forceLazyUnmount bool
+}
+
+// defaultUnmountTimeout is the production default for
+// HostMounterOptions.UnmountTimeout. It matches systemd's own
+// `DefaultTimeoutStopSec` (90s) — the same order of magnitude operators
+// already expect a service/unit to be given before a stop is considered stuck.
+// See docs/known-pitfalls.md class 16: a hard NFS mount to a vanished server
+// can block `umount` in uninterruptible (D-state) sleep, which this bound
+// works around by not waiting on the stuck call rather than by killing it
+// (SIGKILL cannot interrupt D-state).
+const defaultUnmountTimeout = 90 * time.Second
+
+// HostMounterOptions configures optional hostMounter behavior beyond the
+// required command runner. The zero value is safe: it uses
+// defaultUnmountTimeout and leaves the lazy-fallback behavior disabled.
+type HostMounterOptions struct {
+	// UnmountTimeout bounds how long Unmount waits for a plain `umount` before
+	// giving up (or falling back, if ForceLazyUnmount is set). Zero uses
+	// defaultUnmountTimeout. See docs/known-pitfalls.md class 16.
+	UnmountTimeout time.Duration
+	// ForceLazyUnmount, when true, makes Unmount fall back to `umount -f -l`
+	// (force + lazy/MNT_DETACH) after a plain umount fails or times out, so
+	// NodeUnpublishVolume can no longer be blocked indefinitely by a dead
+	// NFS/NVMe-oF server. This is opt-in (default false) rather than always-on
+	// because MNT_DETACH detaches the mount point before outstanding I/O to the
+	// target has necessarily finished draining, which is a real (if narrow)
+	// data-safety tradeoff operators should choose explicitly. Without it,
+	// Unmount still never blocks forever — it just returns the timeout/error to
+	// the caller instead of forcing the detach. See docs/known-pitfalls.md
+	// class 16.
+	ForceLazyUnmount bool
 }
 
 // NewHostMounter returns a NodeMounter backed by run (a host-exec-aware command
 // runner). run must not be nil.
-func NewHostMounter(run func(ctx context.Context, name string, args ...string) (string, error)) NodeMounter {
-	return &hostMounter{run: run}
+func NewHostMounter(run func(ctx context.Context, name string, args ...string) (string, error), opts HostMounterOptions) NodeMounter {
+	timeout := opts.UnmountTimeout
+	if timeout <= 0 {
+		timeout = defaultUnmountTimeout
+	}
+	return &hostMounter{run: run, unmountTimeout: timeout, forceLazyUnmount: opts.ForceLazyUnmount}
 }
 
 func (m *hostMounter) IsMountPoint(path string) (bool, error) {
@@ -181,11 +224,54 @@ func (m *hostMounter) BindMountDevice(device, target string, readOnly bool) erro
 }
 
 func (m *hostMounter) Unmount(target string) error {
-	_, err := m.run(context.Background(), "umount", target)
-	if err != nil && strings.Contains(err.Error(), "not mounted") {
+	timeout := m.unmountTimeout
+	if timeout <= 0 {
+		timeout = defaultUnmountTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Run the plain umount in a goroutine rather than waiting on it directly:
+	// if the target is a hard NFS mount to a server that has vanished, the
+	// call can block in uninterruptible (D-state) sleep, where not even
+	// SIGKILL (which ctx's cancellation would send via exec.CommandContext)
+	// can unblock it. Racing the result against ctx.Done() bounds *our* wait
+	// without depending on the child process ever actually dying.
+	result := make(chan error, 1)
+	go func() {
+		_, err := m.run(ctx, "umount", target)
+		result <- err
+	}()
+
+	var err error
+	select {
+	case err = <-result:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+
+	if err == nil {
 		return nil
 	}
-	return err
+	if strings.Contains(err.Error(), "not mounted") {
+		return nil
+	}
+	if !m.forceLazyUnmount {
+		return err
+	}
+
+	// Plain umount failed, or did not return within timeout, and the lazy
+	// fallback is enabled. Fall back to a lazy force-unmount: MNT_DETACH
+	// (`-l`) detaches the mount point from the namespace immediately, without
+	// waiting for outstanding I/O to a dead server to drain, so this call
+	// succeeds even when the plain umount above is permanently stuck. `-f`
+	// additionally forces an NFS unmount that would otherwise be rejected as
+	// unreachable. See docs/known-pitfalls.md class 16.
+	_, lazyErr := m.run(context.Background(), "umount", "-f", "-l", target)
+	if lazyErr != nil && strings.Contains(lazyErr.Error(), "not mounted") {
+		return nil
+	}
+	return lazyErr
 }
 
 // nvmeConnectTimeout / nvmeDevicePoll bound the wait for the namespace block

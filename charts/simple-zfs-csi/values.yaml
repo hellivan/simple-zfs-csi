@@ -356,6 +356,25 @@ csiNode:
   # -- and initiator ports cannot drift. Set only to target a different port
   # -- (e.g. a load balancer in front of the storage nodes).
   nvmePort: ""
+  # Bound how NodeUnpublishVolume's unmount behaves against a hard NFS/NVMe-oF
+  # mount whose server has vanished (e.g. node reboot with the server and its
+  # own client co-located). See docs/known-pitfalls.md class 16.
+  unmount:
+    # -- How long a single unmount waits for a plain `umount` to return before
+    # -- giving up (or falling back, see forceLazyFallback below) instead of
+    # -- blocking forever. 90s matches systemd's own default service-stop
+    # -- timeout (`DefaultTimeoutStopSec`).
+    timeout: 90s
+    # -- After a plain umount fails or times out, force a lazy unmount
+    # -- (`umount -f -l` / MNT_DETACH) so NodeUnpublishVolume can no longer be
+    # -- blocked indefinitely by a dead NFS/NVMe-oF server. Opt-in (disabled by
+    # -- default): MNT_DETACH detaches the mount point before outstanding I/O to
+    # -- the target has necessarily finished draining, which is a real (if
+    # -- narrow) data-safety tradeoff you should opt into deliberately. With
+    # -- this left false, unmount still never blocks forever — it just returns
+    # -- an error to the caller (which kubelet retries) instead of forcing the
+    # -- detach.
+    forceLazyFallback: false
   # Run mount.nfs / nvme against the host's binaries instead of the in-image
   # tools. The node image bundles nfs-common + nvme-cli, so this is off by
   # default; enable on hosts (e.g. Talos) where mounts must run in the host
