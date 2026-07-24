@@ -150,6 +150,15 @@ discovery:
     # -- How to reach the host binaries: "chroot" (Talos-documented, bind-mounts
     # the host root at /host) or "nsenter" (enters the host mount namespace of
     # targetPid; requires hostPID).
+    # -- CAVEAT (chroot): this agent runs `zfs create`/`clone`, which AUTO-MOUNT
+    # the new dataset. In chroot mode that mount is born inside the pod under
+    # /host, so the /host volume is mounted Bidirectional to propagate it out to
+    # the host and the NFS DaemonSet (see docs/known-pitfalls.md class 15). A
+    # Bidirectional mount REQUIRES the host `/` to be a SHARED mount, or the pod
+    # fails to start — verify with `findmnt -o TARGET,PROPAGATION /` (want
+    # "shared"). If `/` is not shared, use mode: nsenter, which creates the
+    # mount directly in the host namespace and needs no /host volume or shared
+    # root. nsenter is the recommended choice on Talos.
     mode: chroot
     # -- Host PID whose namespaces are entered in nsenter mode.
     targetPid: 1
@@ -335,6 +344,13 @@ csiNode:
     # -- Enable running the host's mount/nvme binaries via chroot/nsenter.
     enabled: false
     # -- "chroot" (bind-mount host root at /host) or "nsenter" (enter targetPid namespaces).
+    # -- CAVEAT (chroot): when enabled, the node mounter runs `mount`/`mkfs` via
+    # `chroot /host`, so the volume mount is created inside the pod under /host
+    # and its /host volume is mounted Bidirectional to reach the host/kubelet
+    # (see docs/known-pitfalls.md class 15). Bidirectional REQUIRES host `/` to
+    # be a SHARED mount (`findmnt -o TARGET,PROPAGATION /` → "shared") or the pod
+    # fails to start. Prefer mode: nsenter (no /host volume, no shared-root
+    # requirement) on Talos.
     mode: chroot
     # -- Host PID whose namespaces are entered in nsenter mode.
     targetPid: 1
