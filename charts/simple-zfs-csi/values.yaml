@@ -375,6 +375,21 @@ csiNode:
     # -- an error to the caller (which kubelet retries) instead of forcing the
     # -- detach.
     forceLazyFallback: false
+  # -- terminationGracePeriodSeconds for the csi-node pod. Empty (default)
+  # -- leaves Kubernetes' own 30s pod default in place UNLESS
+  # -- `unmount.forceLazyFallback` is enabled, in which case the chart
+  # -- defaults this to 120s automatically — comfortably above
+  # -- `unmount.timeout`'s 90s default, so kubelet's SIGKILL doesn't cut off
+  # -- the lazy-fallback unmount before it can actually complete. With
+  # -- `forceLazyFallback` disabled, extending this buys little: `Unmount`
+  # -- never blocks forever either way, and whether it fails via kubelet's
+  # -- SIGKILL (connection reset) at 30s or via its own bounded timeout at
+  # -- 90s, the outcome is the same failed unmount — only `forceLazyFallback`
+  # -- turns "more time" into "an unmount that actually succeeds". Set this
+  # -- explicitly to override either default. If you raise `unmount.timeout`
+  # -- with `forceLazyFallback` enabled, raise this to match. See
+  # -- docs/known-pitfalls.md class 16.
+  terminationGracePeriodSeconds: ""
   # Run mount.nfs / nvme against the host's binaries instead of the in-image
   # tools. The node image bundles nfs-common + nvme-cli, so this is off by
   # default; enable on hosts (e.g. Talos) where mounts must run in the host

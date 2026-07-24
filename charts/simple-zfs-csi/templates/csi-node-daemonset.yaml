@@ -1,6 +1,10 @@
 {{- if .Values.csiNode.enabled }}
 {{- $kubeletDir := trimSuffix "/" .Values.csiNode.kubeletDir }}
 {{- $pluginDir := printf "%s/plugins/%s" $kubeletDir .Values.driverName }}
+{{- $tgps := .Values.csiNode.terminationGracePeriodSeconds }}
+{{- if and (not $tgps) .Values.csiNode.unmount.forceLazyFallback }}
+{{- $tgps = 120 }}
+{{- end }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -28,6 +32,13 @@ spec:
       serviceAccountName: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "csi-node") }}
       {{- with (include "simple-zfs-csi.priorityClassName" (dict "root" . "component" "csiNode")) }}
       priorityClassName: {{ . }}
+      {{- end }}
+      {{- with $tgps }}
+      # Must stay comfortably above csiNode.unmount.timeout: if kubelet SIGKILLs
+      # this pod's container before Unmount's bounded wait/lazy-fallback
+      # completes, the fix in docs/known-pitfalls.md class 16 can't run to
+      # completion for volumes local to this same node.
+      terminationGracePeriodSeconds: {{ . }}
       {{- end }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

@@ -449,11 +449,46 @@ above. See [design-decisions.md](design-decisions.md) ADR-0016.
 
 ---
 
-## 16. Node shutdown/reboot can hang on unmount when the NFS/NVMe-oF server dies first (fixed)
+## 16. Node shutdown/reboot can hang on unmount when the NFS/NVMe-oF server dies first (fixed — Talos's Graceful Node Shutdown + `system-node-critical` gives real ordering; tune grace periods)
+
+**TL;DR — three independent layers, keep all three; none is a substitute for
+the others:**
+
+1. **`priorityClassName: system-node-critical`** (nfs/nvmeof/csi-node) —
+   solves *"is `csi-node` even still alive/ordered to answer the unmount
+   call?"* via Talos's Graceful Node Shutdown. Does **not** make a hung
+   `umount` return — it only guarantees who's present to attempt it.
+2. **`Unmount`'s bounded timeout + optional lazy fallback**
+   ([internal/csi/mount.go](../internal/csi/mount.go)) — solves *"does the
+   `umount` syscall itself return, or hang forever in D-state against a dead
+   server?"* This is a kernel/NFS-client property, completely orthogonal to
+   which pod is alive or in what order; `priorityClassName` has no effect on
+   it at all.
+3. **`csiNode.terminationGracePeriodSeconds` (chart) /
+   `shutdownGracePeriod`+`shutdownGracePeriodCriticalPods` (Talos machine
+   config)** — give (2) enough budget to actually finish, but **only matters
+   when `unmount.forceLazyFallback` is enabled**. Without it, `Unmount` never
+   blocks forever either way, and whether it fails via kubelet's SIGKILL
+   (connection reset) at the default 30s or via its own bounded timeout at
+   90s, the outcome is the same failed unmount — extra grace period doesn't
+   change that. With `forceLazyFallback` on, more time changes the outcome
+   (an unmount that actually completes), so the chart auto-raises
+   `terminationGracePeriodSeconds` to 120s in that case (empty/unset
+   otherwise, leaving Kubernetes' 30s default). During a real node shutdown,
+   Talos/kubelet's own `shutdownGracePeriodCriticalPods` supersedes the
+   pod-level setting for that event, but the chart setting still governs
+   every *other* teardown path this class covers (`kubectl drain`, rolling
+   updates, manual pod deletion) — keep both tuned together when
+   `forceLazyFallback` is on.
 
 **Status:** identified 2026-07-24; `priorityClassName` mitigation landed the
-same day (eviction/OOM hardening only); the actual blocking-`umount` race is
-**fixed** as of the bounded-timeout + lazy-fallback `Unmount` below.
+same day; the blocking-`umount` race is fixed for `kubectl drain`, cross-node
+mounts, **and** (corrected 2026-07-24, see the callout below) a bare,
+undrained `talos reboot` — Talos implements kubelet's `GracefulNodeShutdown`
+feature and `system-node-critical` is exactly the classification that feature
+uses to defer these pods until after workload pods and their volumes are torn
+down. The remaining actionable gap is **grace-period tuning**, not "no
+mechanism at all" — see the guard below.
 
 **Symptom:** a `talos reboot`/shutdown (or plain `kubectl drain`) of a storage
 node takes a very long time to complete, sometimes appearing to hang
@@ -502,18 +537,13 @@ and
 pressure** (they are never picked as eviction candidates ahead of ordinary
 pods) and from the **OOM killer's** score adjustment, and it makes a `kubectl
 drain` schedule their eviction relative to lower-priority pods more
-predictably. **What it does not fix:** it has no effect on a voluntary
-`talos reboot`/shutdown's SIGTERM ordering across DaemonSets — kubelet still
-has no built-in "stop server after client" (or reverse) sequencing on plain
-pod termination. Note this is **not** a gap that Kubernetes' own
-priority-aware shutdown sequencing (`GracefulNodeShutdownBasedOnPodPriority` /
-`shutdownGracePeriodByPodPriority`) can close either: that kubelet feature
-"depends on systemd since it takes advantage of systemd inhibitor locks to
-delay the node shutdown" (upstream docs), and Talos runs no systemd/logind at
-all (see the "detach rpc.mountd" rejected option below) — so kubelet on Talos
-has no mechanism to detect the shutdown and sequence pod termination by
-priority in the first place. `priorityClassName` here is strictly an
-eviction/OOM safeguard, not a shutdown-ordering fix.
+predictably. **Correction (2026-07-24):** earlier revisions of this class
+additionally claimed `priorityClassName` has no effect on `talos reboot`
+ordering because Talos lacks systemd/logind for kubelet's
+`GracefulNodeShutdown` to hook into. That claim was **wrong** — see the
+dedicated callout further down for the corrected mechanism and sources.
+`system-node-critical` turns out to be the actual shutdown-ordering guard for
+this class on Talos, not merely an eviction/OOM safeguard.
 
 **Guarded by (the actual fix):** `Unmount` in
 [internal/csi/mount.go](../internal/csi/mount.go) no longer waits
@@ -560,6 +590,79 @@ step in `NodeUnpublishVolume`
 ([internal/csi/node.go](../internal/csi/node.go)) still runs after `Unmount`,
 so it now benefits from the same bound instead of being blocked behind an
 unbounded call.
+
+**Correction (2026-07-24, prompted by external issue review): Talos DOES
+support kubelet's Graceful Node Shutdown, and `system-node-critical` is the
+mechanism that gives real ordering here — not just an eviction/OOM
+safeguard.** Earlier drafts of this class asserted that Talos has no
+systemd/logind and therefore no way for kubelet to detect an imminent
+shutdown, so `csi-node` (a DaemonSet pod, not kubelet infrastructure) was torn
+down with no ordering guarantee relative to the workload pod whose volume
+it's unmounting, and a bare undrained `talos reboot` gave no protection at
+all. **That was wrong.** Per a Talos maintainer: *"This is already supported
+in Talos, we implement a fake d-bus and inform kubelet"*
+([siderolabs/talos#9556](https://github.com/siderolabs/talos/issues/9556)) —
+Talos fakes just enough of the systemd-inhibitor-lock signal for kubelet's
+`GracefulNodeShutdown` feature to activate on shutdown, without needing real
+systemd.
+
+`GracefulNodeShutdown` runs in **two phases**: it terminates ordinary pods
+first, then — only once they (and their volumes) are torn down — terminates
+**critical pods**, defined specifically as pods carrying `priorityClassName:
+system-node-critical` or `system-cluster-critical`. A `piraeus-operator` user
+confirmed this directly against kubelet source: *"the kubelet has special
+logic for this and won't start terminating critical pods before all the
+volumes from normal pods have been unmounted. So this too is already handled
+for us"*
+([piraeusdatastore/piraeus-operator#860](https://github.com/piraeusdatastore/piraeus-operator/issues/860)).
+
+This lines up exactly with what this class already does: **nfs, nvmeof and
+csi-node default to `priorityClassName: system-node-critical`** (see the
+`priorityClassName` guard above). That means on a real, undrained `talos
+reboot`, kubelet's own shutdown manager — not any code in this driver —
+defers tearing down `csi-node` (and the NFS/NVMe-oF server pods) until
+**after** it has finished tearing down the workload pods and their volumes.
+The workload pod's `NodeUnpublishVolume` call therefore runs against a
+`csi-node` pod that is *guaranteed* still alive on Talos for a bare reboot
+too — not just for `kubectl drain`. **`priorityClassName:
+system-node-critical` is not merely an eviction/OOM safeguard — on Talos it
+is the actual mechanism providing the shutdown-ordering guarantee this whole
+class is about.**
+
+**What's still a real, actionable gap: the default grace-period budget is
+short — and only matters at all when `forceLazyFallback` is enabled.**
+`GracefulNodeShutdown` is bounded by two kubelet settings,
+`shutdownGracePeriod` (total budget) and `shutdownGracePeriodCriticalPods`
+(reserved for the critical-pod phase) — and a `piraeus-operator` user
+inspecting a real cluster found **Talos defaults these to 30s and 10s
+respectively**. That leaves only ~20s for the "ordinary pods + their volume
+unmounts" phase and ~10s for the critical-pod phase, both considerably
+shorter than this project's own defaults when `forceLazyFallback` is on
+(`csiNode.unmount.timeout` 90s, `csiNode.terminationGracePeriodSeconds`
+auto-raised to 120s). If kubelet's own shutdown-manager budget is exhausted
+before `Unmount`'s bounded wait/fallback completes, kubelet may still force
+through — the same class of race already addressed for
+`terminationGracePeriodSeconds` vs. `unmount.timeout`, just one layer up, at
+the **Talos machine config** level instead of the pod spec level. With
+`forceLazyFallback` left at its default `false`, this doesn't matter: a
+short kubelet budget just means the (already-inevitable) failed unmount is
+reported a little sooner.
+
+**Guard (operational — Talos machine config, out of this Helm chart's
+control; only needed when `forceLazyFallback` is enabled):** explicitly raise
+`shutdownGracePeriod` and `shutdownGracePeriodCriticalPods` in the node's
+kubelet config (`machine.kubelet.extraConfig` in the Talos machine config) so
+the total budget comfortably exceeds `csiNode.unmount.timeout` plus a buffer
+for `RemovePath`/`NVMeDisconnect` — e.g. `shutdownGracePeriod: 150s`,
+`shutdownGracePeriodCriticalPods: 30s` to match this chart's 90s/120s
+`forceLazyFallback`-enabled defaults. **If you raise `csiNode.unmount.timeout`
+with `forceLazyFallback` enabled, raise both `terminationGracePeriodSeconds`
+(chart, auto-set to 120s only while `forceLazyFallback` is on — see the
+`unmount` values above) and `shutdownGracePeriod` /
+`shutdownGracePeriodCriticalPods` (Talos machine config) to match.**
+`kubectl drain` remains unaffected either way — DaemonSet pods are never
+evicted by drain, so `csi-node` is always available for the drain's own
+`NodeUnpublishVolume` calls, independent of any of the above.
 
 ### NVMe-oF vs NFS: why the risk is asymmetric
 
@@ -649,13 +752,28 @@ Considered and **rejected**: having the NFS server pod's `preStop` hook run
 clients get a fast error instead of a silent hang. This does not work because
 a `preStop` hook cannot distinguish "this node is going away for good" from
 "this pod is being recreated in a few seconds" (rolling update, crash-restart,
-routine chart upgrade) — both look identical from inside the hook, and
-Kubernetes exposes no reliable, version-independent signal for a pod to tell
-them apart. Since a big part of *why* `hard` NFS mounts exist is so a brief
-server restart is invisible to clients (they just block briefly and retry),
-forcibly unexporting on every routine restart would convert currently-harmless
-events into active disruptions (stale filehandles / connection resets for
-every mounted client) while only sometimes helping the one case it targets.
+routine chart upgrade) — both look identical from inside the hook.
+
+**Correction (2026-07-24):** this class previously claimed "Kubernetes exposes
+no reliable, version-independent signal for a pod to tell them apart." That
+overstated it — during an actual `GracefulNodeShutdown` (which, per the
+correction above, Talos does support), the Node object's `Ready` condition
+carries `message: node is shutting down`
+([docs](https://kubernetes.io/docs/concepts/cluster-administration/node-shutdown/)),
+and the `piraeus-operator` community used exactly this from a `preStop` hook
+to distinguish a real shutdown from a routine restart
+([piraeusdatastore/piraeus-operator#860](https://github.com/piraeusdatastore/piraeus-operator/issues/860)).
+The conclusion below still holds, but for a narrower reason: this project's
+class-16 fix (bounded `Unmount` + `system-node-critical` ordering) already
+solves the underlying problem architecturally and without needing this pod to
+poll its own Node object (extra RBAC, an extra dependency on API server
+reachability during shutdown, and a hook that only ever helps the narrower
+"this node's own NFS clients" case, not cross-node ones). Since a big part of
+*why* `hard` NFS mounts exist is so a brief server restart is invisible to
+clients (they just block briefly and retry), forcibly unexporting on every
+routine restart would convert currently-harmless events into active
+disruptions (stale filehandles / connection resets for every mounted client)
+while only sometimes helping the one case it targets.
 **Do not add this hook.** Prefer client-side bounded timeouts (NVMe-oF
 `--ctrl-loss-tmo`/`--reconnect-delay`, NFS `soft`/`timeo` if the write-safety
 tradeoff is accepted) instead — those bound the wait based on elapsed time, not
