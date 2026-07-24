@@ -495,6 +495,107 @@ mount options, bounded-timeout unmount with lazy fallback in
 `priorityClassName`/`preStop` ordering) are being evaluated; update this entry
 with the `Guarded by:` fix once one lands.
 
+### NVMe-oF vs NFS: why the risk is asymmetric
+
+**NVMe-oF is structurally safer here.** The target has no persistent userspace
+server process at all — [internal/nvmet/configfs.go](../internal/nvmet/configfs.go)
+is explicit: *"The controller is the sole manager of nvmet on its storage node:
+reconcile makes the on-disk configfs tree exactly match the desired set of
+subsystems."* The `nvmeof-controller` pod only writes directory entries under
+`/sys/kernel/config/nvmet` (host kernel configfs); the kernel's `nvmet` module
+does the actual serving. Restarting/recreating that pod (rolling update,
+crash, normal churn) does **not** tear the target down — the kernel keeps
+serving with whatever configfs state was last written, regardless of whether
+the reconciler pod is running. On a genuine same-node reboot, the target
+(kernel `nvmet`) and the initiator (kernel NVMe host driver used by `nvme
+connect` in [internal/csi/mount.go](../internal/csi/mount.go)) are **the same
+kernel image** — they disappear together, atomically, at kernel halt. There is
+no window where the target dies first while the initiator is still expecting
+service.
+
+**Verified — no shutdown-time teardown code exists for the NVMe-oF target.**
+[cmd/nvmeof-controller/main.go](../cmd/nvmeof-controller/main.go) runs
+`mgr.Start(ctrl.SetupSignalHandler())`; on SIGTERM this only stops the
+controller-runtime manager (reconcile loop, leader election) — nothing calls
+into [internal/nvmet](../internal/nvmet) to remove configfs subsystems/ports on
+exit. So for the same-node graceful-reboot/drain case: pod eviction triggers
+`NodeUnpublishVolume` (`umount` + `nvme disconnect`) against a target that is
+still fully alive, because nothing has touched its configfs state yet; the
+`nvmeof-controller` pod's own termination (whenever it happens, in whatever
+order relative to the consumer pod) has **no effect** on the target; the
+target only actually disappears at kernel halt, together with the initiator.
+**Conclusion: NVMe-oF is not a problem for the same-node graceful
+reboot/drain case** — this is a structural property (no teardown-on-exit code
+path), not just a timing coincidence. It remains a real risk only in the
+cross-node case or an ungraceful storage-node failure (crash/panic/network
+partition) — see `ctrl-loss-tmo`/`reconnect-delay` in the "another option"
+discussion above.
+
+**NFS is not simply "userspace and fragile," but it does have one real
+pod-lifecycle-bound weak point.** The `nfsd` kernel threads are exactly the
+same story as `nvmet`: [internal/nfsserver/server.go](../internal/nfsserver/server.go)
+starts them with `rpc.nfsd <N>`, and the code comments it directly — *"rpc.nfsd
+starts the threads and exits immediately; the threads keep running in the
+kernel."* Those threads, and the export table populated by `exportfs -ra`, are
+host kernel state, not tied to the pod's process tree, just like `nvmet`.
+
+The actual weak point is **`rpc.mountd`**, a real userspace daemon forked as a
+child of the NFS server pod's own container process. The code says why it
+matters: *"rpc.mountd services the kernel's export/auth upcalls (required for
+v4 too)."* When the pod is torn down (SIGTERM/SIGKILL, or the container
+runtime's cgroup-kill on stop), `rpc.mountd` dies with it, so new export/auth
+upcalls can start failing even though the low-level `nfsd` threads and export
+table are still alive in the kernel.
+
+**Verified — `rpc.mountd`/`rpcbind` are killed immediately on pod SIGTERM, not
+at kernel halt.** `startChild` in
+[internal/nfsserver/server.go](../internal/nfsserver/server.go) launches them
+with `exec.CommandContext(ctx, ...)`; when the manager's root context is
+cancelled (SIGTERM to the pod via `ctrl.SetupSignalHandler()` in
+[cmd/nfs-controller/main.go](../cmd/nfs-controller/main.go)), Go's `os/exec`
+kills that child process there and then — well before, and independent of, any
+eventual kernel halt. This is the concrete difference from NVMe-oF: NFS's
+required upcall helper is torn down as an immediate side effect of *its own
+pod's* termination, whereas NVMe-oF's target has no such process to kill.
+
+Two consequences follow from this, and neither is fully solved by the
+"everything dies together on reboot" argument:
+
+1. **Even on a single node**, there is no guaranteed *ordering* between "the
+   CSI-node plugin's `umount` for the local NFS mount" and "the NFS server
+   pod's container getting killed" during the pod-teardown phase that precedes
+   the actual kernel halt. A blocked, uninterruptible `umount` can get stuck in
+   D-state and hang the whole shutdown sequence well before any kernel-halt
+   atomicity would apply — the "same kernel, dies together" argument only
+   covers the literal moment of kernel halt, not the pod-teardown phase
+   leading up to it.
+2. **Cross-node NFS mounts remain fully exposed regardless of any of this**:
+   if the NFS server pod is on node A and the consumer pod mounting it is on
+   node B, node A's pod (or all of node A, if it reboots) can go away while
+   node B's client kernel is completely unaffected and still expects the
+   server to answer — the classic NFS-client-hangs-on-dead-server case, with
+   no atomicity argument to fall back on.
+
+### Rejected option: `preStop: exportfs -ua` on the NFS server DaemonSet
+
+Considered and **rejected**: having the NFS server pod's `preStop` hook run
+`exportfs -ua` (or similarly disconnect clients) before exiting, so in-flight
+clients get a fast error instead of a silent hang. This does not work because
+a `preStop` hook cannot distinguish "this node is going away for good" from
+"this pod is being recreated in a few seconds" (rolling update, crash-restart,
+routine chart upgrade) — both look identical from inside the hook, and
+Kubernetes exposes no reliable, version-independent signal for a pod to tell
+them apart. Since a big part of *why* `hard` NFS mounts exist is so a brief
+server restart is invisible to clients (they just block briefly and retry),
+forcibly unexporting on every routine restart would convert currently-harmless
+events into active disruptions (stale filehandles / connection resets for
+every mounted client) while only sometimes helping the one case it targets.
+**Do not add this hook.** Prefer client-side bounded timeouts (NVMe-oF
+`--ctrl-loss-tmo`/`--reconnect-delay`, NFS `soft`/`timeo` if the write-safety
+tradeoff is accepted) instead — those bound the wait based on elapsed time, not
+on guessing pod-termination intent, so a quick transient restart stays
+transparent while a truly dead server still eventually unblocks.
+
 ---
 
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
