@@ -85,6 +85,17 @@ spec:
                   immutable for the lifetime of the snapshot.
                 minLength: 1
                 type: string
+              sourceType:
+                description: |-
+                  SourceType is the source ZfsDataset's type (filesystem or volume) at
+                  snapshot creation time. The CSI controller captures it from the source
+                  so that a later restore can still reject a filesystem/zvol type mismatch
+                  even if the source ZfsDataset has since been deleted (e.g. the original
+                  PVC was removed but the snapshot was retained). Immutable once set.
+                enum:
+                - filesystem
+                - volume
+                type: string
               sourceVolume:
                 description: |-
                   SourceVolume is the CSI source volume id (the source ZfsDataset's

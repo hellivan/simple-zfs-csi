@@ -79,6 +79,9 @@ func TestCreateSnapshot_CreatesAndReturnsReady(t *testing.T) {
 	if got.Spec.PoolGUID != "999" || got.Spec.Dataset != "k8s/pvc-1" || got.Spec.SnapshotName != "snap-1" || got.Spec.SourceVolume != "pvc-1" {
 		t.Errorf("snapshot spec = %+v", got.Spec)
 	}
+	if got.Spec.SourceType != storagev1alpha1.DatasetTypeFilesystem {
+		t.Errorf("snapshot spec.sourceType = %q, want %q", got.Spec.SourceType, storagev1alpha1.DatasetTypeFilesystem)
+	}
 }
 
 func TestCreateSnapshot_MissingSourceVolume(t *testing.T) {

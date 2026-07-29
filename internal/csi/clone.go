@@ -39,7 +39,7 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		if snap.Spec.PoolGUID != rp.PoolGUID {
 			return nil, status.Errorf(codes.InvalidArgument, "cross-pool restore unsupported: snapshot %q is on pool %s, target pool is %s", id, snap.Spec.PoolGUID, rp.PoolGUID)
 		}
-		if srcType := c.sourceDatasetType(ctx, snap.Spec.SourceVolume); srcType != "" && srcType != rp.DatasetType {
+		if srcType := c.snapshotSourceType(ctx, snap); srcType != "" && srcType != rp.DatasetType {
 			return nil, status.Errorf(codes.InvalidArgument, "cannot restore a %s snapshot into a %s (protocol %s) volume", srcType, rp.DatasetType, rp.Protocol)
 		}
 		return &storagev1alpha1.DatasetSource{Snapshot: snap.Spec.Dataset + "@" + snap.Spec.SnapshotName}, nil
@@ -67,6 +67,19 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 	default:
 		return nil, status.Error(codes.InvalidArgument, "unsupported volume content source")
 	}
+}
+
+// snapshotSourceType returns the ZFS dataset type (filesystem or volume) of a
+// snapshot's source, preferring the type recorded on the ZfsSnapshot itself
+// (captured at creation time, so it survives the source being deleted later,
+// e.g. the original PVC was removed but the snapshot retained). Falls back to
+// a live lookup of the source ZfsDataset for snapshots created before
+// SourceType existed. Returns "" when neither is available.
+func (c *ControllerServer) snapshotSourceType(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot) storagev1alpha1.DatasetType {
+	if snap.Spec.SourceType != "" {
+		return snap.Spec.SourceType
+	}
+	return c.sourceDatasetType(ctx, snap.Spec.SourceVolume)
 }
 
 // sourceDatasetType looks up the ZFS type of a source ZfsDataset by name,

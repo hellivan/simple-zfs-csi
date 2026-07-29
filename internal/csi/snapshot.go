@@ -44,6 +44,7 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		Dataset:      src.Spec.Dataset,
 		SnapshotName: name,
 		SourceVolume: sourceID,
+		SourceType:   src.Spec.Type,
 	}
 	if err := c.ensureSnapshot(ctx, name, desired); err != nil {
 		return nil, err
@@ -146,7 +147,8 @@ func (c *ControllerServer) ensureSnapshot(ctx context.Context, name string, desi
 	default:
 		if existing.Spec.PoolGUID != desired.PoolGUID ||
 			existing.Spec.Dataset != desired.Dataset ||
-			existing.Spec.SourceVolume != desired.SourceVolume {
+			existing.Spec.SourceVolume != desired.SourceVolume ||
+			existing.Spec.SourceType != desired.SourceType {
 			return status.Errorf(codes.AlreadyExists, "snapshot %q already exists for a different source", name)
 		}
 		return nil

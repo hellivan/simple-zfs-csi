@@ -44,6 +44,14 @@ type ZfsSnapshotSpec struct {
 	// reporting; the agent does not need it to take the snapshot.
 	// +optional
 	SourceVolume string `json:"sourceVolume,omitempty"`
+
+	// SourceType is the source ZfsDataset's type (filesystem or volume) at
+	// snapshot creation time. The CSI controller captures it from the source
+	// so that a later restore can still reject a filesystem/zvol type mismatch
+	// even if the source ZfsDataset has since been deleted (e.g. the original
+	// PVC was removed but the snapshot was retained). Immutable once set.
+	// +optional
+	SourceType DatasetType `json:"sourceType,omitempty"`
 }
 
 // ZfsSnapshotStatus reports the observed snapshot state on the node.

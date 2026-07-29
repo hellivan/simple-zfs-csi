@@ -125,3 +125,26 @@ func TestCreateVolume_RestoreTypeMismatchRejected(t *testing.T) {
 		t.Fatalf("expected InvalidArgument for type mismatch, got %v", err)
 	}
 }
+
+// TestCreateVolume_RestoreTypeMismatchRejectedAfterSourceDeleted verifies the
+// type check still fires when the source ZfsDataset no longer exists (e.g. the
+// original PVC was deleted but the snapshot was retained), relying on the
+// SourceType recorded on the ZfsSnapshot at creation time rather than a live
+// lookup of the (now-gone) source.
+func TestCreateVolume_RestoreTypeMismatchRejectedAfterSourceDeleted(t *testing.T) {
+	snap := snapshotObj("snap-1", "999", "k8s/pvc-src", "pvc-src")
+	snap.Spec.SourceType = storagev1alpha1.DatasetTypeFilesystem
+	// No sourceDataset("pvc-src") in the fake client: the source PVC is gone.
+	cl := newTestClient(t, snap)
+	cs := newController(cl)
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:                "pvc-restore",
+		VolumeCapabilities:  mountCaps(),
+		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
+		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nvmeof"},
+		VolumeContentSource: snapshotSource("snap-1"),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for type mismatch with deleted source, got %v", err)
+	}
+}

@@ -10,6 +10,83 @@ recurring bug classes and their guards are catalogued in
 
 ---
 
+## ADR-0017 — Keep one CSI driver for both protocols; reject cross-protocol/type restores in-controller
+
+**Status:** Accepted (2026-07-29) · **Scope:** `internal/csi` (`resolveContentSource`, `ZfsSnapshotSpec.SourceType`) · **Builds on** the single-driver StorageClass/protocol model (ADR-0002), the `ZfsDataset`/`ZfsSnapshot` CRD taxonomy (ADR-0006, ADR-0008) and the same-pool/same-type clone/restore checks (ADR-0009).
+
+### Context
+
+A single CSI driver name (`simple-zfs-csi.io`) serves both protocols (`nfs` =
+filesystem, `nvmeof` = zvol), selected purely by the StorageClass `protocol`
+parameter (ADR-0002). This raised the question of whether a snapshot of one
+dataset type could be restored into a volume of the other type — e.g. a
+filesystem PVC's snapshot restored via an `nvmeof` StorageClass — and whether
+that class of mismatch is actually guarded against, given Kubernetes itself
+provides no help here (unlike, say, ceph-csi, where `rbd.csi.ceph.com` and
+`cephfs.csi.ceph.com` are separate driver names, so `external-provisioner`
+refuses to route a cross-backend restore before it ever reaches the driver).
+
+Investigation confirmed the mismatch is already rejected in
+`resolveContentSource` (ADR-0009): it compares the source's dataset type
+against the target StorageClass's protocol-derived type and returns
+`InvalidArgument` on a mismatch. The one gap found was that the source type was
+previously derived only via a live lookup of the source `ZfsDataset`, which
+returns "unknown" (skipping the check) once that source object is deleted —
+e.g. the original PVC was removed but its snapshot retained. This was closed by
+recording `SourceType` on `ZfsSnapshotSpec` itself, captured immutably at
+`CreateSnapshot` time, mirroring the precedent set by Kubernetes'
+`VolumeSnapshotContent.spec.sourceVolumeMode` (also immutable, also captured at
+snapshot creation for the same reason).
+
+This left the broader question: given ceph-csi's precedent of splitting by
+backend, would splitting this driver into two (e.g.
+`nfs.simple-zfs-csi.io` / `nvmeof.simple-zfs-csi.io`) be the better design here
+too?
+
+### Decision
+
+**Keep the single CSI driver name for both protocols.** The in-controller
+type/protocol check (now hardened against source deletion) is sufficient, and
+the one-driver model already matches how CSI drivers conventionally serve
+multiple volume modes from a single driver (e.g. `Filesystem` vs `Block`
+`VolumeCapability.AccessType`, as EBS/GCE PD/ceph-csi's own RBD driver do) —
+the `protocol` StorageClass parameter plays that same role here.
+
+### Alternatives considered
+
+- **Split into two CSI driver names, one per protocol.** Would make the
+  mismatch structurally impossible at the Kubernetes plumbing layer (wrong
+  driver name never routes to the controller at all), matching ceph-csi's
+  `rbd.csi.ceph.com`/`cephfs.csi.ceph.com` split. Rejected: ceph-csi splits by
+  *backend* (RBD vs CephFS are different storage systems with independent
+  provisioning APIs and sidecar/scaling needs); this project's `nfs` vs
+  `nvmeof` split is already made at that layer — `nfs-controller` and
+  `nvmeof-controller` are separate binaries/Dockerfiles/DaemonSets. Only the
+  CSI *control plane* (provisioning/attach/snapshot bookkeeping against the
+  same ZFS pools) is shared, which is the normal scope for one driver name.
+  Splitting would double the `CSIDriver` object, the controller Deployment and
+  all four of its sidecars (provisioner/resizer/attacher/snapshotter), the node
+  plugin's kubelet registration, and the RBAC surface — a large, ongoing
+  maintenance cost to trade an already-tested ~15-line in-controller check for
+  a Kubernetes-level one.
+- **Do nothing (rely only on the live `ZfsDataset` lookup).** Rejected: leaves
+  the type check silently skipped once the source dataset is deleted, the
+  scenario this ADR set out to close.
+
+### Consequences
+
+- No chart/API-visible change beyond `ZfsSnapshotSpec.SourceType`
+  (`internal/csi/snapshot.go`, `internal/csi/clone.go`); existing clusters'
+  pre-upgrade `ZfsSnapshot` objects have `SourceType: ""` and transparently fall
+  back to the old live-lookup behavior (no migration needed, but they remain
+  exposed to the source-deleted edge case until recreated).
+- The in-controller checks remain the single enforcement point for
+  cross-protocol/type restores; the driver-name split is not planned unless
+  NFS and NVMe-oF need independent scaling, RBAC, or upgrade lifecycles in the
+  future, at which point this ADR should be superseded.
+
+---
+
 ## ADR-0016 — Default `hostExec.mode` to `nsenter`; `chroot` cannot create host mounts on Talos
 
 **Status:** Accepted (2026-07-24) · **Scope:** Helm `values.yaml` defaults for `discovery.hostExec.mode`, `csiNode.hostExec.mode` and `toolbox.hostExec.mode` (`chroot` → `nsenter`), and the operational guidance in [known-pitfalls.md](known-pitfalls.md) class 15 · **Builds on** the `Runner` host-exec indirection (ADR-0003) and the host-exec observability/mode work (ADR-0013).
