@@ -152,17 +152,19 @@ backing clones (e.g. `pool/.zfs-csi-snapshots/<name>`, sitting *outside* any
 snapshot would be a clone whose origin lives outside the replicated subtree, so
 `zfs send -R k8s/secure` would fail to preserve it (or fail outright).
 
-**Fix:** nest the hidden backing-clone namespace **inside the same parent/prefix as the
-source dataset**, not pool-global:
+**Fix:** place the backing clone as a **flat sibling inside the same parent/prefix as the
+source dataset**, not pool-global, distinguished by a name prefix rather than a nested
+folder (revised after further discussion — see §2.8 and D1):
 
 ```
 source dataset:  pool/k8s/secure/pvc-1
-backing clone:   pool/k8s/secure/<leafName>/pvc-1-snap-name   (leafName default: "zfs-csi-snapshots")
+backing clone:   pool/k8s/secure/csi-snap-<name>   (prefix default: "csi-snap-")
 ```
 
-Computed as `dirname(sourceDataset) + "/" + leafName + "/" + snapshotName` — purely from
+Computed as `dirname(sourceDataset) + "/" + namePrefix + snapshotName` — purely from
 data already on the spec, no cross-component absolute-path config needed, just a shared
-leaf-folder-name constant.
+name-prefix constant. (This was originally designed as a nested subfolder; revised to a
+flat name-prefix scheme after further discussion — see §2.8.)
 
 This means: replicating `k8s/secure` recursively naturally captures the backing clones
 and (post-promotion) the relocated origin snapshots, because they physically live inside
@@ -196,6 +198,102 @@ exist silently (see D6).
 
 ---
 
+### 2.7 Property/fsType compatibility on clone and restore (raised by the user, separately from the snapshot-lifecycle work above, but folded into the same redesign)
+
+**The concern:** `zfs clone`/`zfs send`+`receive` copy *content*, not the freedom to
+retroactively re-decide structural properties. Three concrete cases, verified against
+this codebase and ZFS semantics:
+
+1. **`volblocksize` (zvols) — hard ZFS wall.** A clone's block layout must exactly match
+   its origin; `-o volblocksize=X` differing from the source is rejected by ZFS outright.
+   `internal/zpool/zfs.go`'s `Clone()` already has a comment acknowledging this
+   ("a clone inherits read-only properties such as volblocksize from its origin"), and
+   `zfsdataset_controller.go`'s `clone()` path already avoids passing it (`volumeProps()`,
+   which adds `volblocksize`, is only used by the plain-create path, never by `clone()`).
+   **Gap: this means a target StorageClass's `volblocksize` is silently ignored for a
+   cloned/restored volume today — no error, no warning.**
+2. **`recordsize` (filesystems) and other mutable `property.*` overrides — soft gotcha,
+   not a ZFS error.** `-o recordsize=X` *is* accepted on a clone even if different from
+   the origin (recordsize is always mutable), but it only governs **new** writes; blocks
+   shared with the origin at clone time keep the **original** record size until
+   rewritten. `zfs send`/`receive` has the identical characteristic for the identical
+   reason (the stream reproduces blocks exactly as originally written). Not an error, but
+   silently not doing what a user restoring into a differently-tuned StorageClass would
+   expect.
+3. **`fsType` (block/zvol volumes only) — confirmed real bug via the node plugin's own
+   code.** `internal/csi/mount.go`'s `FormatAndMount`:
+   ```go
+   existing, err := m.detectFS(device)   // blkid
+   if existing == "" {
+       // mkfs.<fsType> only runs if the device has NO filesystem yet
+   }
+   mount -t <fsType> device target        // always mounts with whatever fsType was requested
+   ```
+   A cloned/restored zvol is a byte-for-byte copy of the source, filesystem included. If
+   the target StorageClass/PV requests a different `fsType` than what the source was
+   actually formatted with, `mkfs` is correctly skipped (device isn't empty) but `mount -t
+   <requested>` is then attempted against the *actual* on-disk filesystem — this fails at
+   `NodeStageVolume` time with a wrong-fs-type/bad-superblock error. Unlike the ZFS
+   properties above, **`fsType` isn't tracked anywhere in our CRDs today** — it only
+   exists as a per-mount argument at `NodeStageVolume` time, invisible to the controller
+   at `CreateVolume`/restore time.
+
+**Is this scenario something a real user could actually trigger, or a contrived edge
+case?** Checked against the official Kubernetes docs
+(`kubernetes.io/docs/concepts/storage/volume-pvc-datasource/`, fetched live):
+
+> **Cloning is supported with a different Storage Class.** Destination volume can be the
+> same or a different storage class as the source. ... Cloning can only be performed
+> between two volumes that use the same `VolumeMode` setting (if you request a block mode
+> volume, the source MUST also be block mode).
+
+**Confirmed: yes, this is normal, documented, spec-compliant Kubernetes usage, not a
+misuse.** The *only* K8s-level restrictions on PVC-to-PVC cloning are: same namespace,
+source `Bound` and not in use, same `VolumeMode` (already covered by our existing
+`SourceType`/dataset-kind check), and destination capacity ≥ source capacity. **Nothing**
+about matching `fsType`, `recordsize`, `volblocksize`, or any other driver-specific
+property is checked by Kubernetes at all — consistent with the pattern found everywhere
+else in this investigation (the CSI/K8s layer pushes essentially all data-integrity
+enforcement onto the driver). This fully justifies treating it as a real gap to close, not
+a hypothetical.
+
+**Decision: see D10.**
+
+### 2.8 Backing-clone naming: flat name-prefix, not a nested subfolder (revised from the
+initial design)
+
+Initially designed as a nested subfolder (`<prefix>/<leafName>/<name>`, requiring a
+separate hidden container dataset per prefix — see the original D2). Revised, for two
+reasons raised by the user:
+
+1. **This is actually how Rook/ceph-csi does it, but as a structural necessity, not a
+   preference** — RBD images (`csi-snap-<uuid>`, `csi-vol-<uuid>`) live in a **flat**
+   pool namespace; RBD has no folder/hierarchy concept at all, so ceph-csi's flat,
+   prefixed naming isn't a design choice, it's the only option RBD offers. ZFS is
+   hierarchical, so nesting was an *option* for us, not a requirement — but there's no
+   strong reason to use it if a flat prefix works just as well.
+2. **A flat prefix already matches this project's own existing convention** for
+   internal/bookkeeping ZFS objects: ADR-0009's direct-volume-clone path already does
+   `srcFull + "@clone-" + vol.Name` — a flat, prefixed snapshot name, no subfolder.
+   Matching that convention is more consistent than introducing a new nested-folder
+   pattern.
+
+**Revised scheme:** `dirname(sourceDataset)/<namePrefix><snapshotName>`, e.g.
+`pool/k8s/secure/csi-snap-<name>` — flat, no separate container dataset needed at all
+(the original D2 "auto-create hidden container" step is eliminated entirely, since
+there's no container anymore, just a sibling dataset under the already-existing prefix).
+Collision risk against real PVC dataset names is negligible in practice: dynamically
+provisioned PV names are always Kubernetes-generated and start with `pvc-`, so a
+`csi-snap-` prefix cannot realistically collide — the same risk profile already accepted
+for `@clone-<name>`.
+
+**Clarifying "hidden":** ZFS has no feature to make a dataset invisible from `zfs list`
+(unlike RBD's `snap-trash`, which specifically hides a snapshot from `rbd snap ls`) —
+every backing clone will always show up in `zfs list`/`zfs list -t all` regardless of
+naming scheme. What "hidden" actually refers to is `canmount=off` (filesystem) /
+`volmode=none` (zvol) — properties that suppress auto-mounting / block-device exposure,
+an orthogonal, purely operational concern kept regardless of the naming scheme.
+
 ## 3. Chosen design
 
 Two selectable **modes**, per `VolumeSnapshotClass` (see D8), because they have genuinely
@@ -207,23 +305,21 @@ able to choose:
 **On `CreateSnapshot`** (source `pool/k8s/secure/pvc-src`, CSI name `snap-1`):
 1. `zfs snapshot pool/k8s/secure/pvc-src@snap-1` — raw point-in-time snapshot (unchanged
    from today).
-2. Ensure `pool/k8s/secure/<leafName>` container exists (idempotent, single-level
-   `zfs create`, no `-p` — safe because the immediate parent `pool/k8s/secure` is already
-   guaranteed to exist per ADR-0013's "parents are declared, not implied" rule).
-3. `zfs clone pool/k8s/secure/pvc-src@snap-1 pool/k8s/secure/<leafName>/snap-1` — the
-   "backing clone" (Ceph's `csi-snap-<uuid>` clone-image equivalent). Use
-   `canmount=off` (filesystem) or `volmode=none` (zvol) so it never auto-mounts/exposes a
-   device — pick based on `ZfsSnapshotSpec.SourceType` (already added to the CRD earlier
-   this session).
-4. `zfs snapshot pool/k8s/secure/<leafName>/snap-1@restore-source` — fixed-name
+2. `zfs clone pool/k8s/secure/pvc-src@snap-1 pool/k8s/secure/csi-snap-snap-1` — the
+   "backing clone", a flat sibling of the source directly under the same prefix (no
+   separate container dataset needed, see §2.8). Matches Ceph's `csi-snap-<uuid>`
+   clone-image equivalent, just ZFS-flavored. Use `canmount=off` (filesystem) or
+   `volmode=none` (zvol) so it never auto-mounts/exposes a device — pick based on
+   `ZfsSnapshotSpec.SourceType` (already added to the CRD earlier this session).
+3. `zfs snapshot pool/k8s/secure/csi-snap-snap-1@restore-source` — fixed-name
    self-snapshot on the backing clone, created immediately (mirrors Ceph pre-creating the
    clone-image's own snapshot). **Fixed suffix name, distinct from the CSI-visible
    snapshot name**, so it never collides with the relocated raw-origin snapshot after
    promotion (see step below — the raw origin keeps its own CSI-visible name,
    `@snap-1`, and after promotion both `@snap-1` and `@restore-source` coexist on the same
    backing-clone dataset without collision).
-5. `CreationTime`/`RestoreSize` status fields are read from
-   `<leafName>/snap-1@restore-source` (not the raw source snapshot) — stable regardless of
+4. `CreationTime`/`RestoreSize` status fields are read from
+   `csi-snap-snap-1@restore-source` (not the raw source snapshot) — stable regardless of
    what happens to the source later.
 
 **On `DeleteVolume`** (deleting `pvc-src`), in `ZfsDatasetReconciler`, before
@@ -231,7 +327,7 @@ able to choose:
 1. List live `ZfsSnapshot`s with `Spec.SourceVolume == pvc-src`.
 2. **Block** (return error, requeue) if any of them are not yet `Ready` (see D3 — avoids
    destroying the source out from under an in-flight `CreateSnapshot`).
-3. For each `Ready` one, `zfs promote pool/k8s/secure/<leafName>/<name>` (idempotent: skip
+3. For each `Ready` one, `zfs promote pool/k8s/secure/csi-snap-<name>` (idempotent: skip
    if no `origin` property — i.e. already promoted, or never was a clone).
 4. **Also** (D7/D9): list live `ZfsDataset`s with `Spec.Source.Volume == pvc-src` (direct
    PVC-to-PVC clones, not via any `VolumeSnapshot`) and unconditionally `zfs promote` each
@@ -243,7 +339,7 @@ able to choose:
    zero remaining snapshot/clone dependents, **always succeeds**.
 
 **Restores** (`resolveContentSource`) always clone from
-`<leafName>/<name>@restore-source`, never from the original source path directly — stable
+`csi-snap-<name>@restore-source`, never from the original source path directly — stable
 whether the source is alive, deleted-but-not-yet-promoted, or promoted away.
 
 **`DeleteSnapshot`, final design — finalizer-based tracking + reverse-promote** (see D4
@@ -296,9 +392,9 @@ in the user's cluster yet, so no migration concern — go straight to the better
 | # | Topic | Final decision |
 |---|---|---|
 | D0 | Core mechanism | `zfs promote` to relocate a snapshot onto a pre-created backing clone — ZFS-native equivalent of Ceph's snap-trash |
-| D1 | Backing clone location | Nested: `dirname(sourceDataset)/<leafName>/<snapName>` — **not** pool-global (required for `zfs send -R` backup compatibility, §2.5) |
-| D1a | Leaf folder name | Configurable via values.yaml, default **`zfs-csi-snapshots`** |
-| D2 | Hidden container creation | Auto-create (single-level `zfs create`, no `-p`) — safe because parent prefix already guaranteed to exist per ADR-0013 |
+| D1 | Backing clone naming/location | **Revised (§2.8):** flat sibling `dirname(sourceDataset)/<namePrefix><snapName>` (e.g. `pool/k8s/secure/csi-snap-<name>`) — **not** pool-global (required for `zfs send -R` backup compatibility, §2.5), and **not** a nested subfolder (matches Rook/ceph-csi's own naming convention and this project's existing `@clone-<name>` convention, §2.8) |
+| D1a | Name prefix | Configurable via values.yaml, default **`csi-snap-`** |
+| D2 | ~~Hidden container creation~~ | **Removed — no longer applicable.** Only existed for the original nested-subfolder design; the flat-prefix revision (§2.8, D1) needs no separate container dataset at all, just a sibling under the already-existing prefix. |
 | D3 | In-flight-snapshot vs. concurrent `DeleteVolume` race | `ZfsDatasetReconciler`'s delete path blocks (error+requeue) on any dependent `ZfsSnapshot` not yet `Ready` (`Pending` or `Error` phase) — bounded wait, not a deadlock (verified: both reconcilers run on the same node/manager per pool, underlying ZFS object isn't destroyed yet so the in-flight snapshot can still complete) |
 | D4 | `DeleteSnapshot` "in use" detection + policy | **Final: finalizer-based dependency tracking** (`restored-by.<pvcName>` finalizers added at restore time, removed at the dependent's own teardown) **+ reverse-`zfs promote`** of every tracked dependent before destroying the backing clone. Always succeeds, matches Ceph's actual (source-code-confirmed) behavior. Superseded two earlier, less-good candidates: (a) discover "in use" only via the async ZFS destroy error inside the finalizer loop (bad UX, no immediate/standard error signal); (b) synchronous check via `ZfsDataset.Spec.Source.Snapshot` + block with `FAILED_PRECONDITION` (better UX than (a), race-prone via TOCTOU, and doesn't match Ceph's real always-succeeds behavior) |
 | D5 | Self-snapshot suffix name | Fixed `@restore-source`, distinct from the CSI-visible snapshot name (avoids collision with the relocated raw-origin snapshot after promotion) |
@@ -306,6 +402,7 @@ in the user's cluster yet, so no migration concern — go straight to the better
 | D7 | Direct PVC-to-PVC clone (`VolumeContentSource_Volume`, no `VolumeSnapshot` involved) — must the *source* PVC's deletion be blocked while a clone exists? | **No — always promote instead, unconditionally** (no mode toggle possible/needed, since there's no `VolumeSnapshotClass` in this path). Same mechanism as D3, applied to ADR-0009's intermediate `<src>@clone-<name>` snapshot. Re-confirmed explicitly as its own question later in the conversation — same answer. |
 | D8 | Dual-mode selectability | `VolumeSnapshotClass` parameter `mode: standalone\|integrated`; values.yaml default `csiController.snapshotter.defaultMode: standalone` (chosen over `integrated` because there are no existing snapshots yet in the target cluster — no migration risk) |
 | D9 | (alias of D7 — the user re-asked this question in different words; recorded here to make clear it was re-verified, not newly introduced) | Same as D7 |
+| D10 | Property/fsType compatibility on clone and restore (§2.7) | **Reject on any mismatch, for both `resolveContentSource` code paths (restore-from-snapshot and clone-from-volume), both modes.** Specifically: (a) `volblocksize` — reject if the target's resolved value differs from the source's actual value (today it's silently ignored instead); (b) any `property.*` override (`recordsize`, `compression`, etc.) — reject if the target's resolved value differs from the source's recorded `Spec.Properties`/`Spec.Volume.Volblocksize`, rather than allowing a technically-valid-but-confusing partial override; (c) `fsType` (block/zvol only) — reject if the target's resolved `fsType` differs from the source's actual formatted filesystem. Chosen over allowing selective, per-property overrides: simpler, matches "clone copies content, not the freedom to redecide structure," and closes a real, confirmed, silently-broken case (Kubernetes explicitly permits cross-StorageClass cloning/restore with no compatibility checking of its own, per §2.7). Comparison for (a)/(b) is Spec-to-Spec (no live ZFS query needed, consistent with the D4 preference for K8s-native checks over ZFS round-trips); (c) requires new state — see task list. |
 
 ## 5. Rejected alternatives (and why)
 
@@ -320,8 +417,14 @@ in the user's cluster yet, so no migration concern — go straight to the better
   subsystem needed.
 - **Pool-global hidden namespace for backing clones** (`pool/.zfs-csi-snapshots/<name>`).
   Rejected: breaks `zfs send -R <prefix>` backup/replication for any restored PVC, since
-  the clone's origin would sit outside the replicated subtree (§2.5). Replaced by nesting
-  under the source's own prefix (D1).
+  the clone's origin would sit outside the replicated subtree (§2.5). Replaced by placing
+  the backing clone under the source's own prefix (D1).
+- **Nested subfolder for the backing clone** (`<prefix>/<leafName>/<name>`, with a
+  separate hidden container dataset). Rejected in favor of a flat name-prefix
+  (`<prefix>/csi-snap-<name>`, D1/§2.8): matches how Rook/ceph-csi actually names things
+  (a structural necessity for RBD, adopted here for consistency) and this project's own
+  existing `@clone-<name>` convention; also eliminates the need for a separate
+  container-dataset creation step entirely.
 - **Synchronous `List(ZfsDataset)` + block for D4.** Rejected in favor of finalizer-based
   tracking + reverse-promote: the `List`-based check has a TOCTOU race (a concurrent
   restore could land between the check and the delete), requires a cluster-wide scan on
@@ -346,9 +449,10 @@ in the user's cluster yet, so no migration concern — go straight to the better
    immutable, default resolved at creation — same pattern as the existing `SourceType`
    field). Regenerate CRDs/deepcopy (`make manifests`).
 3. `internal/controller/zfssnapshot_controller.go`:
-   - Create path: branch on `Mode`. `standalone` → raw snapshot + ensure hidden
-     container + clone + `@restore-source` self-snapshot (with `canmount=off`/
-     `volmode=none` per `SourceType`). `integrated` → unchanged (raw snapshot only).
+   - Create path: branch on `Mode`. `standalone` → raw snapshot + flat-sibling clone
+     (`csi-snap-<name>`, no separate container dataset needed) + `@restore-source`
+     self-snapshot (with `canmount=off`/`volmode=none` per `SourceType`). `integrated` →
+     unchanged (raw snapshot only).
    - Delete path: branch on `Mode`. `standalone` → read own finalizer list, `zfs promote`
      each tracked dependent, destroy backing clone, best-effort cleanup of the raw origin
      snapshot on the source if still present, release own finalizer. `integrated` →
@@ -364,7 +468,7 @@ in the user's cluster yet, so no migration concern — go straight to the better
      always `zfs promote` each one, unconditionally.
    - Only then proceed to `zfs destroy -r`.
 5. `internal/csi/clone.go` (`resolveContentSource`):
-   - Restore-from-snapshot: clone from `<leafName>/<name>@restore-source` in `standalone`
+   - Restore-from-snapshot: clone from `csi-snap-<name>@restore-source` in `standalone`
      mode, from `snap.Spec.Dataset + "@" + snap.Spec.SnapshotName` in `integrated` mode
      (branch on `snap.Spec.Mode`).
    - D6: reject cross-prefix restores (`dirname(targetDataset) != dirname(snap.Spec.Dataset)`)
@@ -381,8 +485,8 @@ in the user's cluster yet, so no migration concern — go straight to the better
    - `ZfsDatasetReconciler`'s own delete path removes that same finalizer from the source
      `ZfsSnapshot` (if any) as part of its teardown, regardless of clone/restore kind.
 7. Chart: `charts/simple-zfs-csi/values.yaml` — add
-   `csiController.snapshotter.defaultMode: standalone` and a leaf-folder-name value
-   (default `zfs-csi-snapshots`). Thread both into `cmd/csi-controller` (parameter
+   `csiController.snapshotter.defaultMode: standalone` and a name-prefix value
+   (default `csi-snap-`). Thread both into `cmd/csi-controller` (parameter
    resolution + restore path) and `cmd/zpool-discovery` (agent — creates the backing
    clone) via chart-templated flags/args so they can never drift out of sync.
 8. Tests (both `internal/controller/*_test.go` and `internal/csi/*_test.go`):
@@ -396,13 +500,47 @@ in the user's cluster yet, so no migration concern — go straight to the better
    - `DeleteSnapshot` (standalone): finalizer added on restore, removed on dependent
      teardown, reverse-promote + destroy always succeeds even with live dependents.
    - `DeleteSnapshot` (integrated): unaffected, still relies on ZFS's natural protection.
-9. Once implemented and passing: add a single ADR to `design-decisions.md` distilling
+9. `api/v1alpha1/zfsdataset_types.go`: add `Status.FSType` (string, set once). Node plugin's
+   `FormatAndMount` (`internal/csi/mount.go`) needs to report the fsType it actually used
+   the first time it formats an empty device (`existing == ""` branch) back up so the
+   `ZfsDatasetReconciler`/node code path can persist it on the `ZfsDataset` status. An
+   empty `Status.FSType` (never formatted yet) means nothing to conflict with — restores
+   from/clones of a never-mounted volume remain unconstrained until first format.
+10. `internal/csi/clone.go` (`resolveContentSource`), D10: before accepting a
+    restore/clone, compare the target's resolved `volblocksize` and `property.*`
+    overrides against the source `ZfsDataset.Spec.Properties`/`Spec.Volume.Volblocksize`
+    (Spec-to-Spec, no ZFS call), and the target's resolved `fsType` (if block/zvol)
+    against the source's `Status.FSType` (if set) — reject any mismatch with
+    `InvalidArgument`.
+11. Once implemented and passing: add a single ADR to `design-decisions.md` distilling
    this document's final decisions (per the repo's one-decision-per-ADR, append-only
    convention) — this document stays as the detailed backing record, referenced from
    the ADR.
 
-## 7. Open items / not yet decided
+## 7. Future work (deliberately out of scope for this redesign)
 
-None outstanding as of writing — every decision point raised (D0-D9) has a final answer
-recorded above. If new questions come up during implementation, add them here as `D10`,
-`D11`, etc., following the same table format, before resolving them.
+- **Prefix regular volume dataset names too, for naming consistency** (e.g.
+  `csi-vol-<name>`), mirroring the new `csi-snap-` prefix on backing clones and
+  Ceph-csi's `csi-vol-`/`csi-snap-` convention. Raised by the user, explicitly deferred
+  as future work, not part of this redesign. Rationale for treating it separately:
+  - Ceph's `csi-vol-`/`csi-snap-` prefixes are type-tags on top of a self-generated
+    opaque UUID (Ceph never reuses the PVC's own name as the RBD image name — it
+    maintains a separate volume-journal mapping). This project deliberately does the
+    opposite: the ZFS dataset name **is** the CSI volume name directly
+    (`rp.Dataset(name)`), no separate ID journal, which already gets Kubernetes'
+    `pvc-<uuid>` naming for free as a de facto unique/opaque identifier.
+  - `csi-snap-` was introduced to solve a **one-sided** disambiguation problem (backing
+    clones vs. real PVC datasets sharing the same flat prefix namespace) — marking one
+    side is sufficient; marking volumes too would be redundant, not additive.
+  - Much larger blast radius than the snapshot work: it would touch every PVC dataset
+    name, present and future, across the whole driver, not just the new, isolated
+    snapshot/clone mechanism this redesign covers.
+  - Desired purely for aesthetic/naming-consistency reasons ("I like to have things
+    clean"), not for a functional gap — worth doing later as its own, separately-scoped
+    change (its own ADR/plan), not bundled into this one.
+
+## 8. Open items / not yet decided
+
+None outstanding as of writing — every decision point raised (D0-D10) has a final answer
+recorded above. If new questions come up during implementation, add them here as `D11`,
+`D12`, etc., following the same table format, before resolving them.
