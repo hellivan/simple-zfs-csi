@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -14,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
@@ -40,6 +42,11 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		return nil, status.Errorf(codes.Internal, "get source ZfsDataset %q: %v", sourceID, err)
 	}
 
+	mode, err := c.resolveSnapshotMode(req.GetParameters())
+	if err != nil {
+		return nil, err
+	}
+
 	desired := storagev1alpha1.ZfsSnapshotSpec{
 		PoolGUID: src.Spec.PoolGUID,
 		Dataset:  src.Spec.Dataset,
@@ -50,6 +57,7 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		SnapshotName: "csi-snap-" + uuid.New().String(),
 		SourceVolume: sourceID,
 		SourceType:   src.Spec.Type,
+		Mode:         mode,
 	}
 	actual, err := c.ensureSnapshot(ctx, name, desired)
 	if err != nil {
@@ -159,10 +167,86 @@ func (c *ControllerServer) ensureSnapshot(ctx context.Context, name string, desi
 		if existing.Spec.PoolGUID != desired.PoolGUID ||
 			existing.Spec.Dataset != desired.Dataset ||
 			existing.Spec.SourceVolume != desired.SourceVolume ||
-			existing.Spec.SourceType != desired.SourceType {
+			existing.Spec.SourceType != desired.SourceType ||
+			effectiveMode(existing.Spec) != effectiveMode(desired) {
 			return storagev1alpha1.ZfsSnapshotSpec{}, status.Errorf(codes.AlreadyExists, "snapshot %q already exists for a different source", name)
 		}
 		return existing.Spec, nil
+	}
+}
+
+// snapshotModeParam is the VolumeSnapshotClass parameter selecting
+// ZfsSnapshotSpec.Mode (D8, snapshot-lifecycle-redesign.md).
+const snapshotModeParam = "mode"
+
+// resolveSnapshotMode resolves the effective Mode for a new snapshot: the
+// VolumeSnapshotClass "mode" parameter if set, else the chart-configured
+// DefaultSnapshotMode, else SnapshotModeStandalone.
+func (c *ControllerServer) resolveSnapshotMode(params map[string]string) (storagev1alpha1.ZfsSnapshotMode, error) {
+	raw := strings.TrimSpace(params[snapshotModeParam])
+	if raw == "" {
+		raw = string(c.DefaultSnapshotMode)
+	}
+	if raw == "" {
+		raw = string(storagev1alpha1.SnapshotModeStandalone)
+	}
+	mode := storagev1alpha1.ZfsSnapshotMode(raw)
+	switch mode {
+	case storagev1alpha1.SnapshotModeStandalone, storagev1alpha1.SnapshotModeIntegrated:
+		return mode, nil
+	default:
+		return "", status.Errorf(codes.InvalidArgument, "parameter %q must be %q or %q, got %q",
+			snapshotModeParam, storagev1alpha1.SnapshotModeStandalone, storagev1alpha1.SnapshotModeIntegrated, raw)
+	}
+}
+
+// effectiveMode normalises an empty Mode (snapshots created before Mode
+// existed) to Integrated for comparison purposes — today's original,
+// pre-redesign behaviour.
+func effectiveMode(spec storagev1alpha1.ZfsSnapshotSpec) storagev1alpha1.ZfsSnapshotMode {
+	if spec.Mode == "" {
+		return storagev1alpha1.SnapshotModeIntegrated
+	}
+	return spec.Mode
+}
+
+// restoredByFinalizerPrefix mirrors internal/controller's finalizer of the same
+// name (D4/D15, snapshot-lifecycle-redesign.md): a
+// "restored-by.<pvcName>" finalizer on a standalone-mode backing-clone
+// ZfsDataset tracks that pvcName's own ZfsDataset currently depends on it, so
+// ZfsDatasetReconciler's delete path promotes pvcName away before the backing
+// clone itself can be destroyed.
+const restoredByFinalizerPrefix = "storage.simple-zfs-csi.io/restored-by."
+
+// addRestoredByFinalizer registers a restored-by.<pvcName> finalizer on the
+// standalone-mode backing-clone ZfsDataset named backingName (D4/D15),
+// fetch-check-patch with conflict retry. Rejects the restore with
+// FailedPrecondition if the backing clone is already terminating (its source
+// snapshot is being deleted).
+func (c *ControllerServer) addRestoredByFinalizer(ctx context.Context, backingName, pvcName string) error {
+	finalizer := restoredByFinalizerPrefix + pvcName
+	for {
+		cur := &storagev1alpha1.ZfsDataset{}
+		if err := c.Client.Get(ctx, client.ObjectKey{Name: backingName}, cur); err != nil {
+			if apierrors.IsNotFound(err) {
+				return status.Errorf(codes.Internal, "backing clone %q for the source snapshot is missing", backingName)
+			}
+			return status.Errorf(codes.Internal, "get backing clone %q: %v", backingName, err)
+		}
+		if !cur.DeletionTimestamp.IsZero() {
+			return status.Errorf(codes.FailedPrecondition, "backing clone %q for the source snapshot is being deleted; retry", backingName)
+		}
+		if controllerutil.ContainsFinalizer(cur, finalizer) {
+			return nil
+		}
+		controllerutil.AddFinalizer(cur, finalizer)
+		if err := c.Client.Update(ctx, cur); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return status.Errorf(codes.Internal, "add restored-by finalizer to backing clone %q: %v", backingName, err)
+		}
+		return nil
 	}
 }
 

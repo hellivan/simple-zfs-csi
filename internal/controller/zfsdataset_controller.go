@@ -88,7 +88,19 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			if err := r.ZFS.Destroy(ctx, full, true); err != nil {
+			// D12/D15: clear any tracking finalizer elsewhere that references this
+			// dataset, now that it's going away, so a stale reference never lingers
+			// on whichever object happened to be tracking it.
+			if err := r.clearTrackingFinalizersReferencing(ctx, vol.Name); err != nil {
+				return ctrl.Result{}, err
+			}
+			// D3/D7/D9/D12: promote away every tracked dependent first, so the
+			// dataset is guaranteed to have zero snapshots/clones of its own left
+			// — what makes a non-recursive destroy (D11) always safe/correct.
+			if err := r.beforeDestroy(ctx, &vol, pool.Status.PoolName, full); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.ZFS.Destroy(ctx, full, false); err != nil {
 				return ctrl.Result{}, err
 			}
 			logger.Info("destroyed ZFS object", "dataset", full)

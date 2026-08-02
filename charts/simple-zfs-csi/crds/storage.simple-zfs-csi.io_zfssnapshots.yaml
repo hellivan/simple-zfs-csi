@@ -72,6 +72,18 @@ spec:
                   full ZFS snapshot name "<poolName>/<dataset>@<snapshotName>".
                 minLength: 1
                 type: string
+              mode:
+                description: |-
+                  Mode selects standalone (Ceph-style, via zfs promote; new default) or
+                  integrated (today's original, plain-snapshot-only behaviour). Immutable
+                  once set, resolved at CreateSnapshot time from the VolumeSnapshotClass
+                  "mode" parameter with a chart-configured default (D8). Empty is treated as
+                  Integrated for backward compatibility with snapshots created before this
+                  field existed.
+                enum:
+                - standalone
+                - integrated
+                type: string
               poolGUID:
                 description: |-
                   PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name without

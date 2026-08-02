@@ -61,6 +61,7 @@ spec:
             - --create-timeout={{ .Values.csiController.createTimeout }}
             - --poll-interval={{ .Values.csiController.pollInterval }}
             - --pvc-annotation-prefix={{ .Values.csiController.pvcAnnotationPrefix }}
+            - --default-snapshot-mode={{ .Values.csiController.snapshotter.defaultMode }}
             {{- if .Values.csiController.defaultParameters }}
             - --default-parameters-configmap={{ include "simple-zfs-csi.fullname" . }}-csi-controller-defaults
             {{- end }}

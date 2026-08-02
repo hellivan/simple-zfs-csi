@@ -10,6 +10,67 @@ recurring bug classes and their guards are catalogued in
 
 ---
 
+## ADR-0019 — Independent snapshot lifecycle via `zfs promote`; dual standalone/integrated mode
+
+**Status:** Accepted (2026-08-02) · **Scope:** `internal/zpool` (`ZFS.Promote`), `internal/controller` (`zfsdataset_controller.go`, `zfssnapshot_controller.go`, new `promote.go`), `internal/csi` (`clone.go`, `snapshot.go`), `api/v1alpha1` (`ZfsSnapshotSpec.Mode`), chart (`csiController.snapshotter.defaultMode`) · **Full record:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md).
+
+### Context
+
+`ZfsDatasetReconciler`'s `DeleteVolume` path ran `zfs destroy -r`, which silently destroys
+all of a volume's own ZFS snapshots when the volume itself is deleted — violating the CSI
+requirement that a volume's snapshots survive its deletion. The full investigation (D0-D16
+in the linked doc) considered Ceph-style "trash" (rename+defer) and rejected it: a ZFS
+dataset with live snapshots has no operation to free only its own private data while
+leaving snapshots attached, so trash would leave the entire deleted volume's storage
+allocated for as long as any snapshot survives — an unbounded, silent leak on this
+project's own long-retained-backup-snapshot use case. `zfs promote` (reversing a clone's
+parent/child relationship with its origin snapshot) is the ZFS-native primitive Ceph's RBD
+lacks, and reclaims the deleted volume's own data immediately and unconditionally instead.
+
+### Decision
+
+Two selectable `ZfsSnapshotSpec.Mode` values, resolved at `CreateSnapshot` time from a
+`VolumeSnapshotClass` `mode` parameter (falling back to `csiController.snapshotter.defaultMode`,
+chart default `standalone`; unset/legacy snapshots are treated as `integrated`):
+
+- **`standalone`** (new default): `CreateSnapshot` takes the raw snapshot, then provisions
+  an owned, child `ZfsDataset` "backing clone" from it (flat sibling under the source's own
+  prefix, named after the already-independent `Spec.SnapshotName` — no new naming scheme
+  needed thanks to ADR-0018), and takes a fixed `@restore-source` self-snapshot on it.
+  Restores always clone from `<backing-clone>@restore-source`, never the raw snapshot.
+  `DeleteVolume` promotes every `Ready` standalone dependent's backing clone away
+  (unconditionally) instead of blocking, then destroys the source with a **non-recursive**
+  `zfs destroy` (safe now that every tracked dependent has been promoted off it first).
+  `DeleteSnapshot` deletes the backing-clone `ZfsDataset` object and waits for
+  `ZfsDatasetReconciler`'s own promote-then-destroy delete path to finish it, then performs
+  the required (not best-effort) raw-origin-snapshot cleanup on the true source.
+- **`integrated`** (today's original behavior): plain `zfs snapshot`, no backing clone.
+  `DeleteVolume` blocks (requeues) while any live `integrated`-mode dependent exists —
+  there's nothing to promote in this mode.
+
+Direct PVC-to-PVC clones (ADR-0009, no `VolumeSnapshot` involved) are always promoted away
+unconditionally on `DeleteVolume`, no mode toggle. A generalized `promoted-onto.<name>`/
+`restored-by.<name>` finalizer mechanism tracks any dataset-to-dataset dependency the
+promote machinery creates (e.g. two simultaneous restores from one snapshot — promoting
+one reparents the other onto it instead of freeing it, per real, documented ZFS behavior),
+so every object stays independently deletable in any order. Cross-`datasetPrefix` restores
+are rejected outright (`InvalidArgument`) since a backing clone's origin must stay inside
+the same replicated subtree for `zfs send -R` backup compatibility.
+
+### Consequences
+
+- Snapshots now genuinely survive their source volume's deletion in `standalone` mode
+  (the actual bug motivating this work), with no CO-visible blocking.
+- **Deferred, not implemented in this pass**: `Status.FSType` tracking and the D10
+  property/fsType compatibility rejection on clone/restore (needs `internal/csi/mount.go`
+  node-plugin changes beyond this pass's scope) — see the linked doc's status header.
+- Test coverage uses a fake `ZFS` double (including a `Promote` model of ZFS's real
+  sibling-clone reparenting); the D16 promote-ordering fixpoint loop's real-pool edge cases
+  are not independently re-verified here, relying instead on the linked doc's own
+  2026-07-31 live-pool verification.
+
+---
+
 ## ADR-0018 — Independent, opaque ZFS-facing names for `ZfsDataset`/`ZfsSnapshot`
 
 **Status:** Accepted (2026-08-02) · **Scope:** `internal/csi` (`CreateVolume`, `CreateSnapshot`, `ensureVolume`, `ensureSnapshot`, `volumeSpecCompatible`), `internal/controller/zfsdataset_controller.go` (`clone()`) · **Full record:** [independent-resource-naming-redesign.md](independent-resource-naming-redesign.md).

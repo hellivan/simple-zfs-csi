@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -30,8 +31,11 @@ type fakeZFS struct {
 	lastZvProps    map[string]string
 	cloned         []string // records "snapshot -> dest" for each Clone
 	lastCloneProps map[string]string
-	setProps       []string // records "name property=value" for each SetProperty
-	ownership      []string // records "mountpoint uid:gid mode" for each ApplyOwnership
+	setProps       []string          // records "name property=value" for each SetProperty
+	ownership      []string          // records "mountpoint uid:gid mode" for each ApplyOwnership
+	origin         map[string]string // dataset -> its current origin snapshot ("" / absent = none)
+	promoted       []string          // records each dataset name passed to Promote
+	promoteErr     map[string]error  // optional: force Promote to fail for a given dataset
 }
 
 func newFakeZFS(existing ...string) *fakeZFS {
@@ -39,6 +43,8 @@ func newFakeZFS(existing ...string) *fakeZFS {
 		existing:    map[string]bool{},
 		props:       map[string]map[string]string{},
 		createdZvol: map[string]int64{},
+		origin:      map[string]string{},
+		promoteErr:  map[string]error{},
 	}
 	for _, e := range existing {
 		f.existing[e] = true
@@ -90,6 +96,38 @@ func (f *fakeZFS) Clone(_ context.Context, snapshot, dest string, props map[stri
 	f.lastCloneProps = props
 	f.existing[dest] = true
 	f.store(dest, props)
+	f.origin[dest] = snapshot
+	return nil
+}
+
+// Promote is a simplified model of `zfs promote` (real semantics: D0/D12/D13 in
+// snapshot-lifecycle-redesign.md). It clears dest's origin and, mirroring real
+// ZFS's "move any clone references" behaviour (D12), reparents any *other*
+// tracked dataset whose origin was exactly the same snapshot onto the newly
+// relocated one instead. A no-op (recorded, but no state change) if dataset
+// has no origin, mirroring the real CLI.Promote's early-return.
+func (f *fakeZFS) Promote(_ context.Context, dataset string) error {
+	if err := f.promoteErr[dataset]; err != nil {
+		f.promoted = append(f.promoted, dataset)
+		return err
+	}
+	origin, ok := f.origin[dataset]
+	if !ok || origin == "" {
+		return nil // already independent; real CLI.Promote never calls `zfs promote` here either
+	}
+	f.promoted = append(f.promoted, dataset)
+	at := strings.Index(origin, "@")
+	if at < 0 {
+		return fmt.Errorf("origin %q is not a snapshot", origin)
+	}
+	suffix := origin[at:]
+	relocated := dataset + suffix
+	delete(f.origin, dataset)
+	for other, o := range f.origin {
+		if o == origin {
+			f.origin[other] = relocated
+		}
+	}
 	return nil
 }
 
@@ -99,6 +137,12 @@ func (f *fakeZFS) Get(_ context.Context, name, property string) (string, error) 
 	}
 	if property == "type" {
 		return "filesystem", nil
+	}
+	if property == "origin" {
+		if o := f.origin[name]; o != "" {
+			return o, nil
+		}
+		return "-", nil
 	}
 	if m := f.props[name]; m != nil {
 		return m[property], nil
@@ -634,3 +678,250 @@ func TestZfsDatasetReconcile_DeleteDestroysAndReleases(t *testing.T) {
 		t.Fatalf("expected volume to be removed after finalizer release")
 	}
 }
+
+// TestZfsDatasetReconcile_DeleteBlocksOnPendingSnapshot verifies D3: a volume
+// with an in-flight (not yet Ready) dependent snapshot must not be destroyed.
+func TestZfsDatasetReconcile_DeleteBlocksOnPendingSnapshot(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	snap := &storagev1alpha1.ZfsSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
+		Spec: storagev1alpha1.ZfsSnapshotSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "csi-snap-x",
+			SourceVolume: "pvc-1", Mode: storagev1alpha1.SnapshotModeStandalone,
+		},
+		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhasePending},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol, snap).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsSnapshot{}).
+		Build()
+
+	z := newFakeZFS("tank/k8s/pvc-1")
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}})
+	if err == nil {
+		t.Fatal("expected reconcile to block/error while a dependent snapshot is still in-flight")
+	}
+	if len(z.destroyed) != 0 {
+		t.Fatalf("volume should not be destroyed while a dependent snapshot is in-flight, got %v", z.destroyed)
+	}
+}
+
+// TestZfsDatasetReconcile_DeleteBlocksOnIntegratedModeSnapshot verifies §3.2:
+// an integrated-mode dependent has no promote mechanism, so DeleteVolume must
+// keep blocking (requeuing) until it's gone, exactly like before this redesign.
+func TestZfsDatasetReconcile_DeleteBlocksOnIntegratedModeSnapshot(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	snap := &storagev1alpha1.ZfsSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
+		Spec: storagev1alpha1.ZfsSnapshotSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "snap-1",
+			SourceVolume: "pvc-1", Mode: storagev1alpha1.SnapshotModeIntegrated,
+		},
+		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol, snap).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsSnapshot{}).
+		Build()
+
+	z := newFakeZFS("tank/k8s/pvc-1")
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}})
+	if err == nil {
+		t.Fatal("expected reconcile to block/error while a live integrated-mode snapshot exists")
+	}
+	if len(z.destroyed) != 0 {
+		t.Fatalf("volume should not be destroyed while an integrated-mode dependent exists, got %v", z.destroyed)
+	}
+}
+
+// TestZfsDatasetReconcile_DeletePromotesStandaloneBackingCloneAndSucceeds
+// verifies D0/D3/D11: a Ready standalone-mode dependent's backing clone is
+// promoted away (never blocked on), after which the source volume's own
+// (non-recursive) destroy succeeds.
+func TestZfsDatasetReconcile_DeletePromotesStandaloneBackingCloneAndSucceeds(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	snap := &storagev1alpha1.ZfsSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
+		Spec: storagev1alpha1.ZfsSnapshotSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "csi-snap-x",
+			SourceVolume: "pvc-1", Mode: storagev1alpha1.SnapshotModeStandalone,
+		},
+		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
+	}
+	backing := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-x"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/csi-snap-x", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/pvc-1@csi-snap-x"},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol, snap, backing).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsSnapshot{}).
+		Build()
+
+	z := newFakeZFS("tank/k8s/pvc-1", "tank/k8s/csi-snap-x")
+	z.origin["tank/k8s/csi-snap-x"] = "tank/k8s/pvc-1@csi-snap-x"
+
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if len(z.promoted) != 1 || z.promoted[0] != "tank/k8s/csi-snap-x" {
+		t.Fatalf("expected backing clone promoted, got %v", z.promoted)
+	}
+	if len(z.destroyed) != 1 || z.destroyed[0] != "tank/k8s/pvc-1" {
+		t.Fatalf("expected source volume destroyed, got %v", z.destroyed)
+	}
+}
+
+// TestZfsDatasetReconcile_DeletePromotesDirectCloneDependents verifies D7/D9:
+// a direct PVC-to-PVC clone (ADR-0009, no VolumeSnapshot involved) is always
+// promoted away unconditionally before the source is destroyed.
+func TestZfsDatasetReconcile_DeletePromotesDirectCloneDependents(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-src", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	clone := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-clone"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-clone", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Source: &storagev1alpha1.DatasetSource{Volume: "k8s/pvc-src"},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol, clone).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
+		Build()
+
+	z := newFakeZFS("tank/k8s/pvc-src", "tank/k8s/pvc-clone")
+	z.origin["tank/k8s/pvc-clone"] = "tank/k8s/pvc-src@clone-" + cloneSnapshotSuffix("pvc-clone")
+
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-src"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(z.promoted) != 1 || z.promoted[0] != "tank/k8s/pvc-clone" {
+		t.Fatalf("expected direct clone promoted, got %v", z.promoted)
+	}
+	if len(z.destroyed) != 1 || z.destroyed[0] != "tank/k8s/pvc-src" {
+		t.Fatalf("expected source destroyed, got %v", z.destroyed)
+	}
+}
+
+// TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents verifies
+// D12/D15's generalized dependent tracking: deleting a standalone-mode backing
+// clone with two simultaneous restored-PVC dependents (each tracked via its
+// own restored-by.* finalizer) promotes both away and still succeeds,
+// regardless of real ZFS's sibling-clone-reparenting behaviour when one is
+// promoted before the other (§2.9).
+func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	isController, blockOwnerDeletion := true, true
+	backing := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "csi-snap-x",
+			Finalizers: []string{
+				zfsDatasetFinalizer,
+				restoredByFinalizer("pvc-r1"),
+				restoredByFinalizer("pvc-r2"),
+			},
+			DeletionTimestamp: &now,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         storagev1alpha1.GroupVersion.String(),
+				Kind:               "ZfsSnapshot",
+				Name:               "snap-1",
+				Controller:         &isController,
+				BlockOwnerDeletion: &blockOwnerDeletion,
+			}},
+		},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/csi-snap-x", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/pvc-src@csi-snap-x"},
+		},
+	}
+	snapOwner := &storagev1alpha1.ZfsSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
+		Spec: storagev1alpha1.ZfsSnapshotSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
+			SourceVolume: "pvc-src", Mode: storagev1alpha1.SnapshotModeStandalone,
+		},
+	}
+	r1 := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-r1"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-r1", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-x@restore-source"},
+		},
+	}
+	r2 := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-r2"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-r2", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-x@restore-source"},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), backing, snapOwner, r1, r2).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
+		Build()
+
+	z := newFakeZFS("tank/k8s/csi-snap-x", "tank/k8s/pvc-r1", "tank/k8s/pvc-r2")
+	z.origin["tank/k8s/pvc-r1"] = "tank/k8s/csi-snap-x@restore-source"
+	z.origin["tank/k8s/pvc-r2"] = "tank/k8s/csi-snap-x@restore-source"
+
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-x"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if len(z.promoted) != 2 {
+		t.Fatalf("expected both restored dependents promoted exactly once, got %v", z.promoted)
+	}
+	if o := z.origin["tank/k8s/pvc-r1"]; o != "" {
+		t.Errorf("pvc-r1 origin = %q, want cleared (fully independent)", o)
+	}
+	if o := z.origin["tank/k8s/pvc-r2"]; o != "" {
+		t.Errorf("pvc-r2 origin = %q, want cleared (fully independent)", o)
+	}
+	if len(z.destroyed) != 1 || z.destroyed[0] != "tank/k8s/csi-snap-x" {
+		t.Fatalf("expected backing clone destroyed, got %v", z.destroyed)
+	}
+
+	// pvc-r1/pvc-r2 remain untouched, independent objects — only the backing
+	// clone (and its own tracking finalizers) were affected.
+	for _, name := range []string{"pvc-r1", "pvc-r2"} {
+		var got storagev1alpha1.ZfsDataset
+		if err := c.Get(context.Background(), client.ObjectKey{Name: name}, &got); err != nil {
+			t.Errorf("get %q: %v", name, err)
+		}
+	}
+}
+

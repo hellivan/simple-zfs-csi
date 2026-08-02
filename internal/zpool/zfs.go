@@ -53,6 +53,14 @@ type ZFS interface {
 	// applying optional settable properties. Idempotent: an already-existing dest
 	// is not an error.
 	Clone(ctx context.Context, snapshot, dest string, props map[string]string) error
+	// Promote reverses a clone's parent/child relationship with its origin
+	// snapshot, relocating the shared snapshot history onto dataset instead of
+	// the (former) origin (see snapshot-lifecycle-redesign.md, D0). Idempotent:
+	// a no-op if dataset has no origin (already independent). Verifies progress
+	// by comparing origin before/after each call and retries (bounded) if
+	// unchanged, since a single call is not always sufficient for a
+	// clone-of-clone chain (D13, confirmed upstream defect openzfs/zfs#15587).
+	Promote(ctx context.Context, dataset string) error
 	// Destroy removes a dataset/zvol. It is idempotent: destroying a
 	// non-existent object is not an error. recursive also destroys children.
 	Destroy(ctx context.Context, name string, recursive bool) error
@@ -231,6 +239,60 @@ func (z *CLI) Get(ctx context.Context, name, property string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// promoteMaxAttempts bounds Promote's verify-and-retry loop (D13). A confirmed
+// upstream defect (openzfs/zfs#15587) means a single `zfs promote` call is not
+// always sufficient for a dataset that is itself part of a clone-of-clone
+// chain; bemgr (a real downstream project) works around this the same way,
+// capped at 100 attempts. 20 is used here since each attempt is a cheap,
+// idempotent metadata operation and a real fix should converge in far fewer.
+const promoteMaxAttempts = 20
+
+// isOriginEmpty reports whether a `zfs get origin` value means "no origin"
+// (never a clone, or already fully promoted/independent).
+func isOriginEmpty(origin string) bool {
+	origin = strings.TrimSpace(origin)
+	return origin == "" || origin == "-"
+}
+
+// Promote reverses dataset's parent/child relationship with its origin
+// snapshot via `zfs promote`, so dataset owns the shared snapshot history
+// instead of depending on it (see ../../docs/snapshot-lifecycle-redesign.md,
+// D0). Idempotent: a no-op if dataset already has no origin.
+//
+// D13: verifies progress rather than assuming one call is sufficient — after
+// each `zfs promote`, it re-reads origin and compares against the value
+// before that call. Any change (including to a different non-empty value,
+// which is normal lineage bookkeeping in a multi-hop clone-of-clone chain, not
+// a sign of failure) means the call made progress and Promote returns
+// success. Only a value that stays completely unchanged across the full retry
+// budget is a hard error.
+func (z *CLI) Promote(ctx context.Context, dataset string) error {
+	if dataset == "" {
+		return fmt.Errorf("dataset name is empty")
+	}
+	before, err := z.Get(ctx, dataset, "origin")
+	if err != nil {
+		return err
+	}
+	if isOriginEmpty(before) {
+		return nil
+	}
+	for attempt := 1; attempt <= promoteMaxAttempts; attempt++ {
+		if _, err := z.run(ctx, "promote", dataset); err != nil {
+			return fmt.Errorf("zfs promote %s (attempt %d/%d): %w", dataset, attempt, promoteMaxAttempts, err)
+		}
+		after, err := z.Get(ctx, dataset, "origin")
+		if err != nil {
+			return err
+		}
+		if after != before {
+			return nil
+		}
+		before = after
+	}
+	return fmt.Errorf("zfs promote %s: origin did not change after %d attempts", dataset, promoteMaxAttempts)
 }
 
 // SetProperty sets a single ZFS property on an existing dataset/zvol.

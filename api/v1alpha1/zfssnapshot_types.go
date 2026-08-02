@@ -17,6 +17,25 @@ const (
 	SnapshotPhaseError ZfsSnapshotPhase = "Error"
 )
 
+// ZfsSnapshotMode selects the ZFS-level mechanism CreateSnapshot uses to take
+// (and, later, tear down) a snapshot. See docs/snapshot-lifecycle-redesign.md,
+// D8/D14.
+// +kubebuilder:validation:Enum=standalone;integrated
+type ZfsSnapshotMode string
+
+const (
+	// SnapshotModeStandalone takes a raw ZFS snapshot and immediately provisions
+	// an owned backing-clone ZfsDataset from it (D15), so the snapshot is fully
+	// independent of its source volume: DeleteVolume promotes it away (zfs
+	// promote, D0) instead of blocking. This is the Ceph-style, new default.
+	SnapshotModeStandalone ZfsSnapshotMode = "standalone"
+	// SnapshotModeIntegrated takes a plain ZFS snapshot only — today's original,
+	// pre-redesign behaviour. Cheaper (no extra clone dataset), but DeleteVolume
+	// blocks (requeues) while any dependent snapshot in this mode still exists,
+	// since there is no promote mechanism to fall back on.
+	SnapshotModeIntegrated ZfsSnapshotMode = "integrated"
+)
+
 // ZfsSnapshotSpec is the desired point-in-time snapshot of a source dataset/zvol
 // on the pool identified by PoolGUID. It is a separate lifecycle from ZfsDataset
 // (derive-from-source, read-only, restore/clone) — see design-decisions ADR-0006.
@@ -52,6 +71,15 @@ type ZfsSnapshotSpec struct {
 	// PVC was removed but the snapshot was retained). Immutable once set.
 	// +optional
 	SourceType DatasetType `json:"sourceType,omitempty"`
+
+	// Mode selects standalone (Ceph-style, via zfs promote; new default) or
+	// integrated (today's original, plain-snapshot-only behaviour). Immutable
+	// once set, resolved at CreateSnapshot time from the VolumeSnapshotClass
+	// "mode" parameter with a chart-configured default (D8). Empty is treated as
+	// Integrated for backward compatibility with snapshots created before this
+	// field existed.
+	// +optional
+	Mode ZfsSnapshotMode `json:"mode,omitempty"`
 }
 
 // ZfsSnapshotStatus reports the observed snapshot state on the node.

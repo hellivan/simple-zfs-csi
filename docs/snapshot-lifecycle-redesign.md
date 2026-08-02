@@ -1,11 +1,20 @@
 # ZFS Snapshot/Clone Lifecycle Redesign — Research & Decision Log
 
-**Status: design complete, implementation not yet started.** This document is a complete
-record of the investigation, research, options considered, and final decisions for
-reworking how `ZfsSnapshot`/clone/restore lifecycle interacts with `DeleteVolume` and
-`DeleteSnapshot`. It exists so the work can resume from scratch even with zero prior
-context (e.g. after losing chat history). Once implemented and tested, the final
-decisions here should also be distilled into a proper ADR in
+**Status: core mechanism implemented (2026-08-02), see [ADR-0019](design-decisions.md).**
+D0-D16 (promote-based `DeleteVolume`/`DeleteSnapshot`, standalone/integrated dual mode,
+D12's generalized dependent tracking, D6's cross-prefix rejection) are implemented and
+covered by tests using a fake ZFS double. **Not yet implemented** (tracked as follow-up,
+not silently dropped): task list items 9-10 — `ZfsDataset.Status.FSType` tracking and the
+D10 property/fsType compatibility rejection on clone/restore, which need node-plugin
+(`internal/csi/mount.go`) changes beyond this pass's scope. **Also not yet verified**:
+task list item 8's real-ZFS-pool test for D16's promote-ordering fixpoint loop (the fake
+double models the documented/verified single-pass behavior; the bounded fixpoint is kept
+as defense-in-depth per the D16 errata below, not because it was re-proven necessary here).
+This document is a complete record of the investigation, research, options considered,
+and final decisions for reworking how `ZfsSnapshot`/clone/restore lifecycle interacts with
+`DeleteVolume` and `DeleteSnapshot`. It exists so the work can resume from scratch even
+with zero prior context (e.g. after losing chat history). Once implemented and tested, the
+final decisions here should also be distilled into a proper ADR in
 [design-decisions.md](design-decisions.md) (one ADR, referencing this doc for the full
 rationale) — but *this* document stays as the detailed working record and should be kept
 up to date as implementation proceeds (unlike ADRs, this file is meant to be edited).

@@ -160,3 +160,88 @@ func TestList_ParsesTabSeparated(t *testing.T) {
 		t.Errorf("args = %v, want %v", f.gotArgs, wantArgs)
 	}
 }
+
+// promoteRunner simulates `zfs get origin`/`zfs promote` against a single
+// dataset whose origin can be scripted to change on a chosen promote call
+// (D13: a single call is not always immediately sufficient).
+type promoteRunner struct {
+	origin        string
+	promoteCalls  int
+	getCalls      int
+	changeOnCall  int // origin changes to changedTo on this 1-indexed promote call; 0 = never
+	changedTo     string
+	promoteErrOn  int // if set, the promote call at this index returns an error
+}
+
+func (p *promoteRunner) run(_ context.Context, _ string, args ...string) (string, error) {
+	if args[0] == "promote" {
+		p.promoteCalls++
+		if p.promoteErrOn != 0 && p.promoteCalls == p.promoteErrOn {
+			return "", errors.New("simulated promote failure")
+		}
+		if p.changeOnCall != 0 && p.promoteCalls == p.changeOnCall {
+			p.origin = p.changedTo
+		}
+		return "", nil
+	}
+	p.getCalls++
+	return p.origin, nil
+}
+
+func TestPromote_NoOriginIsNoop(t *testing.T) {
+	p := &promoteRunner{origin: "-"}
+	z := &CLI{Run: p.run}
+	if err := z.Promote(context.Background(), "tank/ds"); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if p.promoteCalls != 0 {
+		t.Errorf("promote calls = %d, want 0 (already independent)", p.promoteCalls)
+	}
+}
+
+func TestPromote_SingleCallSufficient(t *testing.T) {
+	p := &promoteRunner{origin: "tank/src@snap-1", changeOnCall: 1, changedTo: "-"}
+	z := &CLI{Run: p.run}
+	if err := z.Promote(context.Background(), "tank/clone"); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if p.promoteCalls != 1 {
+		t.Errorf("promote calls = %d, want 1", p.promoteCalls)
+	}
+}
+
+func TestPromote_RetriesUntilOriginChanges(t *testing.T) {
+	// D13: confirmed upstream defect — a single call can leave a dataset
+	// involved in a clone-of-clone chain still reporting a non-empty origin.
+	// Promote must keep calling until the value actually changes (even to a
+	// different non-empty value — normal multi-hop lineage bookkeeping, not a
+	// failure signal).
+	p := &promoteRunner{origin: "tank/src@snap-1", changeOnCall: 3, changedTo: "tank/mid@snap-1"}
+	z := &CLI{Run: p.run}
+	if err := z.Promote(context.Background(), "tank/clone"); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if p.promoteCalls != 3 {
+		t.Errorf("promote calls = %d, want 3", p.promoteCalls)
+	}
+}
+
+func TestPromote_HardErrorAfterMaxAttempts(t *testing.T) {
+	p := &promoteRunner{origin: "tank/src@snap-1"} // origin never changes
+	z := &CLI{Run: p.run}
+	if err := z.Promote(context.Background(), "tank/clone"); err == nil {
+		t.Fatal("expected a hard error once the retry budget is exhausted")
+	}
+	if p.promoteCalls != promoteMaxAttempts {
+		t.Errorf("promote calls = %d, want %d", p.promoteCalls, promoteMaxAttempts)
+	}
+}
+
+func TestPromote_PropagatesCommandError(t *testing.T) {
+	p := &promoteRunner{origin: "tank/src@snap-1", promoteErrOn: 1}
+	z := &CLI{Run: p.run}
+	if err := z.Promote(context.Background(), "tank/clone"); err == nil {
+		t.Fatal("expected the underlying zfs promote error to propagate")
+	}
+}
+

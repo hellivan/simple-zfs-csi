@@ -2,6 +2,8 @@ package csi
 
 import (
 	"context"
+	"path"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -11,6 +13,25 @@ import (
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
+
+// restoreSourceSnapshotName mirrors internal/controller's constant of the same
+// name (D5, snapshot-lifecycle-redesign.md): the fixed, CSI-invisible
+// self-snapshot every standalone-mode backing-clone ZfsDataset carries.
+// Restores always clone from this, never from the raw origin snapshot.
+const restoreSourceSnapshotName = "restore-source"
+
+// normalizedDatasetPrefix normalises a StorageClass datasetPrefix for
+// comparison against path.Dir() of a full dataset path: path.Dir() of a
+// single-segment (no-prefix) path returns ".", so an empty prefix must
+// normalise to the same value for the D6 cross-prefix check to compare
+// correctly.
+func normalizedDatasetPrefix(prefix string) string {
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" {
+		return "."
+	}
+	return prefix
+}
 
 // resolveContentSource turns a CSI VolumeContentSource (snapshot or volume) into
 // a ZfsDataset clone source. Clones are same-pool and same-type by ZFS
@@ -42,7 +63,33 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		if srcType := c.snapshotSourceType(ctx, snap); srcType != "" && srcType != rp.DatasetType {
 			return nil, status.Errorf(codes.InvalidArgument, "cannot restore a %s snapshot into a %s (protocol %s) volume", srcType, rp.DatasetType, rp.Protocol)
 		}
-		return &storagev1alpha1.DatasetSource{Snapshot: snap.Spec.Dataset + "@" + snap.Spec.SnapshotName}, nil
+
+		if effectiveMode(snap.Spec) != storagev1alpha1.SnapshotModeStandalone {
+			// integrated mode: unchanged, clone directly from the raw snapshot.
+			return &storagev1alpha1.DatasetSource{Snapshot: snap.Spec.Dataset + "@" + snap.Spec.SnapshotName}, nil
+		}
+
+		// standalone mode (D0/D15): restores always clone from the backing
+		// clone's own "@restore-source" self-snapshot, never from the raw
+		// snapshot directly, so restoring keeps working whether the source
+		// volume is still alive, deleted-but-not-yet-promoted, or promoted away.
+		backing := &storagev1alpha1.ZfsDataset{}
+		if err := c.Client.Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing); err != nil {
+			return nil, status.Errorf(codes.Internal, "get backing clone %q for snapshot %q: %v", snap.Spec.SnapshotName, id, err)
+		}
+		// D6: restoring into a different datasetPrefix than the source would
+		// leave the new volume's clone-origin outside its own replicated subtree
+		// (zfs send -R backup compatibility, §2.5) — reject outright rather than
+		// let that footgun exist silently.
+		if path.Dir(strings.Trim(backing.Spec.Dataset, "/")) != normalizedDatasetPrefix(rp.DatasetPrefix) {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"cross-prefix restore unsupported: snapshot %q's data lives under prefix %q, target prefix is %q",
+				id, path.Dir(strings.Trim(backing.Spec.Dataset, "/")), normalizedDatasetPrefix(rp.DatasetPrefix))
+		}
+		if err := c.addRestoredByFinalizer(ctx, backing.Name, req.GetName()); err != nil {
+			return nil, err
+		}
+		return &storagev1alpha1.DatasetSource{Snapshot: backing.Spec.Dataset + "@" + restoreSourceSnapshotName}, nil
 
 	case *csi.VolumeContentSource_Volume:
 		id := cs.GetVolume().GetVolumeId()
