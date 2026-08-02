@@ -283,3 +283,76 @@ func TestHostMounterUnmount(t *testing.T) {
 		}
 	})
 }
+
+// TestHostMounterFormatAndMount covers D10 (docs/snapshot-lifecycle-redesign.md
+// §2.7): a device that already carries a filesystem must be mounted (and its
+// type reported back) using its *actual* on-disk type, never blindly whatever
+// fsType was requested — otherwise a cloned/restored zvol formatted with a
+// different fsType than the target StorageClass requests would fail to mount
+// with a bad-superblock error instead of just using what's really there.
+func TestHostMounterFormatAndMount(t *testing.T) {
+	t.Run("formats an empty device with the requested fsType", func(t *testing.T) {
+		var calls []string
+		m := &hostMounter{
+			run: func(ctx context.Context, name string, args ...string) (string, error) {
+				calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+				if name == "blkid" {
+					return "", errors.New("exit status 2") // no signature -> empty
+				}
+				return "", nil
+			},
+		}
+		got, err := m.FormatAndMount("/dev/nvme1n1", "/mnt/x", "ext4", nil)
+		if err != nil {
+			t.Fatalf("FormatAndMount() = %v, want nil", err)
+		}
+		if got != "ext4" {
+			t.Errorf("effective fsType = %q, want ext4", got)
+		}
+		want := []string{
+			"blkid -o value -s TYPE /dev/nvme1n1",
+			"mkfs.ext4 -F /dev/nvme1n1",
+			"mount -t ext4 /dev/nvme1n1 /mnt/x",
+		}
+		if len(calls) != len(want) {
+			t.Fatalf("calls = %v, want %v", calls, want)
+		}
+		for i := range want {
+			if calls[i] != want[i] {
+				t.Errorf("calls[%d] = %q, want %q", i, calls[i], want[i])
+			}
+		}
+	})
+
+	t.Run("already-formatted device mounts and reports its actual fsType, not the requested one", func(t *testing.T) {
+		var calls []string
+		m := &hostMounter{
+			run: func(ctx context.Context, name string, args ...string) (string, error) {
+				calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+				if name == "blkid" {
+					return "xfs\n", nil
+				}
+				return "", nil
+			},
+		}
+		got, err := m.FormatAndMount("/dev/nvme1n1", "/mnt/x", "ext4", nil)
+		if err != nil {
+			t.Fatalf("FormatAndMount() = %v, want nil", err)
+		}
+		if got != "xfs" {
+			t.Errorf("effective fsType = %q, want xfs (the device's actual on-disk type)", got)
+		}
+		want := []string{
+			"blkid -o value -s TYPE /dev/nvme1n1",
+			"mount -t xfs /dev/nvme1n1 /mnt/x",
+		}
+		if len(calls) != len(want) {
+			t.Fatalf("calls = %v, want %v (no mkfs, and mount uses xfs not ext4)", calls, want)
+		}
+		for i := range want {
+			if calls[i] != want[i] {
+				t.Errorf("calls[%d] = %q, want %q", i, calls[i], want[i])
+			}
+		}
+	})
+}

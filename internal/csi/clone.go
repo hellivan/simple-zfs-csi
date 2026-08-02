@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -63,6 +64,9 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		if srcType := c.snapshotSourceType(ctx, snap); srcType != "" && srcType != rp.DatasetType {
 			return nil, status.Errorf(codes.InvalidArgument, "cannot restore a %s snapshot into a %s (protocol %s) volume", srcType, rp.DatasetType, rp.Protocol)
 		}
+		if err := c.checkCloneCompatibility(ctx, rp, snap.Spec.SourceVolume, req.GetVolumeCapabilities()); err != nil {
+			return nil, err
+		}
 
 		if effectiveMode(snap.Spec) != storagev1alpha1.SnapshotModeStandalone {
 			// integrated mode: unchanged, clone directly from the raw snapshot.
@@ -109,6 +113,9 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		if src.Spec.Type != rp.DatasetType {
 			return nil, status.Errorf(codes.InvalidArgument, "cannot clone a %s volume into a %s (protocol %s) volume", src.Spec.Type, rp.DatasetType, rp.Protocol)
 		}
+		if err := checkCloneCompatibility(rp, src, requestedFsType(req.GetVolumeCapabilities())); err != nil {
+			return nil, err
+		}
 		return &storagev1alpha1.DatasetSource{Volume: src.Spec.Dataset}, nil
 
 	default:
@@ -140,4 +147,93 @@ func (c *ControllerServer) sourceDatasetType(ctx context.Context, name string) s
 		return ""
 	}
 	return ds.Spec.Type
+}
+
+// requestedFsType returns the fsType carried by the first Mount capability, or
+// "" if none is present (e.g. a Block volumeMode request).
+func requestedFsType(caps []*csi.VolumeCapability) string {
+	for _, c := range caps {
+		if m := c.GetMount(); m != nil && m.GetFsType() != "" {
+			return m.GetFsType()
+		}
+	}
+	return ""
+}
+
+// volblocksizeBytes parses a ZFS volblocksize string (e.g. "16k", "8192") into
+// bytes, mirroring internal/controller/zfsdataset_controller.go's volblockBytes
+// so two independently-formatted values (e.g. "16k" vs "16384") compare
+// correctly. Defaults to the modern OpenZFS zvol default (16 KiB) when
+// empty/unparseable, matching the same convention.
+func volblocksizeBytes(s string) int64 {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return 16384
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 'k':
+		mult, s = 1024, s[:len(s)-1]
+	case 'm':
+		mult, s = 1024*1024, s[:len(s)-1]
+	case 'g':
+		mult, s = 1024*1024*1024, s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n <= 0 {
+		return 16384
+	}
+	return n * mult
+}
+
+// checkCloneCompatibility implements D10 (docs/snapshot-lifecycle-redesign.md
+// §2.7): rejects a clone/restore whose resolved volblocksize, ZFS property
+// overrides, or requested fsType would silently diverge from the source's
+// actual structure. Kubernetes explicitly permits cross-StorageClass
+// cloning/restore with no compatibility checking of its own, so this is
+// entirely the driver's responsibility. src may be nil (source deleted): the
+// checks are then skipped entirely (nothing to compare against, not treated as
+// a mismatch) — the same "absence means unconstrained" convention as
+// Status.FSType itself.
+func checkCloneCompatibility(rp *ResolvedParams, src *storagev1alpha1.ZfsDataset, requestedFS string) error {
+	if src == nil {
+		return nil
+	}
+	if rp.DatasetType == storagev1alpha1.DatasetTypeVolume && src.Spec.Volume != nil {
+		if want, have := volblocksizeBytes(rp.Volblocksize), volblocksizeBytes(src.Spec.Volume.Volblocksize); want != have {
+			return status.Errorf(codes.InvalidArgument,
+				"volblocksize mismatch: target resolves to %d bytes, source %q is %d bytes (a clone/restore cannot change volblocksize)",
+				want, src.Name, have)
+		}
+		if requestedFS != "" && src.Status.FSType != "" && requestedFS != src.Status.FSType {
+			return status.Errorf(codes.InvalidArgument,
+				"fsType mismatch: requested %q, source %q was formatted as %q (a clone/restore cannot change the on-disk filesystem)",
+				requestedFS, src.Name, src.Status.FSType)
+		}
+	}
+	for k, v := range rp.Properties {
+		if have, ok := src.Spec.Properties[k]; ok && have != v {
+			return status.Errorf(codes.InvalidArgument,
+				"property %q mismatch: target requests %q, source %q has %q (a clone/restore cannot change structural ZFS properties)",
+				k, v, src.Name, have)
+		}
+	}
+	return nil
+}
+
+// checkCloneCompatibility (snapshot-restore variant) looks up the true source
+// volume live (it may have been deleted, e.g. only the snapshot was retained)
+// and delegates to the Spec-to-Spec check above. Deliberately does not use the
+// standalone-mode backing clone as the comparison source: a backing clone is
+// never mounted (canmount=off/volmode=none), so its own Status.FSType would
+// always be empty regardless of what the real source was formatted as.
+func (c *ControllerServer) checkCloneCompatibility(ctx context.Context, rp *ResolvedParams, sourceVolumeID string, caps []*csi.VolumeCapability) error {
+	if sourceVolumeID == "" {
+		return nil
+	}
+	src := &storagev1alpha1.ZfsDataset{}
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: sourceVolumeID}, src); err != nil {
+		return nil // source gone or unreachable: nothing to compare against
+	}
+	return checkCloneCompatibility(rp, src, requestedFsType(caps))
 }

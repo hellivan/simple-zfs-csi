@@ -317,7 +317,9 @@ subjects:
 {{- if .Values.csiNode.enabled }}
 ---
 # CSI node plugin: read-only access to resolve routing (ZfsPool.status) and the
-# NVMe-oF subsystem NQN (NetworkExport.status). It writes no CRDs.
+# NVMe-oF subsystem NQN (NetworkExport.status). It also patches
+# ZfsDataset.status.fsType once, the first time it formats a zvol (D10,
+# docs/snapshot-lifecycle-redesign.md) — otherwise it writes no CRDs.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -329,6 +331,12 @@ rules:
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfspools", "networkexports"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfsdatasets"]
+    verbs: ["get"]
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfsdatasets/status"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

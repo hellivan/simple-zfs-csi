@@ -7,6 +7,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -56,6 +57,33 @@ func TestCreateVolume_RestoreFromSnapshot(t *testing.T) {
 	}
 }
 
+// TestCreateVolume_RestorePropertyMismatchRejected verifies D10 on the
+// restore-from-snapshot path: the source volume is looked up live via
+// ZfsSnapshot.Spec.SourceVolume (works for both standalone and integrated
+// mode, since a standalone-mode backing clone is never mounted and so never
+// has a useful Status.FSType of its own).
+func TestCreateVolume_RestorePropertyMismatchRejected(t *testing.T) {
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-src", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Properties: map[string]string{"compression": "lz4"},
+		},
+	}
+	cl := newTestClient(t, src, snapshotObj("snap-1", "999", "k8s/pvc-src", "pvc-src"))
+	cs := newController(cl)
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:                "pvc-restore",
+		VolumeCapabilities:  mountCaps(),
+		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
+		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nfs", "property.compression": "gzip"},
+		VolumeContentSource: snapshotSource("snap-1"),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for property mismatch, got %v", err)
+	}
+}
+
 func TestCreateVolume_CloneFromVolume(t *testing.T) {
 	cl := newTestClient(t, sourceDataset("pvc-src"))
 	cs := newController(cl)
@@ -77,6 +105,90 @@ func TestCreateVolume_CloneFromVolume(t *testing.T) {
 	}
 	if vol.Spec.Source == nil || vol.Spec.Source.Volume != "k8s/pvc-src" {
 		t.Errorf("clone source = %+v, want volume k8s/pvc-src", vol.Spec.Source)
+	}
+}
+
+// TestCreateVolume_CloneVolblocksizeMismatchRejected verifies D10
+// (docs/snapshot-lifecycle-redesign.md §2.7): a clone target resolving to a
+// different volblocksize than the source zvol actually has is rejected — ZFS
+// itself would reject this at the `zfs clone` layer, but only with an opaque
+// error; the driver should reject it earlier with a clear one.
+func TestCreateVolume_CloneVolblocksizeMismatchRejected(t *testing.T) {
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-src", Type: storagev1alpha1.DatasetTypeVolume,
+			Volume: &storagev1alpha1.VolumeConfig{Size: resource.MustParse("1Gi"), Volblocksize: "8k"},
+		},
+	}
+	cl := newTestClient(t, src)
+	cs := newController(cl)
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:                "pvc-clone",
+		VolumeCapabilities:  blockCaps(),
+		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
+		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nvmeof", "volblocksize": "16k"},
+		VolumeContentSource: volumeSource("pvc-src"),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for volblocksize mismatch, got %v", err)
+	}
+}
+
+// TestCreateVolume_ClonePropertyMismatchRejected verifies D10: an explicit
+// property.* override that differs from what the source actually has is
+// rejected rather than silently applied as a partial, confusing override.
+func TestCreateVolume_ClonePropertyMismatchRejected(t *testing.T) {
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-src", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Properties: map[string]string{"compression": "lz4"},
+		},
+	}
+	cl := newTestClient(t, src)
+	cs := newController(cl)
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:                "pvc-clone",
+		VolumeCapabilities:  mountCaps(),
+		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
+		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nfs", "property.compression": "gzip"},
+		VolumeContentSource: volumeSource("pvc-src"),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for property mismatch, got %v", err)
+	}
+}
+
+// TestCreateVolume_CloneFsTypeMismatchRejected verifies D10: a clone/restore
+// requesting a different fsType than the source zvol was actually formatted
+// with (ZfsDataset.Status.FSType, set once by the node plugin) is rejected —
+// otherwise NodeStageVolume would fail later with an opaque bad-superblock
+// mount error instead of a clear CreateVolume-time rejection.
+func TestCreateVolume_CloneFsTypeMismatchRejected(t *testing.T) {
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-src", Type: storagev1alpha1.DatasetTypeVolume,
+			Volume: &storagev1alpha1.VolumeConfig{Size: resource.MustParse("1Gi")},
+		},
+		Status: storagev1alpha1.ZfsDatasetStatus{FSType: "xfs"},
+	}
+	cl := newTestClient(t, src)
+	cs := newController(cl)
+	caps := []*csi.VolumeCapability{{
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}},
+		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+	}}
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:                "pvc-clone",
+		VolumeCapabilities:  caps,
+		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
+		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nvmeof"},
+		VolumeContentSource: volumeSource("pvc-src"),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for fsType mismatch, got %v", err)
 	}
 }
 

@@ -153,6 +153,19 @@ type ZfsDatasetStatus struct {
 	// +optional
 	Path string `json:"path,omitempty"`
 
+	// FSType is the filesystem type actually formatted onto a volume-type
+	// (zvol) dataset the first time the node plugin mounted it, e.g. "ext4".
+	// Set once and never changed afterwards, even if a later NodePublishVolume
+	// requests a different fsType (mount.go always uses the on-disk type once
+	// one exists). Empty means the volume has never been formatted/mounted yet
+	// (nothing to conflict with). Used by CreateVolume's clone/restore
+	// compatibility check (D10, docs/snapshot-lifecycle-redesign.md) to reject
+	// a restore/clone that would silently change the on-disk filesystem type.
+	// Always empty for filesystem-type datasets (NFS shares have no node-local
+	// fsType concept).
+	// +optional
+	FSType string `json:"fsType,omitempty"`
+
 	// ObservedGeneration is the spec generation last reconciled.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

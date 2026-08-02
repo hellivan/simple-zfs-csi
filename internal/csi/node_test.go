@@ -32,6 +32,12 @@ type fakeMounter struct {
 	removed        []string
 	rescanned      []string
 	resized        map[string]string // device -> volumePath
+	// formattedFS simulates the device's actual on-disk fsType: preset it in a
+	// test to simulate an already-formatted device (FormatAndMount then returns
+	// this value regardless of what's requested, mirroring hostMounter's real
+	// existing-fs behavior); left empty, FormatAndMount "formats" with whatever
+	// fsType is requested and remembers it for subsequent calls.
+	formattedFS string
 }
 
 func newFakeMounter() *fakeMounter {
@@ -57,10 +63,16 @@ func (f *fakeMounter) MountNFS(source, target string, _ []string) error {
 	f.mounted[target] = true
 	return nil
 }
-func (f *fakeMounter) FormatAndMount(device, target, _ string, _ []string) error {
+func (f *fakeMounter) FormatAndMount(device, target, fsType string, _ []string) (string, error) {
 	f.fsMounts[target] = device
 	f.mounted[target] = true
-	return nil
+	if fsType == "" {
+		fsType = "ext4"
+	}
+	if f.formattedFS == "" {
+		f.formattedFS = fsType
+	}
+	return f.formattedFS, nil
 }
 func (f *fakeMounter) BindMountDevice(device, target string, _ bool) error {
 	f.blockMounts[target] = device
@@ -178,6 +190,60 @@ func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 	}
 	if m.fsMounts["/target/fs"] != "/dev/nvme1n1" {
 		t.Errorf("fs mount device = %q, want /dev/nvme1n1", m.fsMounts["/target/fs"])
+	}
+}
+
+// TestNodePublish_NVMeoF_RecordsFSTypeOnce verifies D10
+// (docs/snapshot-lifecycle-redesign.md): the first NodePublishVolume that
+// formats a zvol records the effective fsType on ZfsDataset.Status.FSType, and
+// a later publish (e.g. after a remount) never overwrites it even if a
+// different fsType happens to be requested — the on-disk type, once set, is
+// immutable.
+func TestNodePublish_NVMeoF_RecordsFSTypeOnce(t *testing.T) {
+	m := newFakeMounter()
+	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"}}
+	export.Status.NQN = "nqn.2025-01.io.simple-zfs-csi:pvc-2"
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-2", Type: storagev1alpha1.DatasetTypeVolume},
+	}
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export, vol)
+
+	if _, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-2",
+		TargetPath:       "/target/fs",
+		VolumeCapability: mountCap(), // requests ext4
+		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-2", CtxProtocol: "nvmeof"},
+	}); err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+
+	var got storagev1alpha1.ZfsDataset
+	if err := ns.Client.Get(context.Background(), client.ObjectKey{Name: "pvc-2"}, &got); err != nil {
+		t.Fatalf("get ZfsDataset: %v", err)
+	}
+	if got.Status.FSType != "ext4" {
+		t.Fatalf("Status.FSType = %q, want ext4", got.Status.FSType)
+	}
+
+	// Simulate an already-formatted device reporting a *different* actual type
+	// (as hostMounter's real detectFS would if the on-disk fs somehow differed) —
+	// a second publish must not overwrite the already-recorded value.
+	m.formattedFS = "xfs"
+	m.mounted["/target/fs2"] = false
+	if _, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-2",
+		TargetPath:       "/target/fs2",
+		VolumeCapability: mountCap(),
+		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-2", CtxProtocol: "nvmeof"},
+	}); err != nil {
+		t.Fatalf("NodePublishVolume (2nd): %v", err)
+	}
+	if err := ns.Client.Get(context.Background(), client.ObjectKey{Name: "pvc-2"}, &got); err != nil {
+		t.Fatalf("get ZfsDataset (2nd): %v", err)
+	}
+	if got.Status.FSType != "ext4" {
+		t.Errorf("Status.FSType changed to %q, want it to stay ext4 (immutable once set)", got.Status.FSType)
 	}
 }
 

@@ -44,8 +44,12 @@ type NodeMounter interface {
 	// options.
 	MountNFS(source, target string, options []string) error
 	// FormatAndMount formats device with fsType if it has no filesystem, then
-	// mounts it at target.
-	FormatAndMount(device, target, fsType string, options []string) error
+	// mounts it at target. If device already carries a filesystem, that
+	// on-disk type is used for the mount (and returned) instead of fsType, so a
+	// mismatched request can never fail with a bad-superblock error. Returns the
+	// filesystem type now on the device (freshly applied, or pre-existing) so
+	// callers can persist it once (ZfsDataset.Status.FSType, D10).
+	FormatAndMount(device, target, fsType string, options []string) (string, error)
 	// BindMountDevice bind-mounts a block device node at target (block volumes).
 	BindMountDevice(device, target string, readOnly bool) error
 	// Unmount unmounts target, ignoring an already-unmounted target.
@@ -184,14 +188,15 @@ func (m *hostMounter) MountNFS(source, target string, options []string) error {
 	return err
 }
 
-func (m *hostMounter) FormatAndMount(device, target, fsType string, options []string) error {
+func (m *hostMounter) FormatAndMount(device, target, fsType string, options []string) (string, error) {
 	if fsType == "" {
 		fsType = "ext4"
 	}
 	existing, err := m.detectFS(device)
 	if err != nil {
-		return err
+		return "", err
 	}
+	effective := fsType
 	if existing == "" {
 		mkfsArgs := []string{}
 		if fsType == "ext4" || fsType == "ext3" {
@@ -202,16 +207,24 @@ func (m *hostMounter) FormatAndMount(device, target, fsType string, options []st
 		}
 		mkfsArgs = append(mkfsArgs, device)
 		if _, err := m.run(context.Background(), "mkfs."+fsType, mkfsArgs...); err != nil {
-			return fmt.Errorf("mkfs.%s %s: %w", fsType, device, err)
+			return "", fmt.Errorf("mkfs.%s %s: %w", fsType, device, err)
 		}
+	} else {
+		// The device already carries a filesystem (e.g. a cloned/restored zvol) —
+		// mount using its actual on-disk type, not blindly whatever fsType was
+		// requested (D10, docs/snapshot-lifecycle-redesign.md §2.7): mounting
+		// with the wrong -t fails with a bad-superblock error.
+		effective = existing
 	}
-	args := []string{"-t", fsType}
+	args := []string{"-t", effective}
 	if len(options) > 0 {
 		args = append(args, "-o", strings.Join(options, ","))
 	}
 	args = append(args, device, target)
-	_, err = m.run(context.Background(), "mount", args...)
-	return err
+	if _, err := m.run(context.Background(), "mount", args...); err != nil {
+		return "", err
+	}
+	return effective, nil
 }
 
 func (m *hostMounter) BindMountDevice(device, target string, readOnly bool) error {

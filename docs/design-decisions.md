@@ -61,9 +61,16 @@ the same replicated subtree for `zfs send -R` backup compatibility.
 
 - Snapshots now genuinely survive their source volume's deletion in `standalone` mode
   (the actual bug motivating this work), with no CO-visible blocking.
-- **Deferred, not implemented in this pass**: `Status.FSType` tracking and the D10
-  property/fsType compatibility rejection on clone/restore (needs `internal/csi/mount.go`
-  node-plugin changes beyond this pass's scope) — see the linked doc's status header.
+- **D10 (property/fsType compatibility on clone/restore) and `Status.FSType` tracking were
+  initially deferred, then implemented in a follow-up pass (2026-08-03)**: `ZfsDataset.Status.FSType`
+  is set once by the node plugin the first time it formats a zvol (`internal/csi/node.go`'s
+  `recordFSType`, best-effort); `internal/csi/mount.go`'s `FormatAndMount` was also fixed to
+  mount using a device's actual on-disk fsType (not blindly the requested one) once it
+  already carries a filesystem, and to report that effective type back. `resolveContentSource`
+  now rejects (`InvalidArgument`) a clone/restore whose resolved `volblocksize`, `property.*`
+  overrides, or requested `fsType` diverge from the source's recorded/actual values, for both
+  content-source paths and both snapshot modes; absent source data (deleted source, or a
+  never-formatted volume) is treated as unconstrained, not as a mismatch.
 - Test coverage uses a fake `ZFS` double (including a `Promote` model of ZFS's real
   sibling-clone reparenting); the D16 promote-ordering fixpoint loop's real-pool edge cases
   are not independently re-verified here, relying instead on the linked doc's own

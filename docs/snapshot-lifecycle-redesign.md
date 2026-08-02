@@ -1,12 +1,11 @@
 # ZFS Snapshot/Clone Lifecycle Redesign — Research & Decision Log
 
-**Status: core mechanism implemented (2026-08-02), see [ADR-0019](design-decisions.md).**
+**Status: implemented (2026-08-03), see [ADR-0019](design-decisions.md).**
 D0-D16 (promote-based `DeleteVolume`/`DeleteSnapshot`, standalone/integrated dual mode,
-D12's generalized dependent tracking, D6's cross-prefix rejection) are implemented and
-covered by tests using a fake ZFS double. **Not yet implemented** (tracked as follow-up,
-not silently dropped): task list items 9-10 — `ZfsDataset.Status.FSType` tracking and the
-D10 property/fsType compatibility rejection on clone/restore, which need node-plugin
-(`internal/csi/mount.go`) changes beyond this pass's scope. **Also not yet verified**:
+D12's generalized dependent tracking, D6's cross-prefix rejection) and D10 (property/fsType
+compatibility rejection on clone/restore, plus `ZfsDataset.Status.FSType` tracking and the
+`internal/csi/mount.go` fix to mount using a device's actual on-disk fsType) are all
+implemented and covered by tests using a fake ZFS/mounter double. **Not yet verified**:
 task list item 8's real-ZFS-pool test for D16's promote-ordering fixpoint loop (the fake
 double models the documented/verified single-pass behavior; the bounded fixpoint is kept
 as defense-in-depth per the D16 errata below, not because it was re-proven necessary here).

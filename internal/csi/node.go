@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
@@ -279,10 +280,39 @@ func (n *NodeServer) publishNVMeoF(ctx context.Context, volumeID string, pool *s
 	if err := n.Mounter.MakeDir(targetPath); err != nil {
 		return status.Errorf(codes.Internal, "create target %q: %v", targetPath, err)
 	}
-	if err := n.Mounter.FormatAndMount(device, targetPath, fsType, mountOptions(flags, readOnly)); err != nil {
+	effectiveFS, err := n.Mounter.FormatAndMount(device, targetPath, fsType, mountOptions(flags, readOnly))
+	if err != nil {
 		return status.Errorf(codes.Internal, "format and mount %q: %v", device, err)
 	}
+	// Best-effort (D10): record the on-disk fsType once, so a later
+	// clone/restore into a different fsType can be rejected instead of
+	// silently producing a bad-superblock mount failure. Never fails the
+	// publish itself — the mount already succeeded.
+	if err := n.recordFSType(ctx, volumeID, effectiveFS); err != nil {
+		n.Log.Error(err, "failed to record fsType on ZfsDataset status", "volume", volumeID, "fsType", effectiveFS)
+	}
 	return nil
+}
+
+// recordFSType sets ZfsDataset.Status.FSType once, the first time a volume-type
+// dataset is formatted/mounted (D10, docs/snapshot-lifecycle-redesign.md). A
+// no-op once already set (immutable) or if fsType is empty.
+func (n *NodeServer) recordFSType(ctx context.Context, volumeID, fsType string) error {
+	if fsType == "" {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		vol := &storagev1alpha1.ZfsDataset{}
+		if err := n.Client.Get(ctx, client.ObjectKey{Name: volumeID}, vol); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if vol.Status.FSType != "" {
+			return nil
+		}
+		patched := vol.DeepCopy()
+		patched.Status.FSType = fsType
+		return n.Client.Status().Patch(ctx, patched, client.MergeFrom(vol))
+	})
 }
 
 // exportNQN returns the effective subsystem NQN for an nvmeof export, preferring
