@@ -285,11 +285,12 @@ func TestHostMounterUnmount(t *testing.T) {
 }
 
 // TestHostMounterFormatAndMount covers D10 (docs/snapshot-lifecycle-redesign.md
-// §2.7): a device that already carries a filesystem must be mounted (and its
-// type reported back) using its *actual* on-disk type, never blindly whatever
-// fsType was requested — otherwise a cloned/restored zvol formatted with a
-// different fsType than the target StorageClass requests would fail to mount
-// with a bad-superblock error instead of just using what's really there.
+// §2.7): a device that already carries a filesystem is mounted using its
+// existing type when it matches what was requested (no redundant mkfs), and
+// FormatAndMount fails loudly — rather than silently substituting the on-disk
+// type — when the two disagree. See the "fails loudly" subtest for why: this
+// matches both upstream k8s.io/mount-utils/ceph-csi behavior and this
+// project's own ADR-0013 "fail loud on misconfiguration" precedent.
 func TestHostMounterFormatAndMount(t *testing.T) {
 	t.Run("formats an empty device with the requested fsType", func(t *testing.T) {
 		var calls []string
@@ -324,7 +325,51 @@ func TestHostMounterFormatAndMount(t *testing.T) {
 		}
 	})
 
-	t.Run("already-formatted device mounts and reports its actual fsType, not the requested one", func(t *testing.T) {
+	t.Run("already-formatted device with matching fsType mounts without mkfs", func(t *testing.T) {
+		var calls []string
+		m := &hostMounter{
+			run: func(ctx context.Context, name string, args ...string) (string, error) {
+				calls = append(calls, strings.Join(append([]string{name}, args...), " "))
+				if name == "blkid" {
+					return "ext4\n", nil
+				}
+				return "", nil
+			},
+		}
+		got, err := m.FormatAndMount("/dev/nvme1n1", "/mnt/x", "ext4", nil)
+		if err != nil {
+			t.Fatalf("FormatAndMount() = %v, want nil", err)
+		}
+		if got != "ext4" {
+			t.Errorf("effective fsType = %q, want ext4", got)
+		}
+		want := []string{
+			"blkid -o value -s TYPE /dev/nvme1n1",
+			"mount -t ext4 /dev/nvme1n1 /mnt/x",
+		}
+		if len(calls) != len(want) {
+			t.Fatalf("calls = %v, want %v (no mkfs)", calls, want)
+		}
+		for i := range want {
+			if calls[i] != want[i] {
+				t.Errorf("calls[%d] = %q, want %q", i, calls[i], want[i])
+			}
+		}
+	})
+
+	// TestHostMounterFormatAndMount/already-formatted device with a different
+	// fsType fails loudly. This matches upstream practice, not a ZFS-specific
+	// choice: k8s.io/mount-utils's own formatAndMountSensitive still attempts
+	// the mount with the *requested* fstype in this situation (tagging the
+	// resulting error FilesystemMismatch) rather than silently substituting
+	// the on-disk type, and ceph-csi's mountVolumeToStagePath does the same
+	// (GetDiskFormat only decides whether to skip mkfs, never overrides the
+	// requested fsType passed to FormatAndMount). Silently substituting would
+	// also contradict this project's own ADR-0013 "fail loud on
+	// misconfiguration" precedent. CreateVolume's D10 check
+	// (ZfsDataset.Status.FSType) is what should prevent this from arising
+	// through this driver's own clone/restore path in the first place.
+	t.Run("already-formatted device with a different fsType fails loudly", func(t *testing.T) {
 		var calls []string
 		m := &hostMounter{
 			run: func(ctx context.Context, name string, args ...string) (string, error) {
@@ -335,24 +380,13 @@ func TestHostMounterFormatAndMount(t *testing.T) {
 				return "", nil
 			},
 		}
-		got, err := m.FormatAndMount("/dev/nvme1n1", "/mnt/x", "ext4", nil)
-		if err != nil {
-			t.Fatalf("FormatAndMount() = %v, want nil", err)
+		_, err := m.FormatAndMount("/dev/nvme1n1", "/mnt/x", "ext4", nil)
+		if err == nil {
+			t.Fatal("FormatAndMount() = nil, want an error (fsType mismatch)")
 		}
-		if got != "xfs" {
-			t.Errorf("effective fsType = %q, want xfs (the device's actual on-disk type)", got)
-		}
-		want := []string{
-			"blkid -o value -s TYPE /dev/nvme1n1",
-			"mount -t xfs /dev/nvme1n1 /mnt/x",
-		}
-		if len(calls) != len(want) {
-			t.Fatalf("calls = %v, want %v (no mkfs, and mount uses xfs not ext4)", calls, want)
-		}
-		for i := range want {
-			if calls[i] != want[i] {
-				t.Errorf("calls[%d] = %q, want %q", i, calls[i], want[i])
-			}
+		want := []string{"blkid -o value -s TYPE /dev/nvme1n1"}
+		if len(calls) != len(want) || calls[0] != want[0] {
+			t.Errorf("calls = %v, want %v (no mkfs, no mount attempt)", calls, want)
 		}
 	})
 }

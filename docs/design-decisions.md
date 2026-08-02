@@ -64,9 +64,15 @@ the same replicated subtree for `zfs send -R` backup compatibility.
 - **D10 (property/fsType compatibility on clone/restore) and `Status.FSType` tracking were
   initially deferred, then implemented in a follow-up pass (2026-08-03)**: `ZfsDataset.Status.FSType`
   is set once by the node plugin the first time it formats a zvol (`internal/csi/node.go`'s
-  `recordFSType`, best-effort); `internal/csi/mount.go`'s `FormatAndMount` was also fixed to
-  mount using a device's actual on-disk fsType (not blindly the requested one) once it
-  already carries a filesystem, and to report that effective type back. `resolveContentSource`
+  `recordFSType`, best-effort). `internal/csi/mount.go`'s `FormatAndMount` skips a redundant
+  `mkfs` when the device is already formatted with the *matching* requested type, and **fails
+  loudly** (refuses to mount) if the device already carries a *different* type — verified
+  against actual upstream practice (`k8s.io/mount-utils`'s `formatAndMountSensitive` and
+  ceph-csi's `mountVolumeToStagePath`, both of which still attempt the mount with the
+  requested type and let it fail rather than silently substituting the on-disk one); an
+  earlier version of this fix incorrectly auto-substituted the existing type; corrected to
+  match both upstream behavior and this project's own ADR-0013 "fail loud on
+  misconfiguration" precedent. `resolveContentSource`
   now rejects (`InvalidArgument`) a clone/restore whose resolved `volblocksize`, `property.*`
   overrides, or requested `fsType` diverge from the source's recorded/actual values, for both
   content-source paths and both snapshot modes; absent source data (deleted source, or a

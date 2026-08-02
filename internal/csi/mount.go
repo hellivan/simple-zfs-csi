@@ -196,7 +196,6 @@ func (m *hostMounter) FormatAndMount(device, target, fsType string, options []st
 	if err != nil {
 		return "", err
 	}
-	effective := fsType
 	if existing == "" {
 		mkfsArgs := []string{}
 		if fsType == "ext4" || fsType == "ext3" {
@@ -209,14 +208,20 @@ func (m *hostMounter) FormatAndMount(device, target, fsType string, options []st
 		if _, err := m.run(context.Background(), "mkfs."+fsType, mkfsArgs...); err != nil {
 			return "", fmt.Errorf("mkfs.%s %s: %w", fsType, device, err)
 		}
-	} else {
-		// The device already carries a filesystem (e.g. a cloned/restored zvol) —
-		// mount using its actual on-disk type, not blindly whatever fsType was
-		// requested (D10, docs/snapshot-lifecycle-redesign.md §2.7): mounting
-		// with the wrong -t fails with a bad-superblock error.
-		effective = existing
+	} else if existing != fsType {
+		// The device already carries a filesystem of a different type than
+		// requested. Fail loudly instead of silently substituting the on-disk
+		// type for whatever was asked (ADR-0013's "fail loud on
+		// misconfiguration" precedent) — this also matches how upstream
+		// k8s.io/mount-utils and ceph-csi actually behave: they still attempt
+		// the mount with the *requested* fsType and let it fail (tagged
+		// FilesystemMismatch) rather than reconciling it for the caller.
+		// CreateVolume's own D10 check (ZfsDataset.Status.FSType) should
+		// prevent this from arising through this driver's own clone/restore
+		// path; reaching here means something else changed the on-disk type.
+		return "", fmt.Errorf("device %s is formatted as %q, but %q was requested: refusing to mount with a mismatched filesystem type", device, existing, fsType)
 	}
-	args := []string{"-t", effective}
+	args := []string{"-t", fsType}
 	if len(options) > 0 {
 		args = append(args, "-o", strings.Join(options, ","))
 	}
@@ -224,7 +229,7 @@ func (m *hostMounter) FormatAndMount(device, target, fsType string, options []st
 	if _, err := m.run(context.Background(), "mount", args...); err != nil {
 		return "", err
 	}
-	return effective, nil
+	return fsType, nil
 }
 
 func (m *hostMounter) BindMountDevice(device, target string, readOnly bool) error {

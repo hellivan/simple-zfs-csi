@@ -3,9 +3,15 @@
 **Status: implemented (2026-08-03), see [ADR-0019](design-decisions.md).**
 D0-D16 (promote-based `DeleteVolume`/`DeleteSnapshot`, standalone/integrated dual mode,
 D12's generalized dependent tracking, D6's cross-prefix rejection) and D10 (property/fsType
-compatibility rejection on clone/restore, plus `ZfsDataset.Status.FSType` tracking and the
-`internal/csi/mount.go` fix to mount using a device's actual on-disk fsType) are all
-implemented and covered by tests using a fake ZFS/mounter double. **Not yet verified**:
+compatibility rejection on clone/restore, plus `ZfsDataset.Status.FSType` tracking) are all
+implemented and covered by tests using a fake ZFS/mounter double. **Corrected after initial
+implementation (same day):** `internal/csi/mount.go`'s `FormatAndMount` initially
+auto-substituted a device's actual on-disk fsType for a mismatched requested one — verified
+against real ceph-csi/`k8s.io/mount-utils` source and found to be wrong: both always attempt
+the mount with the *requested* type and fail loudly (tagged `FilesystemMismatch`) on a
+mismatch, never silently substituting. Also contradicted this project's own ADR-0013 "fail
+loud on misconfiguration" precedent. Fixed to fail loudly instead — see §2.7 addendum below.
+**Not yet verified**:
 task list item 8's real-ZFS-pool test for D16's promote-ordering fixpoint loop (the fake
 double models the documented/verified single-pass behavior; the bounded fixpoint is kept
 as defense-in-depth per the D16 errata below, not because it was re-proven necessary here).
@@ -266,6 +272,26 @@ enforcement onto the driver). This fully justifies treating it as a real gap to 
 a hypothetical.
 
 **Decision: see D10.**
+
+> **Addendum (2026-08-03): the implementation's first pass at fixing the `fsType` bug above
+> got the *mechanism* wrong, caught by the user asking "is this how others solve it (like
+> Ceph)?".** The initial fix made `FormatAndMount` silently mount using the device's
+> *actual* on-disk fsType whenever it differed from the one requested, instead of the
+> requested one — avoiding the bad-superblock error, but silently. Checked against real
+> source: `k8s.io/mount-utils`'s `formatAndMountSensitive` (used by nearly every CSI
+> driver) and ceph-csi's `mountVolumeToStagePath` both use `GetDiskFormat`/`blkid` only to
+> decide whether to skip `mkfs` — neither ever substitutes the on-disk type for the
+> requested one. They still call `Mount(..., fstype, ...)` with the *originally requested*
+> type and let the underlying `mount -t` fail if it's wrong; `k8s.io/mount-utils` even has
+> a dedicated `FilesystemMismatch` `MountErrorType` for exactly this outcome. Silently
+> substituting also contradicted this project's own ADR-0013 ("fail loud on
+> misconfiguration... the safer default for a storage provisioner"). **Corrected**:
+> `FormatAndMount` now skips `mkfs` when the existing type matches what's requested (no
+> behavior change), but returns a hard error — refusing to mount — when they differ,
+> matching both upstream practice and ADR-0013. The `ZfsDataset.Status.FSType` tracking and
+> the `CreateVolume`-time D10 rejection (below) are what should prevent this mismatch from
+> ever arising through this driver's own clone/restore path in normal operation; the node
+> plugin's own fail-loud behavior is the last line of defense if it does.
 
 ### 2.8 Backing-clone naming: flat name-prefix, not a nested subfolder (revised from the
 initial design)

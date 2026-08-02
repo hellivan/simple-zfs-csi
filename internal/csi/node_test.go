@@ -196,9 +196,12 @@ func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 // TestNodePublish_NVMeoF_RecordsFSTypeOnce verifies D10
 // (docs/snapshot-lifecycle-redesign.md): the first NodePublishVolume that
 // formats a zvol records the effective fsType on ZfsDataset.Status.FSType, and
-// a later publish (e.g. after a remount) never overwrites it even if a
-// different fsType happens to be requested — the on-disk type, once set, is
-// immutable.
+// a later publish to a second target path (e.g. after a remount) leaves it
+// unchanged — the on-disk type, once set, is immutable. (A real mismatched
+// fsType is refused at the mount layer itself — see
+// TestHostMounterFormatAndMount's "fails loudly" case in mount_test.go — so
+// recordFSType is never even reached in that situation; fakeMounter doesn't
+// model that failure since it's exercised directly against hostMounter.)
 func TestNodePublish_NVMeoF_RecordsFSTypeOnce(t *testing.T) {
 	m := newFakeMounter()
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"}}
@@ -226,10 +229,8 @@ func TestNodePublish_NVMeoF_RecordsFSTypeOnce(t *testing.T) {
 		t.Fatalf("Status.FSType = %q, want ext4", got.Status.FSType)
 	}
 
-	// Simulate an already-formatted device reporting a *different* actual type
-	// (as hostMounter's real detectFS would if the on-disk fs somehow differed) —
-	// a second publish must not overwrite the already-recorded value.
-	m.formattedFS = "xfs"
+	// A second publish (matching fsType, as any real remount of the same
+	// volume would) must not disturb the already-recorded value.
 	m.mounted["/target/fs2"] = false
 	if _, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-2",
