@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path"
@@ -215,7 +217,7 @@ func (r *ZfsDatasetReconciler) clone(ctx context.Context, vol *storagev1alpha1.Z
 		return r.ZFS.Clone(ctx, snapFull, dest, props)
 	case src.Volume != "":
 		srcFull := poolName + "/" + strings.Trim(src.Volume, "/")
-		snapFull := srcFull + "@clone-" + vol.Name
+		snapFull := srcFull + "@clone-" + cloneSnapshotSuffix(vol.Name)
 		if err := r.ZFS.Snapshot(ctx, snapFull); err != nil {
 			return err
 		}
@@ -223,6 +225,20 @@ func (r *ZfsDatasetReconciler) clone(ctx context.Context, vol *storagev1alpha1.Z
 	default:
 		return fmt.Errorf("spec.source has neither snapshot nor volume")
 	}
+}
+
+// cloneSnapshotSuffix derives a sanitized, ZFS-safe identifier for the
+// intermediate "@clone-<suffix>" snapshot ADR-0009's direct-clone path takes on
+// the source dataset. It's a deterministic hash of the destination ZfsDataset's
+// object name rather than that name used raw
+// (independent-resource-naming-redesign.md, step 4): this snapshot is purely
+// internal/ephemeral and re-derived fresh on every reconcile (never persisted),
+// so hashing is enough to keep it independent of whatever characters the
+// CO-provided volume id happens to contain, without needing a new persisted
+// field.
+func cloneSnapshotSuffix(destName string) string {
+	sum := sha256.Sum256([]byte(destName))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 // ensureSize converges the on-disk size of an existing object toward the spec:

@@ -411,7 +411,9 @@ func TestZfsDatasetReconcile_ClonesFromVolume(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	wantSnap := "tank/k8s/pvc-src@clone-pvc-clone"
+	// The intermediate snapshot suffix is now a hash of the destination object
+	// name, not the raw name itself (independent-resource-naming-redesign.md).
+	wantSnap := "tank/k8s/pvc-src@clone-" + cloneSnapshotSuffix("pvc-clone")
 	if len(z.createdDS) != 1 || z.createdDS[0] != wantSnap {
 		t.Fatalf("expected intermediate snapshot %q, got %v", wantSnap, z.createdDS)
 	}

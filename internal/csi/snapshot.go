@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -40,13 +41,18 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	}
 
 	desired := storagev1alpha1.ZfsSnapshotSpec{
-		PoolGUID:     src.Spec.PoolGUID,
-		Dataset:      src.Spec.Dataset,
-		SnapshotName: name,
+		PoolGUID: src.Spec.PoolGUID,
+		Dataset:  src.Spec.Dataset,
+		// The ZFS-facing snapshot name is an independent, opaque identifier
+		// (ADR: independent-resource-naming-redesign.md) — never the CO-provided
+		// snapshot name. On an idempotent retry, ensureSnapshot discards this
+		// candidate and reuses the already-persisted Spec.SnapshotName.
+		SnapshotName: "csi-snap-" + uuid.New().String(),
 		SourceVolume: sourceID,
 		SourceType:   src.Spec.Type,
 	}
-	if err := c.ensureSnapshot(ctx, name, desired); err != nil {
+	actual, err := c.ensureSnapshot(ctx, name, desired)
+	if err != nil {
 		return nil, err
 	}
 	snap, err := c.waitSnapshotReady(ctx, name)
@@ -54,7 +60,7 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		return nil, err
 	}
 
-	c.Log.Info("created snapshot", "name", name, "source", sourceID, "pool", desired.PoolGUID, "dataset", desired.Dataset)
+	c.Log.Info("created snapshot", "name", name, "source", sourceID, "pool", actual.PoolGUID, "dataset", actual.Dataset, "snapshotName", actual.SnapshotName)
 	return &csi.CreateSnapshotResponse{Snapshot: snapshotMessage(snap)}, nil
 }
 
@@ -128,8 +134,13 @@ func (c *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 }
 
 // ensureSnapshot creates the ZfsSnapshot, or validates that an existing one with
-// the same name refers to the same source (CSI idempotency).
-func (c *ControllerServer) ensureSnapshot(ctx context.Context, name string, desired storagev1alpha1.ZfsSnapshotSpec) error {
+// the same name refers to the same source (CSI idempotency), and returns the
+// persisted spec. SnapshotName is deliberately excluded from the compatibility
+// check: it's now an independent, opaque identifier generated fresh on every
+// CreateSnapshot call, not something a caller can recompute and compare
+// (independent-resource-naming-redesign.md) — the existing object's
+// Spec.SnapshotName is always authoritative.
+func (c *ControllerServer) ensureSnapshot(ctx context.Context, name string, desired storagev1alpha1.ZfsSnapshotSpec) (storagev1alpha1.ZfsSnapshotSpec, error) {
 	existing := &storagev1alpha1.ZfsSnapshot{}
 	err := c.Client.Get(ctx, client.ObjectKey{Name: name}, existing)
 	switch {
@@ -139,19 +150,19 @@ func (c *ControllerServer) ensureSnapshot(ctx context.Context, name string, desi
 			if apierrors.IsAlreadyExists(err) {
 				return c.ensureSnapshot(ctx, name, desired)
 			}
-			return status.Errorf(codes.Internal, "create ZfsSnapshot %q: %v", name, err)
+			return storagev1alpha1.ZfsSnapshotSpec{}, status.Errorf(codes.Internal, "create ZfsSnapshot %q: %v", name, err)
 		}
-		return nil
+		return desired, nil
 	case err != nil:
-		return status.Errorf(codes.Internal, "get ZfsSnapshot %q: %v", name, err)
+		return storagev1alpha1.ZfsSnapshotSpec{}, status.Errorf(codes.Internal, "get ZfsSnapshot %q: %v", name, err)
 	default:
 		if existing.Spec.PoolGUID != desired.PoolGUID ||
 			existing.Spec.Dataset != desired.Dataset ||
 			existing.Spec.SourceVolume != desired.SourceVolume ||
 			existing.Spec.SourceType != desired.SourceType {
-			return status.Errorf(codes.AlreadyExists, "snapshot %q already exists for a different source", name)
+			return storagev1alpha1.ZfsSnapshotSpec{}, status.Errorf(codes.AlreadyExists, "snapshot %q already exists for a different source", name)
 		}
-		return nil
+		return existing.Spec, nil
 	}
 }
 

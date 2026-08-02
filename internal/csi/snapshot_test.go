@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,7 +77,9 @@ func TestCreateSnapshot_CreatesAndReturnsReady(t *testing.T) {
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, got); err != nil {
 		t.Fatalf("get ZfsSnapshot: %v", err)
 	}
-	if got.Spec.PoolGUID != "999" || got.Spec.Dataset != "k8s/pvc-1" || got.Spec.SnapshotName != "snap-1" || got.Spec.SourceVolume != "pvc-1" {
+	// SnapshotName is now an independent, opaque identifier
+	// (independent-resource-naming-redesign.md), not the CO-provided snapshot name.
+	if got.Spec.PoolGUID != "999" || got.Spec.Dataset != "k8s/pvc-1" || !strings.HasPrefix(got.Spec.SnapshotName, "csi-snap-") || got.Spec.SourceVolume != "pvc-1" {
 		t.Errorf("snapshot spec = %+v", got.Spec)
 	}
 	if got.Spec.SourceType != storagev1alpha1.DatasetTypeFilesystem {
@@ -102,6 +105,23 @@ func TestCreateSnapshot_Idempotent(t *testing.T) {
 	}
 	if _, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-1", SourceVolumeId: "pvc-1"}); err != nil {
 		t.Fatalf("second CreateSnapshot should be idempotent: %v", err)
+	}
+	// The independent, opaque snapshot-name identifier
+	// (independent-resource-naming-redesign.md) must be generated exactly once
+	// and reused on retry, not regenerated.
+	got := &storagev1alpha1.ZfsSnapshot{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, got); err != nil {
+		t.Fatalf("get ZfsSnapshot: %v", err)
+	}
+	first := got.Spec.SnapshotName
+	if _, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-1", SourceVolumeId: "pvc-1"}); err != nil {
+		t.Fatalf("third CreateSnapshot should be idempotent: %v", err)
+	}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, got); err != nil {
+		t.Fatalf("get ZfsSnapshot: %v", err)
+	}
+	if got.Spec.SnapshotName != first {
+		t.Errorf("SnapshotName changed across idempotent retry: %q vs %q", first, got.Spec.SnapshotName)
 	}
 }
 

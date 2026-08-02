@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,7 +104,9 @@ func TestCreateVolume_NFSFilesystem(t *testing.T) {
 		t.Errorf("volumeId = %q, want pvc-1", resp.GetVolume().GetVolumeId())
 	}
 	vctx := resp.GetVolume().GetVolumeContext()
-	if vctx[CtxPoolGUID] != "999" || vctx[CtxDataset] != "k8s/pvc-1" || vctx[CtxProtocol] != "nfs" {
+	// The dataset leaf is now an independent, opaque identifier
+	// (independent-resource-naming-redesign.md), not derived from the CSI name.
+	if vctx[CtxPoolGUID] != "999" || !strings.HasPrefix(vctx[CtxDataset], "k8s/csi-vol-") || vctx[CtxProtocol] != "nfs" {
 		t.Errorf("volume_context = %+v", vctx)
 	}
 
@@ -391,11 +394,21 @@ func TestCreateVolume_IdempotentSameParams(t *testing.T) {
 		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1 << 30},
 		Parameters:         map[string]string{"poolGUID": "999", "protocol": "nfs"},
 	}
-	if _, err := cs.CreateVolume(context.Background(), req); err != nil {
+	resp1, err := cs.CreateVolume(context.Background(), req)
+	if err != nil {
 		t.Fatalf("first CreateVolume: %v", err)
 	}
-	if _, err := cs.CreateVolume(context.Background(), req); err != nil {
+	resp2, err := cs.CreateVolume(context.Background(), req)
+	if err != nil {
 		t.Fatalf("second CreateVolume should be idempotent: %v", err)
+	}
+	// The independent, opaque dataset identifier (independent-resource-naming-
+	// redesign.md) must be generated exactly once and reused on retry, not
+	// regenerated.
+	d1 := resp1.GetVolume().GetVolumeContext()[CtxDataset]
+	d2 := resp2.GetVolume().GetVolumeContext()[CtxDataset]
+	if d1 == "" || d1 != d2 {
+		t.Errorf("dataset changed across idempotent retry: %q vs %q", d1, d2)
 	}
 }
 
@@ -459,8 +472,8 @@ func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 	if vctx[CtxPoolGUID] != "sc-pool" {
 		t.Errorf("poolGUID = %q, want sc-pool (PVC annotation must not override)", vctx[CtxPoolGUID])
 	}
-	if vctx[CtxDataset] != "sc-pfx/pvc-7" {
-		t.Errorf("dataset = %q, want sc-pfx/pvc-7 (datasetPrefix is StorageClass-only)", vctx[CtxDataset])
+	if !strings.HasPrefix(vctx[CtxDataset], "sc-pfx/csi-vol-") {
+		t.Errorf("dataset = %q, want sc-pfx/csi-vol-<uuid> (datasetPrefix is StorageClass-only)", vctx[CtxDataset])
 	}
 	// Non-restricted param from the annotation layer takes effect.
 	vol := &storagev1alpha1.ZfsDataset{}

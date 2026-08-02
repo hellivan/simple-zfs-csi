@@ -1,10 +1,10 @@
 # Independent ZFS-Facing Naming for `ZfsDataset`/`ZfsSnapshot` — Research & Decision Log
 
-**Status: design complete, implementation not yet started.** **Priority: implement this
-*before* [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md).** This is more
-fundamental (it touches the volume path, not just the new snapshot path) and the sooner
-it lands, the less rework the snapshot-lifecycle work needs (its backing-clone naming
-already assumes an independent `Spec.SnapshotName`, which this change provides for free).
+**Status: implemented (2026-08-02), see [ADR-0018](design-decisions.md).** Was previously
+prioritized ahead of [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md)
+since it's more fundamental (touches the volume path, not just the new snapshot path)
+and landing it first means less rework for that plan (its backing-clone naming already
+assumed an independent `Spec.SnapshotName`, which this change provides for free).
 
 Like the sibling document, this is a full working record (findings, rejected ideas,
 accepted ideas) meant to survive independently of chat history, kept as a standalone doc

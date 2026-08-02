@@ -10,6 +10,59 @@ recurring bug classes and their guards are catalogued in
 
 ---
 
+## ADR-0018 — Independent, opaque ZFS-facing names for `ZfsDataset`/`ZfsSnapshot`
+
+**Status:** Accepted (2026-08-02) · **Scope:** `internal/csi` (`CreateVolume`, `CreateSnapshot`, `ensureVolume`, `ensureSnapshot`, `volumeSpecCompatible`), `internal/controller/zfsdataset_controller.go` (`clone()`) · **Full record:** [independent-resource-naming-redesign.md](independent-resource-naming-redesign.md).
+
+### Context
+
+`CreateVolume`/`CreateSnapshot` fed the CO-provided CSI `Name` directly into both
+the Kubernetes object identity (`ObjectMeta.Name`) and the literal ZFS-facing
+path (`ZfsDataset.Spec.Dataset`, `ZfsSnapshot.Spec.SnapshotName`). Investigation
+(detailed in the linked doc) confirmed this was always safe in practice —
+`external-provisioner`/`external-snapshotter` only ever pass Kubernetes-generated
+UUIDs, never raw user text — but coupling the ZFS path to an upstream sidecar's
+internal naming convention (an implementation detail, not a CSI-spec guarantee)
+was still worth removing, Ceph-CSI-style, at a fraction of the cost of a full
+volume/snapshot journal (which would have required decoupling `ObjectMeta.Name`
+itself, touching ~80 call sites).
+
+### Decision
+
+Keep `ObjectMeta.Name` exactly as the CSI-provided `VolumeId`/`SnapshotId`
+(zero changes to any of the ~80 existing call sites keyed off it, and idempotency
+stays free via etcd name uniqueness). Generate a fresh, independent, opaque leaf
+identifier for the two ZFS-facing fields on first creation only, using the
+already-vendored `github.com/google/uuid`:
+- `ZfsDataset.Spec.Dataset`'s leaf: `csi-vol-` + `uuid.New().String()`.
+- `ZfsSnapshot.Spec.SnapshotName`: `csi-snap-` + `uuid.New().String()`.
+
+On an idempotent retry (`ensureVolume`/`ensureSnapshot` finds an existing
+object), the candidate is discarded and the already-persisted value is treated
+as authoritative — both helpers now return the persisted spec instead of `nil`
+so the caller can pick up the real dataset/snapshot-name. `volumeSpecCompatible`
+and `ensureSnapshot`'s compatibility check were updated to drop the
+`Dataset`/`SnapshotName` equality requirement accordingly (no longer
+deterministically recomputable by the caller).
+
+ADR-0009's direct-clone path (`zfsdataset_controller.go`'s `clone()`) had the
+same exposure in its intermediate `"@clone-" + vol.Name` snapshot suffix; this
+is purely internal/ephemeral (re-derived fresh every reconcile, never
+persisted), so it was closed more cheaply by hashing the destination object
+name (`cloneSnapshotSuffix`, SHA-256 truncated to 16 hex chars) rather than
+adding a new persisted field.
+
+### Consequences
+
+- `resolveContentSource`, `ListSnapshots`, status reporting, etc. needed no
+  changes — they already read `Spec.Dataset`/`Spec.SnapshotName` off the
+  fetched object rather than recomputing a path from the CSI id.
+- The snapshot-lifecycle redesign's backing-clone naming can now reuse
+  `Spec.SnapshotName` directly (already independent/opaque) instead of the raw
+  CSI snapshot name.
+
+---
+
 ## ADR-0017 — Keep one CSI driver for both protocols; reject cross-protocol/type restores in-controller
 
 **Status:** Accepted (2026-07-29) · **Scope:** `internal/csi` (`resolveContentSource`, `ZfsSnapshotSpec.SourceType`) · **Builds on** the single-driver StorageClass/protocol model (ADR-0002), the `ZfsDataset`/`ZfsSnapshot` CRD taxonomy (ADR-0006, ADR-0008) and the same-pool/same-type clone/restore checks (ADR-0009).

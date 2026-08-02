@@ -9,6 +9,7 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/go-logr/logr"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -104,13 +105,19 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 		return nil, err
 	}
 
-	dataset := rp.Dataset(name)
+	// The ZFS-facing dataset leaf is an independent, opaque identifier (ADR:
+	// independent-resource-naming-redesign.md) — never the CO-provided volume
+	// name. On an idempotent retry, ensureVolume discards this candidate and
+	// reuses the already-persisted Spec.Dataset from the existing object.
+	dataset := rp.Dataset("csi-vol-" + uuid.New().String())
 	desiredVol := volumeSpec(rp, dataset, sizeBytes)
 	desiredVol.Source = source
 
-	if err := c.ensureVolume(ctx, name, desiredVol); err != nil {
+	actualVol, err := c.ensureVolume(ctx, name, desiredVol)
+	if err != nil {
 		return nil, err
 	}
+	dataset = actualVol.Dataset
 	ready, err := c.waitVolumeReady(ctx, name, 0)
 	if err != nil {
 		return nil, err
@@ -372,8 +379,12 @@ func (c *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *
 }
 
 // ensureVolume creates the ZfsDataset, or validates that an existing one with the
-// same name is compatible (CSI idempotency).
-func (c *ControllerServer) ensureVolume(ctx context.Context, name string, desired storagev1alpha1.ZfsDatasetSpec) error {
+// same name is compatible (CSI idempotency), and returns the persisted spec. The
+// dataset leaf embedded in `desired` is only a candidate: since it's now an
+// independent, opaque identifier rather than deterministically derived from
+// `name` (independent-resource-naming-redesign.md), a retry that finds an
+// existing object must return *its* Spec.Dataset, not recompute one.
+func (c *ControllerServer) ensureVolume(ctx context.Context, name string, desired storagev1alpha1.ZfsDatasetSpec) (storagev1alpha1.ZfsDatasetSpec, error) {
 	existing := &storagev1alpha1.ZfsDataset{}
 	err := c.Client.Get(ctx, client.ObjectKey{Name: name}, existing)
 	switch {
@@ -383,16 +394,16 @@ func (c *ControllerServer) ensureVolume(ctx context.Context, name string, desire
 			if apierrors.IsAlreadyExists(err) {
 				return c.ensureVolume(ctx, name, desired)
 			}
-			return status.Errorf(codes.Internal, "create ZfsDataset %q: %v", name, err)
+			return storagev1alpha1.ZfsDatasetSpec{}, status.Errorf(codes.Internal, "create ZfsDataset %q: %v", name, err)
 		}
-		return nil
+		return desired, nil
 	case err != nil:
-		return status.Errorf(codes.Internal, "get ZfsDataset %q: %v", name, err)
+		return storagev1alpha1.ZfsDatasetSpec{}, status.Errorf(codes.Internal, "get ZfsDataset %q: %v", name, err)
 	default:
 		if !volumeSpecCompatible(existing.Spec, desired) {
-			return status.Errorf(codes.AlreadyExists, "volume %q already exists with different parameters", name)
+			return storagev1alpha1.ZfsDatasetSpec{}, status.Errorf(codes.AlreadyExists, "volume %q already exists with different parameters", name)
 		}
-		return nil
+		return existing.Spec, nil
 	}
 }
 
@@ -620,9 +631,13 @@ func volumeSpec(rp *ResolvedParams, dataset string, sizeBytes int64) storagev1al
 }
 
 // volumeSpecCompatible reports whether an existing ZfsDataset can satisfy a
-// repeated CreateVolume for the same name (identity + size must match).
+// repeated CreateVolume for the same name (identity + size must match). Dataset
+// is deliberately excluded: it's now an independent, opaque identifier
+// generated fresh on every CreateVolume call, not something a caller can
+// recompute and compare (independent-resource-naming-redesign.md) — the
+// existing object's Spec.Dataset is always authoritative.
 func volumeSpecCompatible(existing, desired storagev1alpha1.ZfsDatasetSpec) bool {
-	if existing.PoolGUID != desired.PoolGUID || existing.Dataset != desired.Dataset || existing.Type != desired.Type {
+	if existing.PoolGUID != desired.PoolGUID || existing.Type != desired.Type {
 		return false
 	}
 	if !datasetSourceEqual(existing.Source, desired.Source) {
