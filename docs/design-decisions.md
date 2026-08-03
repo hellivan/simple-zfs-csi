@@ -97,9 +97,13 @@ promote, since a later sibling promote invalidates an earlier reading.
   §5), and `CreateSnapshot` now captures the source's `fsType`/`volblocksize`/properties so
   ADR-0019's D10 compatibility checks still apply once the source volume is gone — which,
   for `standalone` snapshots, is the normal case rather than an edge one.
-- **Not yet re-verified against a real pool.** The 2026-07-31 run executed no `zfs destroy`
-  at all, which is precisely where the four defects lived; the outstanding scenarios are
-  listed in the linked doc §9.2.
+- **Verified against a real pool** (2026-08-03,
+  [delete-path-verification-2026-08-03.md](delete-path-verification-2026-08-03.md)). The
+  2026-07-31 run executed no `zfs destroy` at all, which is precisely where the four
+  defects lived, so the destroy half was re-run separately: all four scenarios against the
+  live `spinning-archive` pool in an isolated scratch subtree, 18 checks, 0 failures, and
+  zero uses of `zfs destroy -r`. Real ZFS matched the Go test double in every case,
+  including where the model contradicted a hand-written expectation.
 
 ---
 

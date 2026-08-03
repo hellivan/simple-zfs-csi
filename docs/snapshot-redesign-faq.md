@@ -9,6 +9,18 @@ Related documents:
 - [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) — the full research/decision log (D0-D16, see §2.12 for the trash-vs-promote re-examination, §2.11 for the promote-ordering proof)
 - [independent-resource-naming-redesign.md](independent-resource-naming-redesign.md) — the separate, prerequisite naming redesign
 
+> ### ⚠️ Partly superseded (2026-08-03)
+>
+> Answers below that describe `promoted-onto.*`/`restored-by.*` finalizer tracking, or a
+> bounded fixpoint promote loop, describe a mechanism that **no longer exists**. A code
+> review found four critical defects caused by keeping a copy of the ZFS clone graph in
+> Kubernetes; dependents are now discovered by querying ZFS directly at delete time.
+> The conclusions those answers reach are still right — `zfs promote` over trash, the
+> backing clone, the dual modes, cross-prefix rejection — only the bookkeeping changed.
+>
+> Current behaviour: [ADR-0020](design-decisions.md) and
+> [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §4 (D17–D26) / §9.
+
 ---
 
 **Q: Do we handle snapshots of zvols and filesystems correctly? What if someone tries to
