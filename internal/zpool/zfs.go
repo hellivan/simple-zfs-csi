@@ -64,6 +64,20 @@ type ZFS interface {
 	// Destroy removes a dataset/zvol. It is idempotent: destroying a
 	// non-existent object is not an error. recursive also destroys children.
 	Destroy(ctx context.Context, name string, recursive bool) error
+	// ListSnapshots returns the full ZFS names of every snapshot taken directly
+	// on dataset, oldest first, excluding snapshots belonging to any child
+	// dataset. It wraps ErrNotExist when dataset itself does not exist, and
+	// returns an empty slice when it exists but carries no snapshots.
+	ListSnapshots(ctx context.Context, dataset string) ([]string, error)
+	// Clones returns the full ZFS names of every dataset/zvol that is a direct
+	// clone of snapshot, read from the ZFS `clones` property. It wraps
+	// ErrNotExist when the snapshot does not exist, and returns an empty slice
+	// when nothing clones it.
+	//
+	// Together with ListSnapshots this exposes the live ZFS clone graph, which
+	// the delete path treats as the single source of truth for what depends on
+	// what (D17) rather than replaying bookkeeping held in Kubernetes.
+	Clones(ctx context.Context, snapshot string) ([]string, error)
 	// Get returns a single ZFS property value. It wraps ErrNotExist when the
 	// object does not exist.
 	Get(ctx context.Context, name, property string) (string, error)
@@ -227,6 +241,55 @@ func (z *CLI) Clone(ctx context.Context, snapshot, dest string, props map[string
 		return nil
 	}
 	return err
+}
+
+// ListSnapshots returns dataset's own snapshots, oldest first. `-d 1` bounds
+// the recursion to dataset itself, so snapshots belonging to a child dataset
+// are never included, and `-s creation` yields the ordering `zfs promote` uses
+// when it relocates "the snapshot that was cloned, and any snapshots previous
+// to this snapshot".
+func (z *CLI) ListSnapshots(ctx context.Context, dataset string) ([]string, error) {
+	if dataset == "" {
+		return nil, fmt.Errorf("dataset name is empty")
+	}
+	out, err := z.run(ctx, "list", "-H", "-o", "name", "-t", "snapshot", "-d", "1", "-s", "creation", dataset)
+	if err != nil {
+		if isNotExist(err) {
+			return nil, fmt.Errorf("%w: %s", ErrNotExist, dataset)
+		}
+		return nil, err
+	}
+	var snaps []string
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			snaps = append(snaps, line)
+		}
+	}
+	return snaps, nil
+}
+
+// Clones returns the direct clones of snapshot via the ZFS `clones` property,
+// which renders as "-" when it has none and as a comma-separated list of full
+// dataset names otherwise. One property read answers "what depends on this
+// snapshot" without enumerating the pool.
+func (z *CLI) Clones(ctx context.Context, snapshot string) ([]string, error) {
+	if !strings.Contains(snapshot, "@") {
+		return nil, fmt.Errorf("clones requires a snapshot name (pool/dataset@snap), got %q", snapshot)
+	}
+	val, err := z.Get(ctx, snapshot, "clones")
+	if err != nil {
+		return nil, err
+	}
+	if val = strings.TrimSpace(val); val == "" || val == "-" {
+		return nil, nil
+	}
+	var clones []string
+	for _, c := range strings.Split(val, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			clones = append(clones, c)
+		}
+	}
+	return clones, nil
 }
 
 // Get returns a single ZFS property value, wrapping ErrNotExist when missing.

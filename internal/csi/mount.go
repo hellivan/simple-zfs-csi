@@ -44,11 +44,16 @@ type NodeMounter interface {
 	// options.
 	MountNFS(source, target string, options []string) error
 	// FormatAndMount formats device with fsType if it has no filesystem, then
-	// mounts it at target. If device already carries a filesystem, that
-	// on-disk type is used for the mount (and returned) instead of fsType, so a
-	// mismatched request can never fail with a bad-superblock error. Returns the
-	// filesystem type now on the device (freshly applied, or pre-existing) so
-	// callers can persist it once (ZfsDataset.Status.FSType, D10).
+	// mounts it at target. If device already carries a *different* filesystem it
+	// fails loud rather than mounting it as the on-disk type: silently honouring
+	// the on-disk type would let a mismatched StorageClass appear to work while
+	// the volume is not what was asked for, and it is the caller's D10
+	// compatibility checks that are supposed to prevent this from ever being
+	// reached. (An earlier revision did use the on-disk type; that behaviour was
+	// deliberately reverted in e70cb53 — do not reinstate it.) Returns the
+	// filesystem type now on the device (freshly applied, or the matching
+	// pre-existing one) so callers can persist it once
+	// (ZfsDataset.Status.FSType, D10).
 	FormatAndMount(device, target, fsType string, options []string) (string, error)
 	// BindMountDevice bind-mounts a block device node at target (block volumes).
 	BindMountDevice(device, target string, readOnly bool) error

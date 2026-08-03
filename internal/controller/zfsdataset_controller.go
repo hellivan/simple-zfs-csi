@@ -89,15 +89,11 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			// D12/D15: clear any tracking finalizer elsewhere that references this
-			// dataset, now that it's going away, so a stale reference never lingers
-			// on whichever object happened to be tracking it.
-			if err := r.clearTrackingFinalizersReferencing(ctx, vol.Name); err != nil {
-				return ctrl.Result{}, err
-			}
-			// D3/D7/D9/D12: promote away every tracked dependent first, so the
-			// dataset is guaranteed to have zero snapshots/clones of its own left
-			// — what makes a non-recursive destroy (D11) always safe/correct.
+			// D3/D17/D18/D21: apply the Kubernetes-level policy blocks, then
+			// detach whatever ZFS reports as depending on this dataset and clean
+			// up its leftover driver-owned snapshot artifacts, so the dataset is
+			// guaranteed to have zero snapshots of its own left — which is what
+			// makes the non-recursive destroy below always safe (D11/D22).
 			if err := r.beforeDestroy(ctx, &vol, pool.Status.PoolName, full); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -171,10 +167,10 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 }
 
 // releaseFinalizer removes the agent finalizer, allowing the API server to
-// complete deletion. It re-reads the object first and retries on conflict: the
-// delete path (clearTrackingFinalizersReferencing/beforeDestroy) may itself have
-// updated this same object's tracking finalizers, so the copy held by Reconcile
-// is routinely stale by the time we get here.
+// complete deletion. It re-reads the object first and retries on conflict
+// rather than updating the copy Reconcile is holding, which may be stale by the
+// time we get here (known-pitfalls.md class 17). Tolerates the object already
+// being gone.
 func (r *ZfsDatasetReconciler) releaseFinalizer(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cur := &storagev1alpha1.ZfsDataset{}

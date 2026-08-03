@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -51,6 +52,14 @@ type ZfsSnapshotReconciler struct {
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots/status,verbs=get;update;patch
+// Standalone mode (D15) provisions the backing clone as a real, owned child
+// ZfsDataset object, so this reconciler — unlike ZfsDatasetReconciler, which
+// only ever fulfils objects the csi-controller authored — creates and deletes
+// ZfsDataset objects itself (D26). The finalizers rule covers the backing
+// clone's ownerReference, which sets blockOwnerDeletion: true.
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots/finalizers,verbs=update
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools,verbs=get;list;watch
 
 // Reconcile takes or destroys the ZFS snapshot backing a ZfsSnapshot, but only on
 // the node that currently hosts its pool.
@@ -135,10 +144,26 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return r.reconcileStandaloneCreate(ctx, &snap, &pool, full)
 }
 
-// releaseSnapshotFinalizer removes the agent finalizer, allowing deletion.
+// releaseSnapshotFinalizer removes the agent finalizer, allowing deletion. It
+// re-reads the object under conflict retry rather than updating a possibly
+// stale in-memory copy: the delete path calls helpers that may themselves write
+// this object, and a plain Update on the stale copy fails with "object was
+// modified" (known-pitfalls.md class 17). Tolerates the object already being
+// gone.
 func (r *ZfsSnapshotReconciler) releaseSnapshotFinalizer(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot) error {
-	controllerutil.RemoveFinalizer(snap, zfsSnapshotFinalizer)
-	return r.Update(ctx, snap)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cur := &storagev1alpha1.ZfsSnapshot{}
+		if err := r.Get(ctx, client.ObjectKey{Name: snap.Name}, cur); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if !controllerutil.RemoveFinalizer(cur, zfsSnapshotFinalizer) {
+			return nil
+		}
+		return r.Update(ctx, cur)
+	})
 }
 
 // reconcileDelete tears down a ZfsSnapshot on the node hosting its pool.
@@ -187,6 +212,15 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	// deleted first). This is the invariant that makes it safe for DeleteVolume
 	// to assume zero live ZfsSnapshots referencing a volume means zero raw
 	// snapshots remain on it either.
+	//
+	// D19: a restored PVC that was promoted while the backing clone above was
+	// being torn down is now a clone of this raw snapshot, and ZFS refuses to
+	// destroy a snapshot that still has dependent clones. Promote those away
+	// first — that relocates the snapshot onto the dependent and turns the
+	// destroy into a NotExist no-op — rather than deadlocking here forever.
+	if err := detachSnapshotClones(ctx, r.Client, r.ZFS, snap.Spec.PoolGUID, pool.Status.PoolName, rawFull); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.ZFS.Destroy(ctx, rawFull, false); err != nil {
 		return ctrl.Result{}, err
 	}

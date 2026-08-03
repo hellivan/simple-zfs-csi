@@ -68,17 +68,53 @@ type ZfsSnapshotSpec struct {
 	// snapshot creation time. The CSI controller captures it from the source
 	// so that a later restore can still reject a filesystem/zvol type mismatch
 	// even if the source ZfsDataset has since been deleted (e.g. the original
-	// PVC was removed but the snapshot was retained). Immutable once set.
+	// PVC was removed but the snapshot was retained).
+	//
+	// Immutable once set (D24): it is a record of what the source *was*, not a
+	// pointer, so changing it could only ever make a restore-compatibility
+	// check lie.
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sourceType is immutable"
 	SourceType DatasetType `json:"sourceType,omitempty"`
 
-	// Mode selects standalone (Ceph-style, via zfs promote; new default) or
-	// integrated (today's original, plain-snapshot-only behaviour). Immutable
-	// once set, resolved at CreateSnapshot time from the VolumeSnapshotClass
-	// "mode" parameter with a chart-configured default (D8). Empty is treated as
-	// Integrated for backward compatibility with snapshots created before this
-	// field existed.
+	// SourceFSType is the filesystem the source volume was formatted with at
+	// snapshot creation time, copied from its Status.FSType. Like SourceType it
+	// exists so a restore can still be checked for compatibility (D10/D25) once
+	// the source ZfsDataset is gone — which, for standalone-mode snapshots, is
+	// the headline scenario rather than an edge case. Empty means the source had
+	// never been formatted (or predates this field), which imposes no constraint.
 	// +optional
+	SourceFSType string `json:"sourceFSType,omitempty"`
+
+	// SourceVolblocksize is the source zvol's volblocksize at snapshot creation
+	// time. Captured for the same reason as SourceFSType (D25): a clone cannot
+	// change volblocksize, and without this a restore into a StorageClass with a
+	// different value passed unnoticed and was then silently ignored by ZFS.
+	// Empty for filesystem sources.
+	// +optional
+	SourceVolblocksize string `json:"sourceVolblocksize,omitempty"`
+
+	// SourceProperties are the structural ZFS property overrides recorded on the
+	// source ZfsDataset at snapshot creation time (D25), compared against the
+	// target's resolved property.* overrides on restore when the source itself
+	// is no longer available.
+	// +optional
+	SourceProperties map[string]string `json:"sourceProperties,omitempty"`
+
+	// Mode selects standalone (Ceph-style, via zfs promote; new default) or
+	// integrated (today's original, plain-snapshot-only behaviour). Resolved at
+	// CreateSnapshot time from the VolumeSnapshotClass "mode" parameter with a
+	// chart-configured default (D8). Empty is treated as Integrated for
+	// backward compatibility with snapshots created before this field existed.
+	//
+	// Immutable once set (D24): Mode selects a teardown *mechanism*, so flipping
+	// it on a live object switches between the promote path and the blocking
+	// path against ZFS state built for the other one — orphaning the backing
+	// clone, its @restore-source, and anything restored from it. No repair
+	// scenario needs it. Contrast the location fields above, which are
+	// deliberately left mutable (api-conventions.md §5).
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="mode is immutable"
 	Mode ZfsSnapshotMode `json:"mode,omitempty"`
 }
 

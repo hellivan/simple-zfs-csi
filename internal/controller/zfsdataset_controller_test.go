@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -22,6 +23,23 @@ import (
 
 // fakeZFS is an in-memory zpool.ZFS used to assert the reconciler's create,
 // destroy and resize behaviour without shelling out.
+//
+// It deliberately models the ZFS semantics the delete path depends on. A double
+// that cannot fail the way ZFS fails hides exactly the bugs that matter here
+// (known-pitfalls.md class 17), so it implements:
+//
+//   - snapshot ownership — which dataset each snapshot currently belongs to,
+//     in creation order;
+//   - `zfs destroy` refusing with "filesystem has children" when a dataset
+//     still owns snapshots, and with "snapshot has dependent clones" when
+//     something still clones a snapshot;
+//   - `zfs promote`'s full rewrite, which touches four things at once rather
+//     than simply clearing an origin (zfs-promote.8 and OpenZFS
+//     dsl_dataset_promote_sync).
+//
+// TestFakeZFSPromote_MatchesLivePoolVerification pins the promote model against
+// the real-pool run recorded in docs/promote-order-verification-2026-07-31.md,
+// so this fidelity is itself tested rather than assumed.
 type fakeZFS struct {
 	existing       map[string]bool
 	props          map[string]map[string]string
@@ -32,11 +50,12 @@ type fakeZFS struct {
 	lastZvProps    map[string]string
 	cloned         []string // records "snapshot -> dest" for each Clone
 	lastCloneProps map[string]string
-	setProps       []string          // records "name property=value" for each SetProperty
-	ownership      []string          // records "mountpoint uid:gid mode" for each ApplyOwnership
-	origin         map[string]string // dataset -> its current origin snapshot ("" / absent = none)
-	promoted       []string          // records each dataset name passed to Promote
-	promoteErr     map[string]error  // optional: force Promote to fail for a given dataset
+	setProps       []string            // records "name property=value" for each SetProperty
+	ownership      []string            // records "mountpoint uid:gid mode" for each ApplyOwnership
+	origin         map[string]string   // dataset -> its current origin snapshot ("" / absent = none)
+	snapshots      map[string][]string // dataset -> its own snapshot suffixes, oldest first
+	promoted       []string            // records each dataset name passed to Promote
+	promoteErr     map[string]error    // optional: force Promote to fail for a given dataset
 }
 
 func newFakeZFS(existing ...string) *fakeZFS {
@@ -45,12 +64,45 @@ func newFakeZFS(existing ...string) *fakeZFS {
 		props:       map[string]map[string]string{},
 		createdZvol: map[string]int64{},
 		origin:      map[string]string{},
+		snapshots:   map[string][]string{},
 		promoteErr:  map[string]error{},
 	}
 	for _, e := range existing {
 		f.existing[e] = true
 	}
 	return f
+}
+
+// splitSnapshotName splits "pool/ds@snap" into ("pool/ds", "snap"). The suffix
+// is empty when name is not a snapshot.
+func splitSnapshotName(name string) (dataset, suffix string) {
+	if i := strings.Index(name, "@"); i >= 0 {
+		return name[:i], name[i+1:]
+	}
+	return name, ""
+}
+
+// seedSnapshot registers a pre-existing snapshot on dataset. Call order defines
+// creation order, which is what `zfs promote` uses to decide how far back to
+// drag snapshots along.
+func (f *fakeZFS) seedSnapshot(dataset, suffix string) {
+	for _, s := range f.snapshots[dataset] {
+		if s == suffix {
+			return
+		}
+	}
+	f.snapshots[dataset] = append(f.snapshots[dataset], suffix)
+	f.existing[dataset+"@"+suffix] = true
+}
+
+// seedClone registers dest as a pre-existing clone of dataset@suffix, creating
+// the snapshot on dataset if it isn't there yet. Tests should use this rather
+// than assigning origin directly: a clone whose origin snapshot does not exist
+// is not a state real ZFS can be in, and promote would rightly reject it.
+func (f *fakeZFS) seedClone(dataset, suffix, dest string) {
+	f.seedSnapshot(dataset, suffix)
+	f.existing[dest] = true
+	f.origin[dest] = dataset + "@" + suffix
 }
 
 func (f *fakeZFS) store(name string, props map[string]string) {
@@ -78,16 +130,58 @@ func (f *fakeZFS) CreateZvol(_ context.Context, name string, sizeBytes int64, pr
 	return nil
 }
 
-func (f *fakeZFS) Destroy(_ context.Context, name string, _ bool) error {
+// Destroy models `zfs destroy`, including the two refusals the non-recursive
+// delete path (D11) depends on. Destroying something that does not exist stays
+// a success, mirroring CLI.Destroy's isNotExist tolerance. Every call is
+// recorded, successful or not, so tests can assert the call sequence.
+func (f *fakeZFS) Destroy(_ context.Context, name string, recursive bool) error {
 	f.destroyed = append(f.destroyed, name)
+	if !f.existing[name] {
+		return nil
+	}
+	dataset, suffix := splitSnapshotName(name)
+	if suffix != "" {
+		for other, o := range f.origin {
+			if o == name {
+				return fmt.Errorf("cannot destroy %q: snapshot has dependent clones (%s)", name, other)
+			}
+		}
+		remaining := f.snapshots[dataset][:0:0]
+		for _, s := range f.snapshots[dataset] {
+			if s != suffix {
+				remaining = append(remaining, s)
+			}
+		}
+		f.snapshots[dataset] = remaining
+		delete(f.existing, name)
+		delete(f.props, name)
+		return nil
+	}
+	if snaps := f.snapshots[name]; len(snaps) > 0 {
+		if !recursive {
+			return fmt.Errorf("cannot destroy %q: filesystem has children\nuse '-r' to destroy the following datasets:\n%s@%s",
+				name, name, strings.Join(snaps, "\n"+name+"@"))
+		}
+		for _, s := range append([]string(nil), snaps...) {
+			if err := f.Destroy(context.Background(), name+"@"+s, false); err != nil {
+				return err
+			}
+		}
+	}
 	delete(f.existing, name)
 	delete(f.props, name)
+	delete(f.origin, name)
+	delete(f.snapshots, name)
 	return nil
 }
 
 func (f *fakeZFS) Snapshot(_ context.Context, name string) error {
+	dataset, suffix := splitSnapshotName(name)
+	if suffix == "" {
+		return fmt.Errorf("snapshot name %q must be of the form pool/dataset@snap", name)
+	}
 	f.createdDS = append(f.createdDS, name)
-	f.existing[name] = true
+	f.seedSnapshot(dataset, suffix)
 	f.props[name] = map[string]string{"creation": "1700000000", "referenced": "1048576"}
 	return nil
 }
@@ -101,12 +195,22 @@ func (f *fakeZFS) Clone(_ context.Context, snapshot, dest string, props map[stri
 	return nil
 }
 
-// Promote is a simplified model of `zfs promote` (real semantics: D0/D12/D13 in
-// snapshot-lifecycle-redesign.md). It clears dest's origin and, mirroring real
-// ZFS's "move any clone references" behaviour (D12), reparents any *other*
-// tracked dataset whose origin was exactly the same snapshot onto the newly
-// relocated one instead. A no-op (recorded, but no state change) if dataset
-// has no origin, mirroring the real CLI.Promote's early-return.
+// Promote models `zfs promote` faithfully. A single call rewrites four things,
+// not one:
+//
+//  1. the origin snapshot *and every snapshot created before it* move from the
+//     former parent onto dataset (zfs-promote.8: "The snapshot that was cloned,
+//     and any snapshots previous to this snapshot, are now owned by the
+//     promoted clone");
+//  2. every other clone of a relocated snapshot is re-parented onto dataset
+//     (dsl_dataset_promote_sync's "move any clone references");
+//  3. dataset inherits the former parent's own previous origin — so a promoted
+//     dataset does *not* necessarily end up independent, which the live-pool
+//     run confirmed and which D13's verification check was corrected for;
+//  4. the former parent becomes a clone of dataset at that snapshot.
+//
+// A no-op (recorded, but no state change) when dataset has no origin, mirroring
+// the real CLI.Promote's early return.
 func (f *fakeZFS) Promote(_ context.Context, dataset string) error {
 	if err := f.promoteErr[dataset]; err != nil {
 		f.promoted = append(f.promoted, dataset)
@@ -114,22 +218,85 @@ func (f *fakeZFS) Promote(_ context.Context, dataset string) error {
 	}
 	origin, ok := f.origin[dataset]
 	if !ok || origin == "" {
-		return nil // already independent; real CLI.Promote never calls `zfs promote` here either
+		return nil // already independent; real CLI.Promote never shells out here either
 	}
 	f.promoted = append(f.promoted, dataset)
-	at := strings.Index(origin, "@")
-	if at < 0 {
+
+	parent, suffix := splitSnapshotName(origin)
+	if suffix == "" {
 		return fmt.Errorf("origin %q is not a snapshot", origin)
 	}
-	suffix := origin[at:]
-	relocated := dataset + suffix
-	delete(f.origin, dataset)
-	for other, o := range f.origin {
-		if o == origin {
-			f.origin[other] = relocated
+	parentSnaps := f.snapshots[parent]
+	idx := -1
+	for i, s := range parentSnaps {
+		if s == suffix {
+			idx = i
+			break
 		}
 	}
+	if idx < 0 {
+		return fmt.Errorf("cannot promote %q: origin snapshot %q does not exist on %q", dataset, origin, parent)
+	}
+	parentOrigin := f.origin[parent]
+
+	// (1) relocate the origin snapshot and everything older than it.
+	moved := append([]string(nil), parentSnaps[:idx+1]...)
+	f.snapshots[parent] = append([]string(nil), parentSnaps[idx+1:]...)
+	f.snapshots[dataset] = append(moved, f.snapshots[dataset]...)
+
+	for _, s := range moved {
+		delete(f.existing, parent+"@"+s)
+		f.existing[dataset+"@"+s] = true
+		// (2) re-parent sibling clones of each relocated snapshot.
+		for other, o := range f.origin {
+			if other == dataset || other == parent {
+				continue
+			}
+			if o == parent+"@"+s {
+				f.origin[other] = dataset + "@" + s
+			}
+		}
+	}
+
+	// (3) dataset takes over the former parent's lineage, which may be empty.
+	if parentOrigin == "" {
+		delete(f.origin, dataset)
+	} else {
+		f.origin[dataset] = parentOrigin
+	}
+	// (4) the former parent is now a clone of the promoted dataset.
+	f.origin[parent] = dataset + "@" + suffix
 	return nil
+}
+
+// ListSnapshots returns dataset's own snapshots, oldest first, mirroring
+// `zfs list -t snapshot -d 1 -s creation`.
+func (f *fakeZFS) ListSnapshots(_ context.Context, dataset string) ([]string, error) {
+	if !f.existing[dataset] {
+		return nil, fmt.Errorf("%w: %s", zpool.ErrNotExist, dataset)
+	}
+	var out []string
+	for _, s := range f.snapshots[dataset] {
+		out = append(out, dataset+"@"+s)
+	}
+	return out, nil
+}
+
+// Clones returns the datasets that currently clone snapshot, mirroring the ZFS
+// `clones` property. Sorted so the delete path's "promote the first one" choice
+// is deterministic in tests.
+func (f *fakeZFS) Clones(_ context.Context, snapshot string) ([]string, error) {
+	if !f.existing[snapshot] {
+		return nil, fmt.Errorf("%w: %s", zpool.ErrNotExist, snapshot)
+	}
+	var out []string
+	for ds, o := range f.origin {
+		if o == snapshot {
+			out = append(out, ds)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (f *fakeZFS) Get(_ context.Context, name, property string) (string, error) {
@@ -174,6 +341,65 @@ func (f *fakeZFS) ApplyOwnership(_ context.Context, mountpoint string, uid, gid 
 	}
 	f.ownership = append(f.ownership, fmt.Sprintf("%s %s:%s %s", mountpoint, u, g, mode))
 	return nil
+}
+
+// TestFakeZFSPromote_MatchesLivePoolVerification pins fakeZFS.Promote against
+// the real-pool run recorded in docs/promote-order-verification-2026-07-31.md:
+// six snapshots of one volume, each with its own backing clone, promoted in the
+// same deliberately scrambled order (t3, t1, t6, t2, t4, t5). The model must
+// reproduce that run's converged final state exactly — including the *non-empty*
+// chained origins, which is precisely what the previous test double got wrong
+// (it always cleared origin) and what D13's verification check had to be
+// corrected for.
+//
+// This test exists so the double's fidelity is verified rather than assumed: if
+// it drifts from real ZFS, every delete-path test built on it silently stops
+// meaning anything (known-pitfalls.md class 17).
+func TestFakeZFSPromote_MatchesLivePoolVerification(t *testing.T) {
+	const vol = "tank/test/vol1"
+	clone := func(n int) string { return fmt.Sprintf("tank/test/csi-snap-t%d", n) }
+	snap := func(n int) string { return fmt.Sprintf("snap_t%d", n) }
+
+	z := newFakeZFS(vol)
+	for n := 1; n <= 6; n++ {
+		z.seedClone(vol, snap(n), clone(n))
+	}
+
+	for _, n := range []int{3, 1, 6, 2, 4, 5} {
+		if err := z.Promote(context.Background(), clone(n)); err != nil {
+			t.Fatalf("promote csi-snap-t%d: %v", n, err)
+		}
+	}
+
+	// Final state, verbatim from the live run's §3.6 listing.
+	for ds, want := range map[string]string{
+		clone(1): "",
+		clone(2): clone(1) + "@" + snap(1),
+		clone(3): clone(2) + "@" + snap(2),
+		clone(4): clone(3) + "@" + snap(3),
+		clone(5): clone(4) + "@" + snap(4),
+		clone(6): clone(5) + "@" + snap(5),
+		vol:      clone(6) + "@" + snap(6),
+	} {
+		if got := z.origin[ds]; got != want {
+			t.Errorf("origin[%s] = %q, want %q", ds, got, want)
+		}
+	}
+
+	// Every backing clone owns exactly and only its own snapshot...
+	for n := 1; n <= 6; n++ {
+		if got := z.snapshots[clone(n)]; !reflect.DeepEqual(got, []string{snap(n)}) {
+			t.Errorf("snapshots[csi-snap-t%d] = %v, want [%s]", n, got, snap(n))
+		}
+	}
+	// ...and vol1 has none left, which is the precondition that makes D11's
+	// plain (non-recursive) destroy succeed.
+	if got := z.snapshots[vol]; len(got) != 0 {
+		t.Errorf("snapshots[vol1] = %v, want none", got)
+	}
+	if err := z.Destroy(context.Background(), vol, false); err != nil {
+		t.Errorf("non-recursive destroy of vol1 should succeed: %v", err)
+	}
 }
 
 func onlinePool() *storagev1alpha1.ZfsPool {
@@ -781,8 +1007,8 @@ func TestZfsDatasetReconcile_DeletePromotesStandaloneBackingCloneAndSucceeds(t *
 		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsSnapshot{}).
 		Build()
 
-	z := newFakeZFS("tank/k8s/pvc-1", "tank/k8s/csi-snap-x")
-	z.origin["tank/k8s/csi-snap-x"] = "tank/k8s/pvc-1@csi-snap-x"
+	z := newFakeZFS("tank/k8s/pvc-1")
+	z.seedClone("tank/k8s/pvc-1", "csi-snap-x", "tank/k8s/csi-snap-x")
 
 	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err != nil {
@@ -820,8 +1046,8 @@ func TestZfsDatasetReconcile_DeletePromotesDirectCloneDependents(t *testing.T) {
 		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
-	z := newFakeZFS("tank/k8s/pvc-src", "tank/k8s/pvc-clone")
-	z.origin["tank/k8s/pvc-clone"] = "tank/k8s/pvc-src@clone-" + cloneSnapshotSuffix("pvc-clone")
+	z := newFakeZFS("tank/k8s/pvc-src")
+	z.seedClone("tank/k8s/pvc-src", "clone-"+cloneSnapshotSuffix("pvc-clone"), "tank/k8s/pvc-clone")
 
 	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-src"}}); err != nil {
@@ -836,23 +1062,19 @@ func TestZfsDatasetReconcile_DeletePromotesDirectCloneDependents(t *testing.T) {
 }
 
 // TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents verifies
-// D12/D15's generalized dependent tracking: deleting a standalone-mode backing
-// clone with two simultaneous restored-PVC dependents (each tracked via its
-// own restored-by.* finalizer) promotes both away and still succeeds,
-// regardless of real ZFS's sibling-clone-reparenting behaviour when one is
-// promoted before the other (§2.9).
+// D17 for the §2.9 case: deleting a standalone-mode backing clone with two
+// simultaneous restored-PVC dependents succeeds. Promoting *one* of them
+// detaches the snapshot from both, because ZFS re-parents the sibling onto the
+// promoted clone in the same operation — so a single promote is enough, and
+// nothing needs to have been tracked in advance.
 func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
 	isController, blockOwnerDeletion := true, true
 	backing := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "csi-snap-x",
-			Finalizers: []string{
-				zfsDatasetFinalizer,
-				restoredByFinalizer("pvc-r1"),
-				restoredByFinalizer("pvc-r2"),
-			},
+			Name:              "csi-snap-x",
+			Finalizers:        []string{zfsDatasetFinalizer},
 			DeletionTimestamp: &now,
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion:         storagev1alpha1.GroupVersion.String(),
@@ -867,22 +1089,27 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/pvc-src@csi-snap-x"},
 		},
 	}
+	// The owning snapshot must itself be terminating, or F7's guard refuses.
 	snapOwner := &storagev1alpha1.ZfsSnapshot{
-		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "snap-1",
+			Finalizers:        []string{zfsSnapshotFinalizer},
+			DeletionTimestamp: &now,
+		},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
 			SourceVolume: "pvc-src", Mode: storagev1alpha1.SnapshotModeStandalone,
 		},
 	}
 	r1 := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-r1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-r1", Finalizers: []string{zfsDatasetFinalizer}},
 		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-r1", Type: storagev1alpha1.DatasetTypeFilesystem,
 			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-x@restore-source"},
 		},
 	}
 	r2 := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-r2"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-r2", Finalizers: []string{zfsDatasetFinalizer}},
 		Spec: storagev1alpha1.ZfsDatasetSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-r2", Type: storagev1alpha1.DatasetTypeFilesystem,
 			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-x@restore-source"},
@@ -894,42 +1121,186 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
-	z := newFakeZFS("tank/k8s/csi-snap-x", "tank/k8s/pvc-r1", "tank/k8s/pvc-r2")
-	z.origin["tank/k8s/pvc-r1"] = "tank/k8s/csi-snap-x@restore-source"
-	z.origin["tank/k8s/pvc-r2"] = "tank/k8s/csi-snap-x@restore-source"
+	z := newFakeZFS("tank/k8s/csi-snap-x")
+	// The backing clone's own state after its source volume was deleted earlier:
+	// the raw origin snapshot relocated onto it (older), then its own
+	// @restore-source (newer), with both restores cloning the latter.
+	z.seedSnapshot("tank/k8s/csi-snap-x", "csi-snap-x")
+	z.seedClone("tank/k8s/csi-snap-x", restoreSourceSnapshotName, "tank/k8s/pvc-r1")
+	z.seedClone("tank/k8s/csi-snap-x", restoreSourceSnapshotName, "tank/k8s/pvc-r2")
 
 	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-x"}}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	if len(z.promoted) != 2 {
-		t.Fatalf("expected both restored dependents promoted exactly once, got %v", z.promoted)
+	// One promote detaches the snapshot from both dependents: ZFS re-parents
+	// pvc-r2 onto pvc-r1 as part of the same operation (§2.9).
+	if !reflect.DeepEqual(z.promoted, []string{"tank/k8s/pvc-r1"}) {
+		t.Fatalf("promoted = %v, want exactly [tank/k8s/pvc-r1]", z.promoted)
 	}
-	if o := z.origin["tank/k8s/pvc-r1"]; o != "" {
-		t.Errorf("pvc-r1 origin = %q, want cleared (fully independent)", o)
+	if o, want := z.origin["tank/k8s/pvc-r2"], "tank/k8s/pvc-r1@"+restoreSourceSnapshotName; o != want {
+		t.Errorf("pvc-r2 origin = %q, want %q (sibling re-parented onto pvc-r1)", o, want)
 	}
-	if o := z.origin["tank/k8s/pvc-r2"]; o != "" {
-		t.Errorf("pvc-r2 origin = %q, want cleared (fully independent)", o)
-	}
-	// D15: a backing clone's own internal snapshot artifacts (its
-	// "@restore-source" self-snapshot and the relocated raw origin snapshot) are
-	// destroyed first, then the clone itself — all non-recursively (D11).
-	want := []string{
-		"tank/k8s/csi-snap-x@" + restoreSourceSnapshotName,
-		"tank/k8s/csi-snap-x@csi-snap-x",
-		"tank/k8s/csi-snap-x",
-	}
-	if !reflect.DeepEqual(z.destroyed, want) {
-		t.Fatalf("destroyed = %v, want %v", z.destroyed, want)
+	// Both of the backing clone's snapshots relocated onto pvc-r1, so it owns no
+	// snapshots by the time destroy runs and no artifact cleanup is needed.
+	if !reflect.DeepEqual(z.destroyed, []string{"tank/k8s/csi-snap-x"}) {
+		t.Fatalf("destroyed = %v, want exactly [tank/k8s/csi-snap-x]", z.destroyed)
 	}
 
-	// pvc-r1/pvc-r2 remain untouched, independent objects — only the backing
-	// clone (and its own tracking finalizers) were affected.
+	// Both restored PVCs survive and stay deletable in either order — that is
+	// the property F2c was breaking. Delete pvc-r1 (which now owns the shared
+	// history) first, then pvc-r2.
 	for _, name := range []string{"pvc-r1", "pvc-r2"} {
-		var got storagev1alpha1.ZfsDataset
-		if err := c.Get(context.Background(), client.ObjectKey{Name: name}, &got); err != nil {
-			t.Errorf("get %q: %v", name, err)
+		var dep storagev1alpha1.ZfsDataset
+		if err := c.Get(context.Background(), client.ObjectKey{Name: name}, &dep); err != nil {
+			t.Fatalf("get %q: %v", name, err)
 		}
+		if err := c.Delete(context.Background(), &dep); err != nil {
+			t.Fatalf("delete %q: %v", name, err)
+		}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name}}); err != nil {
+			t.Fatalf("reconcile delete %q: %v", name, err)
+		}
+		if err := c.Get(context.Background(), client.ObjectKey{Name: name}, &dep); err == nil {
+			t.Errorf("%q still present after delete", name)
+		}
+	}
+}
+
+// TestZfsDatasetReconcile_DirectCloneRemainsDeletableAfterSourceDeleted is the
+// F2a regression. Deleting a direct PVC-to-PVC clone's source promotes the
+// clone, which relocates ADR-0009's intermediate "@clone-<hash>" snapshot onto
+// it. Before D17/D18 nothing ever cleaned that relocated snapshot up, so the
+// clone's own non-recursive destroy failed with "filesystem has children" on
+// every retry and its ZfsDataset stayed Terminating forever — the PV never
+// released and the space never reclaimed.
+func TestZfsDatasetReconcile_DirectCloneRemainsDeletableAfterSourceDeleted(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	cloneSnap := "clone-" + cloneSnapshotSuffix("pvc-clone")
+
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-src", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	clone := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-clone", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-clone", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Source: &storagev1alpha1.DatasetSource{Volume: "k8s/pvc-src"},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), src, clone).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
+		Build()
+
+	z := newFakeZFS("tank/k8s/pvc-src")
+	z.seedClone("tank/k8s/pvc-src", cloneSnap, "tank/k8s/pvc-clone")
+
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	ctx := context.Background()
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-src"}}); err != nil {
+		t.Fatalf("reconcile delete source: %v", err)
+	}
+	// The intermediate snapshot is now owned by the clone, exactly as real ZFS
+	// leaves it — this is the state the old code could never recover from.
+	if got := z.snapshots["tank/k8s/pvc-clone"]; !reflect.DeepEqual(got, []string{cloneSnap}) {
+		t.Fatalf("snapshots[pvc-clone] = %v, want [%s]", got, cloneSnap)
+	}
+
+	var dep storagev1alpha1.ZfsDataset
+	if err := c.Get(ctx, client.ObjectKey{Name: "pvc-clone"}, &dep); err != nil {
+		t.Fatalf("get pvc-clone: %v", err)
+	}
+	if err := c.Delete(ctx, &dep); err != nil {
+		t.Fatalf("delete pvc-clone: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-clone"}}); err != nil {
+		t.Fatalf("reconcile delete clone: %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKey{Name: "pvc-clone"}, &dep); err == nil {
+		t.Fatal("pvc-clone still present: its non-recursive destroy did not succeed")
+	}
+
+	// The relocated artifact was destroyed explicitly, before the dataset, and
+	// never via `zfs destroy -r`.
+	wantOrder := []string{"tank/k8s/pvc-src", "tank/k8s/pvc-clone@" + cloneSnap, "tank/k8s/pvc-clone"}
+	if !reflect.DeepEqual(z.destroyed, wantOrder) {
+		t.Fatalf("destroyed = %v, want %v", z.destroyed, wantOrder)
+	}
+}
+
+// TestZfsDatasetReconcile_DeleteBlocksOnUnprovisionedDependent verifies D21: a
+// restore whose ZfsDataset object exists but whose `zfs clone` has not run yet
+// is invisible in the ZFS clone graph, so the delete path must block on spec
+// rather than destroy the source out from under it.
+func TestZfsDatasetReconcile_DeleteBlocksOnUnprovisionedDependent(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	backing := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-x", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/csi-snap-x", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	pending := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-restore", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-restore", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-x@" + restoreSourceSnapshotName},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), backing, pending).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
+		Build()
+
+	// Only the backing clone exists on disk; pvc-restore has not been cloned yet.
+	z := newFakeZFS("tank/k8s/csi-snap-x")
+	z.seedSnapshot("tank/k8s/csi-snap-x", restoreSourceSnapshotName)
+
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-x"}})
+	if err == nil {
+		t.Fatal("expected the delete to block while a declared dependent is not provisioned yet")
+	}
+	if len(z.destroyed) != 0 {
+		t.Fatalf("nothing should have been destroyed, got %v", z.destroyed)
+	}
+}
+
+// TestZfsDatasetReconcile_DeleteRefusesForeignSnapshot verifies D18's
+// fail-loud allow-list: a snapshot the driver did not create blocks the destroy
+// with a clear error instead of being silently removed or triggering a
+// fallback to `zfs destroy -r`.
+func TestZfsDatasetReconcile_DeleteRefusesForeignSnapshot(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), vol).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
+		Build()
+
+	z := newFakeZFS("tank/k8s/pvc-1")
+	z.seedSnapshot("tank/k8s/pvc-1", "sanoid_daily_2026-08-03")
+
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}})
+	if err == nil {
+		t.Fatal("expected the delete to refuse a snapshot the driver did not create")
+	}
+	if !strings.Contains(err.Error(), "not created by this driver") {
+		t.Errorf("error = %v, want it to name the foreign snapshot as the reason", err)
+	}
+	if len(z.destroyed) != 0 {
+		t.Fatalf("nothing should have been destroyed, got %v", z.destroyed)
 	}
 }

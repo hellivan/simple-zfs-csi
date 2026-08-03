@@ -770,6 +770,16 @@ in the user's cluster yet, so no migration concern — go straight to the better
 | D14 | Is `ZfsSnapshot` still the right CRD name/kind, given `standalone` mode is backed by a raw snapshot + backing clone + self-snapshot, not "just" a plain ZFS snapshot? (§2.10) | **Keep the name and the single CRD kind — add `Mode` as a field (D8), not a new kind.** Matches the precedent already set by `ZfsDataset`: structural kind (`DatasetType`: filesystem/volume) and provenance/mechanism (`DatasetSource`: plain-create vs. clone vs. restore) are already orthogonal, field-level concerns on that CRD, not separate kinds — a cloned `ZfsDataset` isn't renamed `ZfsClone`. `Mode` (standalone/integrated) is the same category of concern for `ZfsSnapshot`: it's about *mechanism*, not *contract*. At the CSI/`VolumeSnapshot` contract level both modes are identical (a point-in-time, read-only, restorable capture of a volume) — which is what "snapshot" means at that layer, regardless of ZFS-level implementation. Reinforced by precedent: Ceph-CSI's own "snapshot" is *also* implemented as a clone-image + its own self-snapshot under the hood (§2.2), and Ceph doesn't rename their concept for it. Renaming the CRD kind itself would also be a large, mostly-cosmetic refactor (touches every reference across controllers/CSI/charts/CRDs) for no functional gain — same category of cost as the naming-consistency item already deferred as future work in [independent-resource-naming-redesign.md](independent-resource-naming-redesign.md). |
 | D15 | Backing clone representation: raw exec-managed dataset vs. a real, owned child `ZfsDataset` object — could we just reuse `ZfsDataset` instead of two CRDs? (§2.10 note, raised as a follow-up) | **Keep `ZfsDataset`/`ZfsSnapshot` as two CRDs (D14 stands), but represent the *backing clone itself* as a real, `ZfsSnapshot`-owned child `ZfsDataset` object** (`ownerReference`, `blockOwnerDeletion: true` — appropriate here, unlike the restored-PVC relationship, since this is a genuine strict 1:1 lifecycle-bound parent/child). Provisioning reuses `ZfsDatasetReconciler`'s existing ADR-0009 clone-creation code path instead of a second, parallel raw-exec implementation in `ZfsSnapshotReconciler`. Teardown reuses that same reconciler's own (D3/D7/D9/D12/D13) promote-then-destroy delete-path logic instead of `ZfsSnapshotReconciler` duplicating a bespoke promote/retry/dependent-chaining loop. This **unifies D4 into D12**: the `restored-by.*` finalizer now lives on the backing-clone `ZfsDataset` (where the clone relationship actually is), tracked/promoted by the same generalized mechanism as D12's `promoted-onto` finalizers — one mechanism, one place, rather than two similar-but-separate implementations split across two reconcilers. `ZfsSnapshotReconciler`'s own delete path shrinks to: delete the child object (delegating all promote complexity), wait for it to be gone, run the required raw-origin-snapshot cleanup on the true source, then release its own finalizer. |
 | D16 | Does D3's promote-loop iteration order matter when a source has multiple, independent snapshots, each with its own backing clone (§2.11)? | **Confirmed correct, empirically, on a live pool (§2.11 test log) — order-independent, self-correcting, no bug, no design change needed.** Ran the exact scrambled-order scenario (t3, t1, t6, t2, t4, t5) against a real ZFS pool (`spinning-archive`, isolated scratch dataset): `zfs promote`'s history-walk is bounded by the *current* clone-origin chain, not an unconditional walk to genesis as a literal source read first suggested — promoting `csi-snap-t6` stopped exactly at `csi-snap-t3`'s boundary instead of reaching through and stealing `t2`/`t3` from it, and a promoted-and-already-independent `csi-snap-t1` was never touched again by any later promote in the batch. Final state: every backing clone ends up owning exactly and only its own snapshot, `vol1` ends with zero snapshots of its own (`zfs destroy vol1`, no `-r`, succeeds). No fixpoint loop, no reordering, and no `promoted-onto` cross-tracking are needed for this specific case — a single unconditional pass over all tracked dependents (as originally designed) is sufficient. (The live test also surfaced and fixed a real, separate bug in D13's verification check — see D13.) |
+| D17 | How dependents are discovered at delete time: Kubernetes-side bookkeeping vs. asking ZFS (raised by the 2026-08-03 code review; the four defects it found are described in §9.1) | **Ask ZFS at the moment of deletion, and remove the `promoted-onto.*`/`restored-by.*` tracking finalizers from the project entirely** — deleted, not demoted to advisory, so exactly one finalizer concept survives repo-wide ("run the external side-effect before the object is allowed to disappear": `zfsdataset`, `zfssnapshot`, `zfsshareattachrequest`). D4/D12/D15 stored the ZFS clone graph in finalizer lists and replayed it on delete. That was the mistake: **one `zfs promote` rewrites four edges of that graph at once** — it relocates the origin snapshot *and every snapshot older than it* onto the promoted clone, re-parents every sibling clone of those snapshots onto it, gives the promoted clone the former parent's previous `origin`, and turns the former parent into a clone of the promoted one. The implementation recorded only the third of those four, which is the single root cause of all four F2 manifestations (permanently undeletable direct clones, permanently stuck `DeleteSnapshot`, wrong tracking with two simultaneous restores, wholly untracked backing-clone chains). Extending the mirror to cover the other three edges was considered and **rejected**: it grows the mirror while leaving it one interrupted reconcile away from drifting, and the process can crash between any two edge updates. Instead the delete path queries the live graph — `zfs list -t snapshot -d 1 <ds>` for what the dataset owns, and the `clones` property for what depends on each of those snapshots — promotes dependents away in a bounded loop until none remain, then cleans up leftovers (D18). Nothing is remembered between reconciles, so nothing can go stale and a crash mid-sequence simply resumes from the truth. Chosen over that review's own recommendation, which was to keep the finalizer mirror and extend it to cover the remaining three edges. Cost accepted: one `zfs list` plus one property read per snapshot on the delete path, and the loss of the Kubernetes-side view of current dependencies (D20). |
+| D18 | Snapshots and clones found inside the driver's own prefix that the driver did not create | **Explicit allow-list, and fail loud on anything else — never `-r`, never guess.** A leftover snapshot is destroyed only if its short name matches one the driver demonstrably creates (`restore-source`, `clone-<16 hex>`, `csi-snap-<uuid>`); a clone is promoted only if it corresponds to a known `ZfsDataset` on the same pool. Anything else errors, the object stays visibly `Terminating`, and a human decides — consistent with ADR-0013's fail-loud philosophy and with D11's stated intent. Additional assertion, cheap and free: refuse to destroy a `csi-snap-<uuid>` snapshot while a non-terminating `ZfsSnapshot` still names it, so the allow-list can never be turned against live snapshot data even if some future sequence relocates a raw snapshot unexpectedly. Rejected: a deny-list (unbounded, and wrong by default), and falling back to `zfs destroy -r` (the exact silent-destruction risk D11 removed). Accepted cost: a clone or snapshot created outside the driver blocks that dataset's deletion until resolved manually. Acceptable because the `datasetPrefix` is designated to the driver and administrators only intervene there in emergencies. |
+| D19 | `DeleteSnapshot`'s required raw-origin `zfs destroy` when a promoted restored PVC still clones it (the F2b defect in §9.1; the 2026-08-03 review flagged it but left the resolution open) | **Promote the raw snapshot's remaining clones away first, then destroy it.** Promoting relocates the raw snapshot onto the dependent, so the subsequent `zfs destroy` becomes a `NotExist` no-op and the finalizer releases normally. This keeps D11's invariant exactly as written — a `ZfsSnapshot` still cannot disappear until its raw snapshot is confirmed dealt with — instead of weakening it. Rejected: relaxing the gate (skip the destroy while clones remain and let the eventual owner's delete path clean it up), which would reintroduce the "a live `ZfsSnapshot` no longer implies a live raw snapshot" ambiguity that D11 was specifically written to remove. Note this is the one place a raw snapshot must be detached from a dataset that is *not* itself being deleted, which is why it needs its own call site rather than falling out of `beforeDestroy`. |
+| D20 | Where dependency provenance lives once the tracking finalizers are gone (D17) | **Nowhere new — `spec` already carries it. Add structured log lines for the action trail and nothing else.** Checked field by field: "pvc-R was created by cloning snapshot X" is `pvc-R.Spec.Source.Snapshot`; "pvc-clone was cloned from volume V" is `Spec.Source.Volume`; "snapshot S was taken from volume A" is `S.Spec.SourceVolume`/`Spec.Dataset`; "backing clone C belongs to S" is C's `ownerReference`. All are written once at creation and never recomputed, so they are strictly more trustworthy than the finalizers were. What the finalizers added on top was *current* dependency — precisely the derived thing D17 stops mirroring, and precisely what ZFS knows authoritatively. The only genuinely unrecorded thing is the *sequence of promotes* that got from creation state to current state, which matters when reading an inverted origin graph ("why is my source volume a clone of a PVC?"); a `logger.Info` per promote and per artifact destroy covers it. Rejected: a `status.dependents` field (derivable from `zfs list -o name,origin`, so a pure cache that can only add drift), and Kubernetes Events (≈1 h default TTL makes them useless as the durable record this would need to be, and they would mean wiring an `EventRecorder` into two binaries for a `kubectl describe` convenience). |
+| D21 | The declared-but-not-yet-created dependent race (a restore whose `ZfsDataset` object exists but whose `zfs clone` has not run yet is invisible to ZFS, so D17 would destroy its source out from under it) | **Block the destroy while any `ZfsDataset` names this dataset in `Spec.Source` and its own ZFS dataset does not exist yet.** This is a read of *desired* state — `spec` is authoritative by construction, written once by the CSI controller, and is not a mirror of anything — so it does not reintroduce what D17 removed. It sits alongside the two existing Kubernetes-level policy blocks (D3's not-yet-`Ready` snapshot and §3.2's live integrated-mode snapshot) rather than in the ZFS-driven half of the delete path. Strictly better than the status quo: today's `restored-by.*` finalizer only accidentally covers the window *after* the dependent object exists (`Promote` on a missing dataset errors and requeues), and does not cover the window between adding the finalizer and creating the object at all, because a missing dependent object is treated as "gone" and the finalizer is dropped. |
+| D22 | Restatement of D11's "zero snapshots" invariant (prompted by the 2026-08-03 review) | **D11's conclusion stands unchanged; its reasoning is superseded.** D11 argued that once every *tracked* dependent has been promoted away, the dataset being deleted has zero snapshots of its own. That is true of the dataset being deleted, but it silently assumed nothing ever lands back *on* it — whereas `zfs promote` relocates snapshots onto whichever dataset is promoted, so every promote creates snapshots somewhere. Restated: **a non-recursive `zfs destroy` is safe because `beforeDestroy` leaves the dataset with zero snapshots of its own, re-verified by listing them from ZFS — achieved by promoting away every remaining clone (D17) and then destroying every remaining driver-owned snapshot artifact (D18), and failing loud rather than falling back to `-r` if anything unrecognised is left.** Dropping `-r` was and remains correct; D11 is not modified. |
+| D23 | Scope of D16's "no design change needed" conclusion (prompted by the 2026-08-03 review) | **Narrowed to what the run actually verified.** The [2026-07-31 live-pool run](promote-order-verification-2026-07-31.md) verified convergence and order-independence of the *promote batch*, and that is all — it deliberately executed no `zfs destroy` whatsoever (its §5), which is exactly where F2a–F2d fail. D16 is therefore correct as far as it goes and must **not** be read as evidence that the delete path as a whole is sound; its final-state listing in fact *documents* F2d (backing clones chained to one another, each owning a snapshot the next one clones, none of it tracked). Re-verification must repeat the same scenario *including* the deletes — see §9. |
+| D24 | Which spec fields are immutable (§9.1, F10) | **Freeze behaviour, not location.** `ZfsSnapshot.Spec.Mode` and `Spec.SourceType` get `+kubebuilder:validation:XValidation:rule="self == oldSelf"`: neither points at anything, and flipping `Mode` on a live object silently inverts its teardown semantics (promote path ⇄ blocking path) against ZFS state built for the other mode, orphaning a backing clone, its `@restore-source`, and any PVC restored from it. There is no repair scenario either field enables. **Deliberately left mutable:** `ZfsDataset.Spec.Dataset`, `ZfsSnapshot.Spec.Dataset`, `ZfsSnapshot.Spec.SnapshotName`. Those are *locations*, and repointing them by hand is a supported emergency workflow (moving datasets to a different prefix, renames, pointing a CR at a dataset prepared with matching properties). Freezing them would turn a recoverable incident into "delete the CR and hope the finalizer doesn't destroy the wrong thing", and would make the structure rigid for no safety gain. Safe to leave mutable specifically because nothing in the delete path resolves dependents through those fields any more (D17). Generalised as a repo-wide rule in [api-conventions.md](api-conventions.md) §5. |
+| D25 | D10's clone/restore compatibility checks when the source volume is already gone (§9.1, F12) | **Capture the source's structural properties onto `ZfsSnapshotSpec` at `CreateSnapshot` time.** The restore-side check looks the source `ZfsDataset` up live and returns "compatible" when it is missing — but a source that no longer exists is the *headline* scenario for `standalone` snapshots, so D10's checks were effectively dead exactly where they matter most: a restore into a StorageClass with a different `fsType` passed the controller and failed much later at `NodeStageVolume`, and a different `volblocksize` was ignored entirely and silently (`clone()` never passes it, so ZFS raises nothing either). New optional fields `sourceFSType`, `sourceVolblocksize`, `sourceProperties` mirror exactly what `SourceType` already does for the identical reason, and are compared against when the live source is unavailable. Excluded from `ensureSnapshot`'s idempotency comparison — the persisted object stays authoritative, same convention as `SnapshotName` — so a source whose `Status.FSType` is populated between CSI retries cannot cause a spurious `AlreadyExists`. |
+| D26 | Which component authors the backing-clone `ZfsDataset` **object**: the CSI controller (as for every other `ZfsDataset`) or the node agent? (raised while fixing F1, since that finding is a direct consequence of the answer) | **The node agent — `ZfsSnapshotReconciler` — deliberately, as the project's one documented exception to "the control plane authors CRDs, node agents execute ZFS".** The standalone create flow inherently alternates between the two: `zfs snapshot` (host) → create the backing-clone object (API) → `zfs clone` (host) → `zfs snapshot @restore-source` (host). Only the middle step could move, and moving it costs more than it buys: `ZfsSnapshot.Status.Phase == Ready` currently means "backing clone exists *and* `@restore-source` taken", so the controller would need a **new intermediate status field or condition** whose sole purpose is to signal "raw snapshot taken, you may create the clone now"; the flow would ping-pong controller→agent→controller→agent; `CreateSnapshot` is a request/response RPC with a deadline, a poor host for multi-step convergence with external side effects; the reconciler's self-healing property is lost (today a backing-clone object deleted by accident is recreated on the next pass — controller-authored, nothing would ever recreate it); and `backingCloneProperties` plus the dataset-path derivation would have to move into or be duplicated in `internal/csi`, directly against D15's purpose of collapsing two implementations into one. Deletion cannot be delegated to Kubernetes garbage collection either: the `ZfsSnapshot`'s finalizer will not release until the backing clone is gone, and GC will not remove the backing clone until the `ZfsSnapshot` is actually out of etcd — a deadlock with or without `blockOwnerDeletion`, which is why `reconcileDelete` does an explicit `Delete` and polls. **Accepted trade-off, recorded explicitly:** the discovery role must therefore hold `create`/`delete` on `zfsdatasets`, and a `ZfsDataset` object carries a `poolGUID` — so a compromised node agent can author objects that induce a *different* node's agent to act on a pool it does not host. That is lateral movement a node-root component does not otherwise have. Judged acceptable: modest next to the host root the agent already holds, and RBAC cannot express the constraint that would actually close it ("only `ZfsDataset`s owned by a `ZfsSnapshot`") — that would need a `ValidatingAdmissionPolicy`, disproportionate here. |
 
 ## 5. Rejected alternatives (and why)
 
@@ -1022,3 +1032,168 @@ None outstanding as of writing except one **explicitly flagged, unresolved item*
 Every other decision point raised (D0-D16 aside from the above) has a final answer
 recorded above. If new questions come up during implementation, add them here as `D17`,
 `D18`, etc., following the same table format, before resolving them.
+
+---
+
+## 9. Post-review corrections (2026-08-03) — findings, decisions, and plan
+
+This section records the outcome of a code review of `ef6a39b..9db3041` carried out on
+2026-08-03. That review lived in a scratch document that is deliberately **not** committed,
+so everything needed to act on it is inlined below — findings, evidence, decisions and
+plan. The `F<n>` labels are the review's own numbering, kept only so the entries here can
+refer to one another; they are defined in this section and nowhere else.
+
+**All findings are implemented** (2026-08-03). What remains is the real-pool
+re-verification in §9.2, which cannot be done from a test suite.
+
+### 9.1 Findings and disposition
+
+#### The four delete-path defects (F2a–F2d) and their shared cause
+
+D11 argued that once every tracked dependent has been promoted away, the dataset being
+deleted has zero snapshots of its own, so a plain `zfs destroy` always succeeds. That is
+true of the dataset being deleted. What it misses is that **`zfs promote` does not make
+snapshots disappear — it relocates them onto the dependent.** Per `zfs-promote.8`: "The
+snapshot that was cloned, and any snapshots previous to this snapshot, are now owned by
+the promoted clone." So every promote *creates* snapshots on some other dataset, and
+`zfs destroy <fs>` without `-r` refuses whenever a dataset has any snapshot of its own:
+
+```
+cannot destroy 'tank/x': filesystem has children
+use '-r' to destroy the following datasets:
+tank/x@snap
+```
+
+Before D11 the driver passed `recursive=true`, which papered over this. With D11 it became
+a hard, permanent failure. The existing cleanup in `beforeDestroy` is gated on
+`backingCloneOwnerSnapshotName` returning `ok=true`, which happens **only** when the
+dataset has a `ZfsSnapshot` `ownerReference` — i.e. only for standalone backing clones.
+Restored PVCs, direct PVC-to-PVC clones and sibling backing clones get no cleanup at all,
+even though they are exactly the datasets the promote machinery dumps relocated snapshots
+onto. It also handles only two fixed suffixes, while a real promote can drag along an
+arbitrary set of older snapshots.
+
+**F2a — direct PVC-to-PVC clone becomes permanently undeletable (a regression).**
+`pvc-clone` is created from `pvc-src` via ADR-0009's `<src>@clone-<hash>` path. Deleting
+`pvc-src` promotes `pvc-clone`, which relocates `@clone-<hash>` onto it; `zfs destroy
+pvc-src` then succeeds. Later deleting `pvc-clone` does nothing in `beforeDestroy` (not a
+backing clone, no tracking finalizers), and the non-recursive destroy fails with
+"filesystem has children" — forever. The PV is never released and the space never
+reclaimed.
+
+**F2b — `DeleteSnapshot` with a live restored PVC gets permanently stuck.** With `pvc-R`
+restored from standalone snapshot `S` of `pvc-A`: deleting `S` deletes the backing clone
+`BC`, whose `beforeDestroy` promotes `pvc-R`. `pvc-R` takes `@restore-source` and its
+origin becomes `A@csi-snap-x`. `BC` destroys fine. Then `reconcileDelete` runs its
+required raw-origin cleanup, `zfs destroy A@csi-snap-x`, which fails with "snapshot has
+dependent clones" because `pvc-R` is now a clone of it. The `zfssnapshot` finalizer is
+deliberately gated on that destroy succeeding, so the `ZfsSnapshot` stays `Terminating`
+forever — directly violating §3.1/D4's "`DeleteSnapshot` always succeeds, never blocks".
+Compounding it, `pvc-R` now permanently owns `@restore-source`, so deleting it later hits
+F2a and it becomes undeletable too.
+
+**F2c — two restores from one snapshot produce stale/incorrect tracking.**
+`promoteTrackedDependents` promotes each dependent and *then* reads its origin, so with two
+dependents the second promote invalidates the first one's already-recorded result. With
+`pvc-R1` and `pvc-R2` both restored from `S`: promoting `R1` records `promoted-onto.pvc-R1`
+on `pvc-A`; promoting `R2` then *steals* `@restore-source` from `R1`, making `R1.origin` =
+`R2@restore-source`. The real `R1 → R2` dependency ends up untracked, the recorded
+`promoted-onto.pvc-R1` on `pvc-A` is simply wrong, and deleting `pvc-R2` then fails
+permanently.
+
+**F2d — sibling backing clones chain to each other with no tracking registered.** Proven
+by this project's own live-pool run: the converged final state in
+[promote-order-verification-2026-07-31.md](promote-order-verification-2026-07-31.md) §3.6
+shows `csi-snap-t2` origin `csi-snap-t1@snap_t1`, `csi-snap-t3` origin
+`csi-snap-t2@snap_t2`, and so on. After `DeleteVolume` on a source with N standalone
+snapshots the backing clones are chained to one another, each owning a real snapshot the
+next one clones. `promoteSnapshotDependents` promotes each backing clone but never
+re-reads `origin` and never registers a `promoted-onto` finalizer — unlike
+`promoteTrackedDependents`, which does. So none of these relationships are tracked, and
+later deleting snapshot `t1` fails on "snapshot has dependent clones" and stays stuck.
+`promoteDirectCloneDependents` has the identical omission.
+
+#### Disposition
+
+| # | Severity | Disposition |
+|---|----------|-------------|
+| F1 | Blocker | **Fix.** Agent RBAC lacks `create`/`delete` on `zfsdatasets`, so `standalone` — the new default — cannot create or delete its backing clone at all: `CreateSnapshot` fails with 403 and parks the `ZfsSnapshot` in `Error`/`BackingCloneCreateFailed`, and `DeleteSnapshot` fails with 403 and stays `Terminating` forever. **Blast radius is the standalone snapshot lifecycle only** — PVC create/delete/expand, restore-from-snapshot and direct PVC-to-PVC clone all author their `ZfsDataset` through the `csi-controller` ServiceAccount, whose ClusterRole already grants the full verb set, and `integrated`-mode snapshots involve no backing-clone object at all. The gap is specific to D15/D26 handing a node agent a job that until then only the cluster controller did. Add the verbs to the discovery ClusterRole, add the missing `+kubebuilder:rbac` markers to `ZfsSnapshotReconciler` (it declares none for `zfsdatasets`, and none for `zfspools` either despite reading them), and add `zfssnapshots/finalizers: ["update"]` — `metav1.NewControllerRef` sets `blockOwnerDeletion: true`, which the `OwnerReferencesPermissionEnforcement` admission plugin rejects without it (off by default in kubeadm, on in several managed distributions, so this must not depend on cluster configuration). `ZfsDatasetReconciler`'s own marker is deliberately left at `get;list;watch;update;patch`: it never authors `ZfsDataset` objects, and the chart's single discovery role is the union of both reconcilers' needs. Note `make manifests` runs `controller-gen` with **no `rbac:` generator**, so these markers are documentation only and never become YAML — which is why the drift went unnoticed and why the chart role has to be edited by hand. Closing that gap for good, including the review's own suggested cheap guard (a test asserting each reconciler's declared verbs are a subset of what its ServiceAccount is granted in the rendered chart), is tracked in [future-work.md](future-work.md) under "Generate RBAC from the kubebuilder markers". |
+| F2a–F2d | Critical | **Done (2026-08-03) — see D17/D18/D19/D21/D22.** All four shared the one root cause described above, and all four are fixed by replacing the finalizer mirror with live ZFS queries rather than extending it. Each has a named regression test: `TestZfsDatasetReconcile_DirectCloneRemainsDeletableAfterSourceDeleted` (F2a), `TestZfsSnapshotReconcile_StandaloneDeleteWithLiveRestore` (F2b), `TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents` (F2c, extended to delete both restores afterwards in either order), and `TestZfsSnapshotReconcile_ChainedBackingClonesRemainDeletable` (F2d). |
+
+| F3 | High | **Done (2026-08-03).** `fakeZFS` modelled none of the ZFS behaviours these defects depend on (no snapshot table at all, `Destroy` never refused, `Promote` always cleared `origin` — the last of which this project's own errata had already corrected). It now models all three, and `TestFakeZFSPromote_MatchesLivePoolVerification` pins it against the 2026-07-31 live run so the fidelity is tested rather than assumed. Seeding helpers (`seedSnapshot`/`seedClone`) replace direct assignment into the `origin` map, which had let tests describe states real ZFS cannot be in (a clone whose origin snapshot does not exist). **What it immediately exposed:** `TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents` asserted that both restored PVCs end up with a cleared `origin`. Under faithful semantics `pvc-r1`'s origin is `pvc-r2@restore-source` — promoting the second dependent takes `@restore-source` back off the first and re-parents it. That is correct ZFS behaviour, and the driver records none of it: exactly F2c. The assertion now states the real converged state, with the untracked dependency called out in a comment as F2c's fix target. |
+| F4 | Medium | **Dissolved by D17 (2026-08-03).** `clearTrackingFinalizersReferencing` was deleted along with the tracking finalizers, so there is no longer an ordering hazard between clearing them and the destroy succeeding. |
+| F5 | Medium | **Done (2026-08-03).** D6 already said the cross-prefix rejection "applies identically to both modes", but `integrated` returned before the check and the direct volume-clone branch had no check at all despite the identical `zfs send -R` locality problem. The comparison is now a shared `checkSamePrefix` helper run on all three paths, against whichever dataset physically holds the origin: the backing clone in standalone mode, the source volume itself in integrated mode and for volume clones. Tests: `TestCreateVolume_IntegratedRestoreCrossPrefixRejected`, `TestCreateVolume_CloneCrossPrefixRejected`. |
+| F6 | Medium | **Dissolved by D17 (2026-08-03).** `promoteDirectCloneDependents` was deleted; direct clones are discovered through the ZFS clone graph, which is inherently pool-local, so a same-path dataset on another pool cannot be selected. |
+| F7 | Medium | **Done (2026-08-03), from both sides.** `beforeDestroy` now refuses when the dataset has a `ZfsSnapshot` `ownerReference` whose owner still exists with a zero `deletionTimestamp` (`checkOwningSnapshotLive`): previously it unconditionally destroyed `full@<owner.Spec.SnapshotName>` for any backing clone, so `kubectl delete zfsdataset csi-snap-<uuid>` run by hand while the owning `ZfsSnapshot` was alive destroyed the raw snapshot and lost the snapshot's data irrecoverably. This was the only genuine data-loss path found. D18's `assertDriverSnapshot` closes the same path from the other side by refusing to destroy a `csi-snap-<uuid>` that a non-terminating `ZfsSnapshot` still claims; both are kept, they are cheap and guard different entry points. |
+| F8 | Low | **Done (2026-08-03).** `FormatAndMount`'s doc comment described the behaviour commit `e70cb53` reverted (silently mounting the on-disk fsType instead of failing). The implementation was already correct; the comment was actively dangerous on a data-integrity function because a future reader could "restore" what it documented. It now states the fail-loud behaviour and says explicitly not to reinstate the old one. |
+| F9 | Low | **Dissolved by D17 (2026-08-03).** `backingCloneOwnerSnapshotName` was deleted. |
+| F10 | Low | **Done (2026-08-03), narrowed — see D24.** Only `ZfsSnapshot.Spec.Mode` and `Spec.SourceType` carry `XValidation: self == oldSelf`. Freezing `ZfsDataset.Spec.Dataset` was also proposed and is rejected: manual repointing is a supported emergency workflow, and no control-flow decision resolves a dependency through that field any more (D17). Generalised in api-conventions.md §5. |
+| F11 | Low | **Done (2026-08-03).** `releaseSnapshotFinalizer` now re-reads under `retry.RetryOnConflict` and tolerates the object already being gone, matching `releaseFinalizer`. It previously did the stale `RemoveFinalizer` + `Update` that `releaseFinalizer` was hardened away from in `9db3041`. D19 made this live rather than latent: `reconcileDelete` now calls a helper that can write before the finalizer release. |
+| F12 | Low | **Done (2026-08-03) — see D25.** `CreateSnapshot` now captures `sourceFSType`, `sourceVolblocksize` and `sourceProperties`; the restore-side check prefers the live source volume and falls back to those when it is gone. Test: `TestCreateVolume_RestoreChecksCapturedSourceFSType` restores from a snapshot whose source `ZfsDataset` no longer exists and asserts the fsType mismatch is still caught — previously it passed the controller silently and failed much later at `NodeStageVolume`. |
+
+### 9.2 Order of work
+
+1. ~~**F1 (RBAC).** Blocks functional verification of everything else.~~ **Done**
+   (2026-08-03): discovery ClusterRole gained `create`/`delete` on `zfsdatasets` plus a
+   `zfssnapshots/finalizers: ["update"]` rule, and `ZfsSnapshotReconciler` gained the
+   `zfsdatasets`, `zfssnapshots/finalizers` and `zfspools` markers it was missing.
+   Verified with `helm template`; no logic changed.
+2. ~~**F3 (test double).** Upgrade `fakeZFS` to model snapshot ownership, promote's
+   four-edge rewrite, and both `Destroy` refusal modes. Confirm the F2 scenarios fail
+   before fixing them — fixing them against the current fake proves nothing.~~ **Done**
+   (2026-08-03): `fakeZFS` now tracks `snapshots` per dataset, refuses `Destroy` with
+   "filesystem has children" and "snapshot has dependent clones", and implements the full
+   promote rewrite. `TestFakeZFSPromote_MatchesLivePoolVerification` replays the
+   2026-07-31 scrambled-order run and reproduces its converged final state verbatim,
+   chained non-empty origins included, so the double's fidelity is itself tested. Seeding
+   helpers (`seedSnapshot`/`seedClone`) replace direct `origin` map assignment, which had
+   let tests describe states real ZFS cannot be in.
+3. ~~**`internal/zpool`:** add `ZFS.ListSnapshots(ctx, dataset)` and `ZFS.Clones(ctx,
+   snapshot)`.~~ **Done** (2026-08-03): `zfs list -H -o name -t snapshot -d 1 -s creation`
+   and the `clones` property respectively — the latter answers "what depends on this
+   snapshot" in a single property read, with no pool-wide enumeration.
+4. ~~**D17/D18/D21/D22:** rewrite `beforeDestroy` around the live clone graph; delete
+   `promoted-onto.*`/`restored-by.*` and every helper that reads or writes them.~~
+   **Done** (2026-08-03): `promote.go` was rewritten; `trackedDependentNames`,
+   `promoteTrackedDependents`, `promoteDirectCloneDependents`, `promoteSnapshotDependents`,
+   `addTrackingFinalizer`, `removeTrackingFinalizer`, `clearTrackingFinalizersReferencing`,
+   `findDatasetByPath`, `backingCloneOwnerSnapshotName`, `originDatasetPath`,
+   `isOriginEmptyValue` and the CSI-side `addRestoredByFinalizer` are all gone. What
+   replaced them: `detachAndCleanSnapshots` (the bounded detach fixpoint),
+   `detachSnapshotClones` (D19), `assertKnownDatasets` and `assertDriverSnapshot` (D18),
+   plus three Kubernetes-level policy checks — `checkSnapshotDependents` (D3/§3.2),
+   `checkOwningSnapshotLive` (F7) and `checkPendingCloneDependents` (D21). The CSI restore
+   path keeps only the `DeletionTimestamp` precondition, as `checkBackingCloneUsable`.
+5. ~~**D19:** promote the raw origin snapshot's clones away in
+   `ZfsSnapshotReconciler.reconcileDelete` before destroying it.~~ **Done** (2026-08-03).
+6. ~~**F7, F5, F11, F8.**~~ **Done** (2026-08-03). F7 and F11 landed with the rewrite; F5
+   added a shared `checkSamePrefix` to all three clone/restore paths; F8 corrected the
+   `FormatAndMount` comment.
+7. ~~**D24 (F10) and D25 (F12):** API changes plus `make manifests`.~~ **Done**
+   (2026-08-03): `mode` and `sourceType` carry `self == oldSelf`; `sourceFSType`,
+   `sourceVolblocksize` and `sourceProperties` are captured at `CreateSnapshot` and used
+   as the comparison basis once the source volume is gone. CRDs regenerated.
+8. ~~**D20:** structured log lines for each promote and each artifact destroy.~~ **Done**
+   (2026-08-03), in `detachAndCleanSnapshots` and `detachSnapshotClones`.
+9. **Migration: not applicable.** No deployment carries `promoted-onto.*`/`restored-by.*`
+   finalizers, so neither a strip-on-reconcile step nor a documented `kubectl patch` is
+   needed, and no transitional concept enters the code. Recorded because the absence is a
+   deliberate conclusion rather than an oversight: such an object *would* never finish
+   deleting, since nothing in the tree understands those finalizers any more. The remedy,
+   should one ever appear, is a one-off `kubectl patch` removing the finalizer by index.
+10. **Real-pool re-verification (D23).** Repeat the 2026-07-31 scenario *including* the
+    deletes, and record it as a new dated document alongside the original. Required
+    cases: (a) direct clone → delete source → delete clone; (b) restore → delete snapshot
+    → delete restored PVC; (c) two restores → delete snapshot → delete both in either
+    order; (d) N standalone snapshots → delete source → delete each snapshot in scrambled
+    order. Every object must disappear cleanly with non-recursive destroys only.
+
+### 9.3 Separate follow-up (not part of this work)
+
+Tracked in [future-work.md](future-work.md): gate re-provisioning on `Status.Phase`, so a
+`ZfsDataset` that was previously `Ready` but is now missing from ZFS fails loudly instead
+of being silently re-created or re-cloned. Surfaced while confirming that `Spec.Source` is
+read only from the `ErrNotExist` branch, which is what makes a stale `Source.Volume`
+harmless for a live dataset — but also what makes an *absent* dataset silently
+re-provision.
+

@@ -67,6 +67,65 @@ already deployed for per-volume snapshots, extending the existing
 `zfs snapshot pool/ds1@x pool/ds2@x ...`) is the preferred target over
 pulling in the csi-addons machinery.
 
+## Gate re-provisioning on `Status.Phase` (fail loud when a dataset disappears)
+
+**Why:** `ZfsDatasetReconciler` calls `create()` from the `ErrNotExist` branch of its
+idempotent-create check, with no memory of whether the dataset ever existed. So a
+`ZfsDataset` whose ZFS object has gone missing — destroyed out of band, pool restored
+from a backup predating it, or `spec.dataset` repointed by hand to a path that doesn't
+exist yet — is silently **re-provisioned**. For a clone-sourced dataset that means
+re-cloning from `spec.source`, producing a fresh copy at the *original* vintage and
+silently discarding everything written since; for an empty-source dataset, an empty
+dataset where data used to be.
+
+This matters most for the supported emergency workflow of repointing `spec.dataset` by
+hand. Repointing to a dataset that **already exists** is safe — `Get(type)` succeeds and
+the driver simply adopts it. Repointing to a path that doesn't exist yet triggers the
+silent re-create instead of an error.
+
+Surfaced during the 2026-08-03 code-review follow-up discussion while confirming that
+`spec.source` is read *only* from that branch (which is what makes a stale
+`spec.source.volume` harmless for a live dataset — see
+[snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §9.3).
+
+**Candidate approach:** refuse to `create()` when the object has previously reported
+`Ready`, surfacing a hard error instead. Checked against the cases that could plausibly
+break it and none do: pool failover and pool re-import both leave the dataset present, so
+`Get` succeeds and `create()` is never reached. Deliberately kept out of the review
+fix-up work — it is a behaviour change unrelated to the snapshot lifecycle.
+
+## Generate RBAC from the kubebuilder markers
+
+**Why:** `make manifests` runs `controller-gen` with only the `object` and `crd`
+generators — there is **no `rbac:` generator**. So every
+`+kubebuilder:rbac:...` marker in `internal/controller` is decorative: it never
+becomes YAML, and the ClusterRoles in
+[charts/simple-zfs-csi/templates/rbac.yaml](../charts/simple-zfs-csi/templates/rbac.yaml)
+are maintained entirely by hand. Nothing checks that the two agree.
+
+That is the structural reason the 2026-08-03 review's blocker finding went
+unnoticed: D15 gave `ZfsSnapshotReconciler` a new job (authoring backing-clone
+`ZfsDataset` objects, ADR-0020/D26), the discovery ClusterRole was never given
+`create`/`delete` to match, and because the reconciler also carried no
+`zfsdatasets` marker at all, regenerating manifests would not have surfaced the
+gap either. The result was that `standalone` — the default snapshot mode — could
+neither create nor delete a snapshot on a fresh install.
+
+**Candidate approach, cheapest first:**
+- A test that renders the chart and asserts each reconciler's declared marker
+  verbs are a subset of what its ServiceAccount's ClusterRole grants. This was
+  the code review's own suggestion, and it catches the drift without changing
+  how the chart is produced.
+- Or wire up `rbac:roleName=...` in the `manifests` target properly. Bigger:
+  the chart's roles also carry hand-written rules for the CSI sidecars
+  (provisioner, resizer, snapshotter) and for core resources that no marker
+  describes, so the generated output would have to be merged with those rather
+  than replacing them — probably as a separate generated role per component,
+  aggregated alongside the hand-written one.
+
+Either way the markers should stop being advisory, since they are currently the
+only place a reconciler's real permission needs are written down.
+
 ## Not pursuing (for now)
 
 - **`VolumeReplication`** (csi-addons) — would mean building `zfs

@@ -15,7 +15,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
@@ -58,6 +57,19 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		SourceVolume: sourceID,
 		SourceType:   src.Spec.Type,
 		Mode:         mode,
+	}
+	// D25: capture the source's structural properties now, so a later restore can
+	// still be checked for compatibility (D10) once the source volume is gone —
+	// which for standalone-mode snapshots is the whole point of the mode.
+	desired.SourceFSType = src.Status.FSType
+	if src.Spec.Volume != nil {
+		desired.SourceVolblocksize = src.Spec.Volume.Volblocksize
+	}
+	if len(src.Spec.Properties) > 0 {
+		desired.SourceProperties = make(map[string]string, len(src.Spec.Properties))
+		for k, v := range src.Spec.Properties {
+			desired.SourceProperties[k] = v
+		}
 	}
 	actual, err := c.ensureSnapshot(ctx, name, desired)
 	if err != nil {
@@ -210,44 +222,28 @@ func effectiveMode(spec storagev1alpha1.ZfsSnapshotSpec) storagev1alpha1.ZfsSnap
 	return spec.Mode
 }
 
-// restoredByFinalizerPrefix mirrors internal/controller's finalizer of the same
-// name (D4/D15, snapshot-lifecycle-redesign.md): a
-// "restored-by.<pvcName>" finalizer on a standalone-mode backing-clone
-// ZfsDataset tracks that pvcName's own ZfsDataset currently depends on it, so
-// ZfsDatasetReconciler's delete path promotes pvcName away before the backing
-// clone itself can be destroyed.
-const restoredByFinalizerPrefix = "storage.simple-zfs-csi.io/restored-by."
-
-// addRestoredByFinalizer registers a restored-by.<pvcName> finalizer on the
-// standalone-mode backing-clone ZfsDataset named backingName (D4/D15),
-// fetch-check-patch with conflict retry. Rejects the restore with
-// FailedPrecondition if the backing clone is already terminating (its source
-// snapshot is being deleted).
-func (c *ControllerServer) addRestoredByFinalizer(ctx context.Context, backingName, pvcName string) error {
-	finalizer := restoredByFinalizerPrefix + pvcName
-	for {
-		cur := &storagev1alpha1.ZfsDataset{}
-		if err := c.Client.Get(ctx, client.ObjectKey{Name: backingName}, cur); err != nil {
-			if apierrors.IsNotFound(err) {
-				return status.Errorf(codes.Internal, "backing clone %q for the source snapshot is missing", backingName)
-			}
-			return status.Errorf(codes.Internal, "get backing clone %q: %v", backingName, err)
+// checkBackingCloneUsable rejects a restore whose standalone-mode backing clone
+// is already being torn down.
+//
+// This previously also registered a "restored-by.<pvcName>" finalizer on that
+// ZfsDataset to record the dependency. D17 removed that bookkeeping entirely:
+// the agent's delete path now discovers dependents from the live ZFS clone
+// graph, and D21 blocks a destroy while a declared-but-not-yet-provisioned
+// dependent exists — which covers strictly more of the race than the finalizer
+// did (it only ever protected the window *after* the dependent object was
+// created, since a missing dependent object was treated as "gone").
+func (c *ControllerServer) checkBackingCloneUsable(ctx context.Context, backingName string) error {
+	cur := &storagev1alpha1.ZfsDataset{}
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: backingName}, cur); err != nil {
+		if apierrors.IsNotFound(err) {
+			return status.Errorf(codes.Internal, "backing clone %q for the source snapshot is missing", backingName)
 		}
-		if !cur.DeletionTimestamp.IsZero() {
-			return status.Errorf(codes.FailedPrecondition, "backing clone %q for the source snapshot is being deleted; retry", backingName)
-		}
-		if controllerutil.ContainsFinalizer(cur, finalizer) {
-			return nil
-		}
-		controllerutil.AddFinalizer(cur, finalizer)
-		if err := c.Client.Update(ctx, cur); err != nil {
-			if apierrors.IsConflict(err) {
-				continue
-			}
-			return status.Errorf(codes.Internal, "add restored-by finalizer to backing clone %q: %v", backingName, err)
-		}
-		return nil
+		return status.Errorf(codes.Internal, "get backing clone %q: %v", backingName, err)
 	}
+	if !cur.DeletionTimestamp.IsZero() {
+		return status.Errorf(codes.FailedPrecondition, "backing clone %q for the source snapshot is being deleted; retry", backingName)
+	}
+	return nil
 }
 
 // waitSnapshotReady polls the ZfsSnapshot until it is ready to use, fails, or the

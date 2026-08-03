@@ -113,6 +113,30 @@ nested arm would collide with a shared field name, rename the *arm/discriminator
 (per §3), not the shared field — keep the shared field's name stable across the
 family.
 
+## 5. Immutability: freeze behaviour, not location
+
+Mark a field immutable (`+kubebuilder:validation:XValidation:rule="self == oldSelf"`)
+only when changing it would silently reinterpret state that already exists on
+disk. Fields that *select a mechanism* qualify: `ZfsSnapshot.spec.mode` switches
+teardown semantics between the promote path and the blocking path, so flipping it
+on a live object orphans a backing clone and everything cloned from it. So does
+`spec.sourceType`. Neither has a repair use.
+
+Fields that *name a location* are deliberately left **mutable**, even where a
+doc comment calls them immutable: `ZfsDataset.spec.dataset`,
+`ZfsSnapshot.spec.dataset`, `ZfsSnapshot.spec.snapshotName`. Repointing them by
+hand is a supported emergency workflow — moving datasets to a different prefix,
+renames, or pointing a CR at a dataset prepared with matching properties.
+Freezing them would turn a recoverable incident into "delete the CR and hope the
+finalizer doesn't destroy the wrong thing", and buys no safety: no control-flow
+decision resolves a dependency through those fields.
+
+The general test is therefore *not* "does anything write this after creation?"
+(nothing does, for either group) but **"is this a description of intent, or a
+pointer someone may legitimately need to re-aim?"** Freeze the first, leave the
+second open. See
+[snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) D24.
+
 ## Current CRD shapes
 
 | CRD | Discriminator | Arms (only the matching one is honoured) | Shared identity fields |

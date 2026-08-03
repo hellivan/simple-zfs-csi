@@ -826,6 +826,80 @@ termination; **client-side bounded timeouts remain the only practical fix.**
 
 ---
 
+## 17. Mirroring external (ZFS) state in Kubernetes objects
+
+**Symptom:** objects stuck `Terminating` forever, or acted on using a dependency
+graph that no longer matches reality. Concretely (all four found by a code review
+on 2026-08-03; full reproductions in
+[snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §9.1): a direct
+PVC-to-PVC clone became permanently undeletable after its source was deleted; a
+`DeleteSnapshot` with a live restored PVC never completed; two restores from one
+snapshot produced tracking that named the wrong object; chained backing clones
+were not tracked at all. `go test ./...` stayed green throughout.
+
+**Root cause:** the delete path stored the ZFS clone graph in Kubernetes
+(`promoted-onto.<name>` / `restored-by.<name>` finalizers) and replayed it later,
+instead of asking ZFS. The mirror was a *cache being used as the authority*. It
+drifts for two compounding reasons:
+
+- **One external operation rewrites several edges at once.** A single `zfs
+  promote` relocates the origin snapshot *and every snapshot older than it* onto
+  the promoted clone, re-parents every sibling clone of those snapshots, gives
+  the promoted clone the former parent's previous `origin`, and turns the former
+  parent into a clone of the promoted one. Code that records one of those four
+  is wrong about the other three.
+- **The process can crash between any two updates.** Nothing makes "do the
+  external operation" and "update the mirror" atomic, so every requeue can resume
+  from a half-written graph.
+
+**Guard:** for state that an external system already tracks authoritatively,
+**query it at the point of decision rather than mirroring it**. Keep a clear
+split of roles and never let a derived value drive a decision:
+
+| Concern | Mechanism | Authoritative? |
+|---|---|---|
+| Run the external side-effect before the object disappears | finalizer | yes |
+| What is wanted / how it was created | `spec` | yes |
+| What physically depends on what, right now | live query (`zfs list`, the `clones` property) | yes |
+| Human-readable view of any of the above | `status`, logs | **no** — derived, disposable |
+
+Corollaries worth applying beyond this one case:
+
+- **A finalizer that is parsed for data is not a finalizer.** Finalizers exist to
+  delay object removal until a side-effect completes. Encoding records in their
+  names (and reading them back out) is a database in disguise; the deletion-
+  blocking behaviour then becomes an accident that wedges objects when the record
+  goes stale.
+- **A test double that doesn't model the external system's failure modes hides
+  exactly the bugs the mirror causes.** The `fakeZFS` here had no snapshot table,
+  a `Destroy` that never refused, and a `Promote` that always cleared `origin` —
+  the last of which the project's own
+  [live-pool log](promote-order-verification-2026-07-31.md) had already shown to
+  be false. Every one of the four defects was structurally invisible.
+- **Verifying part of a sequence is not verifying the sequence.** The
+  2026-07-31 run confirmed the promote batch converges, but deliberately executed
+  no `zfs destroy` — which is where all four defects live. Its own final-state
+  listing in fact documents one of them.
+
+**Where the guard lives:** `internal/controller/promote.go` and the delete paths
+in `internal/controller/zfsdataset_controller.go` /
+`zfssnapshot_controller.go`; decisions D17–D22 in
+[snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §4, plan and
+finding history in its §9. **Status: implemented 2026-08-03** — the
+`promoted-onto.*`/`restored-by.*` finalizers no longer exist anywhere in the
+tree. Regression tests are named per defect in §9.1.
+
+**Related, same family:** the stale-object `Update` trap fixed in `9db3041` —
+`ZfsDatasetReconciler.Reconcile` held a `vol` from one `Get` while delete-path
+helpers re-`Get` and `Update` that same object, so the final `Update` on the
+stale copy failed with "object was modified" (seen with 2+ tracked dependents).
+Rule: any `Update` after calling a helper that may write the same object must
+re-read, under `retry.RetryOnConflict`. Both `releaseFinalizer` and
+`releaseSnapshotFinalizer` now do this (the latter was fixed as review finding
+F11, which D19 turned from latent into live).
+
+---
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing

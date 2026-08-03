@@ -10,6 +10,99 @@ recurring bug classes and their guards are catalogued in
 
 ---
 
+## ADR-0020 — The live ZFS clone graph is the source of truth for delete-path dependents
+
+**Status:** Accepted (2026-08-03) · **Scope:** `internal/zpool` (`ZFS.ListSnapshots`, `ZFS.Clones`), `internal/controller` (`promote.go` rewritten, `zfsdataset_controller.go`, `zfssnapshot_controller.go`), `internal/csi` (`clone.go`, `snapshot.go`) · **Supersedes:** the `promoted-onto.<name>`/`restored-by.<name>` finalizer mechanism described in ADR-0019's Decision section (that ADR is otherwise unchanged and still describes the modes, the backing clone, and `zfs promote` as the core primitive) · **Full record:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) D17–D26 and §9.
+
+### Context
+
+ADR-0019 recorded the ZFS clone graph in Kubernetes — a `promoted-onto.<name>` or
+`restored-by.<name>` finalizer per dataset-to-dataset dependency — and replayed it at
+delete time to decide what to promote. A code review of `ef6a39b..9db3041` found four
+critical defects that all reduce to that mirror drifting from reality (full reproductions
+in the linked doc §9.1): a direct PVC-to-PVC clone became permanently undeletable once its
+source was deleted; `DeleteSnapshot` with a live restored PVC hung in `Terminating`
+forever; two restores from one snapshot produced tracking that named the wrong object; and
+chained backing clones — a state this project's own live-pool run had already recorded —
+were not tracked at all.
+
+The mirror cannot be made reliable by making it more thorough. A single `zfs promote`
+rewrites **four** edges at once: it relocates the origin snapshot *and every snapshot
+older than it* onto the promoted clone, re-parents every sibling clone of those snapshots,
+gives the promoted clone the former parent's previous origin, and turns the former parent
+into a clone of it. The implementation recorded one of the four. Recording all four would
+still leave the mirror one interrupted reconcile away from being wrong, because nothing
+makes "perform the ZFS operation" and "update the mirror" atomic.
+
+The defects were invisible to CI because the `fakeZFS` double had no snapshot table, a
+`Destroy` that never refused, and a `Promote` that always cleared `origin` — the last of
+which the project's own 2026-07-31 errata had already shown to be false.
+
+### Decision
+
+**Ask ZFS at the moment of deletion; delete the tracking finalizers entirely.** They are
+removed, not demoted to advisory, so exactly one finalizer concept remains repo-wide:
+"run the external side-effect before the object is allowed to disappear".
+
+`beforeDestroy` now enumerates a dataset's own snapshots (`zfs list -t snapshot -d 1 -s
+creation`) and each snapshot's dependents (the `clones` property — one property read, no
+pool-wide enumeration), promotes dependents away in a bounded fixpoint until none remain,
+then destroys whatever driver-owned artifacts are left. Nothing is remembered between
+reconciles, so nothing can go stale and a crash mid-sequence simply resumes from the truth.
+
+Kubernetes still decides whether deletion may proceed at all, but only by reading
+*desired* state — `spec` and object lifecycle, never derived bookkeeping: an in-flight or
+integrated-mode dependent snapshot blocks (D3/§3.2), a live owning `ZfsSnapshot` blocks
+(closing the one genuine data-loss path found), and a dependent that declares this dataset
+as its clone source but has not been provisioned yet blocks (D21) — that last one covering
+strictly more of the restore race than the finalizer ever did.
+
+Anything the driver did not create is refused loudly rather than guessed at (D18): a
+snapshot is destroyed only if its short name matches a driver-created form, a clone is
+promoted only if it maps to a known `ZfsDataset`, and a `csi-snap-<uuid>` that a live
+`ZfsSnapshot` still claims is never touched. There is no fallback to `zfs destroy -r`.
+
+**Rejected:** extending the finalizer mirror to cover the remaining three edges (the code
+review's own recommendation). It grows the mechanism that produced every one of the four
+defects while leaving the atomicity gap untouched, and it would additionally require
+re-reading each dependent's origin *after the whole batch* rather than after its own
+promote, since a later sibling promote invalidates an earlier reading.
+
+### Consequences
+
+- All four defects are fixed, each with a named regression test (linked doc §9.1). Their
+  shared root cause is catalogued as [known-pitfalls.md](known-pitfalls.md) class 17,
+  "Mirroring external (ZFS) state in Kubernetes objects".
+- Correctness now rests on the test double's fidelity, so that fidelity is itself tested:
+  `TestFakeZFSPromote_MatchesLivePoolVerification` replays the 2026-07-31 six-snapshot
+  scrambled-order run and reproduces its converged final state verbatim, chained non-empty
+  origins included.
+- Promoting *one* dependent detaches a snapshot from all of them, because ZFS re-parents
+  the siblings in the same operation. Sequences that previously issued N promotes now
+  issue one.
+- Dependency *provenance* is unaffected and needed no replacement (D20): creation lineage
+  already lives immutably in `spec` (`Source.Snapshot`/`Source.Volume`, `SourceVolume`,
+  owner references). Only the promote *action trail* was unrecorded, and structured log
+  lines cover it. A `status.dependents` mirror and Kubernetes Events were both rejected —
+  the former is derivable from `zfs list -o name,origin`, the latter expires in about an
+  hour.
+- Cost: one `zfs list` plus one property read per snapshot on the delete path, and the
+  loss of the `kubectl`-side view of current dependencies.
+- A clone or snapshot created outside the driver inside its own `datasetPrefix` now blocks
+  that dataset's deletion until a human resolves it. Accepted: the prefix is designated to
+  the driver and administrators only intervene there in emergencies.
+- Landed in the same pass, recorded separately as D24/D25 in the linked doc:
+  `ZfsSnapshot.Spec.Mode` and `Spec.SourceType` became immutable via CEL while every
+  *location* field stayed deliberately mutable ([api-conventions.md](api-conventions.md)
+  §5), and `CreateSnapshot` now captures the source's `fsType`/`volblocksize`/properties so
+  ADR-0019's D10 compatibility checks still apply once the source volume is gone — which,
+  for `standalone` snapshots, is the normal case rather than an edge one.
+- **Not yet re-verified against a real pool.** The 2026-07-31 run executed no `zfs destroy`
+  at all, which is precisely where the four defects lived; the outstanding scenarios are
+  listed in the linked doc §9.2.
+
+---
+
 ## ADR-0019 — Independent snapshot lifecycle via `zfs promote`; dual standalone/integrated mode
 
 **Status:** Accepted (2026-08-02) · **Scope:** `internal/zpool` (`ZFS.Promote`), `internal/controller` (`zfsdataset_controller.go`, `zfssnapshot_controller.go`, new `promote.go`), `internal/csi` (`clone.go`, `snapshot.go`), `api/v1alpha1` (`ZfsSnapshotSpec.Mode`), chart (`csiController.snapshotter.defaultMode`) · **Full record:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md).

@@ -2,22 +2,41 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
-// This file implements the ZfsDatasetReconciler side of the snapshot-lifecycle
-// redesign (docs/snapshot-lifecycle-redesign.md): promoting away every tracked
-// dependent of a ZfsDataset before it is destroyed, so DeleteVolume never has to
-// use `zfs destroy -r` (D11) and a volume's snapshots/clones survive its own
-// deletion (D0, via `zfs promote`).
+// This file implements the delete-path half of the snapshot-lifecycle redesign
+// (docs/snapshot-lifecycle-redesign.md): detaching everything that depends on a
+// ZFS object before it is destroyed, so nothing ever needs `zfs destroy -r`
+// (D11) and a volume's snapshots/clones survive its own deletion (D0, via
+// `zfs promote`).
+//
+// D17: the live ZFS clone graph is the single source of truth for what depends
+// on what. Dependents are discovered by asking ZFS — `zfs list -t snapshot` for
+// what a dataset owns, the `clones` property for what depends on each of those
+// snapshots — at the moment of deletion, never by replaying bookkeeping kept in
+// Kubernetes. One `zfs promote` rewrites four edges of that graph at once (it
+// relocates the origin snapshot and every older snapshot onto the promoted
+// clone, re-parents sibling clones onto it, gives it the former parent's
+// previous origin, and turns the former parent into a clone of it), and the
+// process can crash between any two of them — so any mirror of that graph held
+// elsewhere is permanently one interrupted reconcile away from being wrong.
+// Re-deriving it makes the whole sequence idempotent and crash-safe: every
+// reconcile starts from the truth.
+//
+// Kubernetes still decides the things ZFS cannot express — whether deletion may
+// proceed at all — but those are reads of *desired* state (spec), never of
+// derived bookkeeping.
 
 // restoreSourceSnapshotName is the fixed, CSI-invisible self-snapshot name (D5)
 // taken on every standalone-mode backing-clone ZfsDataset (D15) immediately
@@ -27,27 +46,29 @@ import (
 // alive, deleted-but-not-yet-promoted, or already promoted away.
 const restoreSourceSnapshotName = "restore-source"
 
-// Finalizer prefixes for the generalized dependent-tracking mechanism (D12/D15).
-// A "promoted-onto.<name>" or "restored-by.<name>" finalizer on a ZfsDataset
-// means the *named* ZfsDataset currently depends on this one (its ZFS dataset is
-// a clone whose origin lives here) and must be `zfs promote`d away before this
-// one can be destroyed. The two prefixes exist for readability at the call site
-// (D12's promote-chaining vs. D4's restore-tracking) but are handled completely
-// uniformly by every helper below — D15 unifies D4 into D12.
-const (
-	promotedOntoFinalizerPrefix = "storage.simple-zfs-csi.io/promoted-onto."
-	restoredByFinalizerPrefix   = "storage.simple-zfs-csi.io/restored-by."
-)
+// maxDetachRounds bounds the detach fixpoint. Each round performs exactly one
+// `zfs promote`, and every promote strictly reduces the number of snapshots
+// still owned by the dataset being destroyed, so the loop terminates in at most
+// one round per snapshot. The cap only exists so a ZFS-side surprise degrades
+// into a visible error rather than an unbounded loop.
+const maxDetachRounds = 100
 
-func promotedOntoFinalizer(dependentName string) string {
-	return promotedOntoFinalizerPrefix + dependentName
-}
-
-// restoredByFinalizer names the finalizer a restored PVC's ZfsDataset registers
-// on the standalone-mode backing clone it was cloned from (D4/D15).
-func restoredByFinalizer(dependentName string) string {
-	return restoredByFinalizerPrefix + dependentName
-}
+// driverSnapshotSuffix matches the snapshot short names (the part after "@")
+// this driver creates, and only those:
+//
+//   - "restore-source" — a standalone backing clone's self-snapshot (D5);
+//   - "clone-<16 hex>" — the ephemeral intermediate snapshot ADR-0009's direct
+//     PVC-to-PVC clone path takes (see cloneSnapshotSuffix);
+//   - "csi-snap-<uuid>" — a CSI-visible raw snapshot
+//     (independent-resource-naming-redesign.md).
+//
+// It is deliberately an allow-list (D18): anything else living on a driver
+// dataset was put there from outside the driver, and the delete path refuses to
+// touch it rather than guessing. The "csi-snap-" arm matches on prefix rather
+// than on UUID shape because that prefix is reserved for the driver by design
+// (D1a); assertDriverSnapshot additionally refuses any such snapshot that a
+// live ZfsSnapshot still claims.
+var driverSnapshotSuffix = regexp.MustCompile(`^(restore-source|clone-[0-9a-f]{16}|csi-snap-.+)$`)
 
 // effectiveSnapshotMode returns snap's resolved Mode, treating an empty value
 // (snapshots created before Mode existed) as Integrated — today's original,
@@ -59,94 +80,75 @@ func effectiveSnapshotMode(snap *storagev1alpha1.ZfsSnapshot) storagev1alpha1.Zf
 	return snap.Spec.Mode
 }
 
-// isOriginEmptyValue reports whether a `zfs get origin` value means "no
-// origin" (never a clone, or already fully promoted/independent).
-func isOriginEmptyValue(origin string) bool {
-	origin = strings.TrimSpace(origin)
-	return origin == "" || origin == "-"
-}
-
-// originDatasetPath extracts the pool-relative dataset path from a full ZFS
-// origin value (e.g. "tank/k8s/csi-snap-x@restore-source" -> "k8s/csi-snap-x",
-// given poolName "tank").
-func originDatasetPath(origin, poolName string) string {
-	ds := origin
-	if i := strings.Index(ds, "@"); i >= 0 {
-		ds = ds[:i]
+// splitSnapshot splits a full ZFS snapshot name into its dataset and short
+// name, e.g. "tank/k8s/vol@restore-source" -> ("tank/k8s/vol", "restore-source").
+// The suffix is empty when full is not a snapshot.
+func splitSnapshot(full string) (dataset, suffix string) {
+	if i := strings.Index(full, "@"); i >= 0 {
+		return full[:i], full[i+1:]
 	}
-	return strings.TrimPrefix(strings.TrimPrefix(ds, poolName), "/")
+	return full, ""
 }
 
-// trackedDependentNames returns the object names of every ZfsDataset tracked as
-// depending on vol via a promoted-onto.*/restored-by.* finalizer (D12/D15).
-func trackedDependentNames(vol *storagev1alpha1.ZfsDataset) []string {
-	var names []string
-	for _, f := range vol.Finalizers {
-		switch {
-		case strings.HasPrefix(f, promotedOntoFinalizerPrefix):
-			names = append(names, strings.TrimPrefix(f, promotedOntoFinalizerPrefix))
-		case strings.HasPrefix(f, restoredByFinalizerPrefix):
-			names = append(names, strings.TrimPrefix(f, restoredByFinalizerPrefix))
-		}
+// datasetPathOf converts a full ZFS name into the pool-relative path stored in
+// ZfsDataset.Spec.Dataset, e.g. ("tank", "tank/k8s/vol") -> "k8s/vol".
+func datasetPathOf(poolName, full string) string {
+	return strings.Trim(strings.TrimPrefix(strings.TrimPrefix(full, poolName), "/"), "/")
+}
+
+// sourceDependsOn reports whether dep's clone source lives on the dataset at
+// datasetPath — either a snapshot of it (restore, or a standalone backing
+// clone) or the dataset itself (direct PVC-to-PVC clone, ADR-0009).
+func sourceDependsOn(dep *storagev1alpha1.ZfsDataset, datasetPath string) bool {
+	src := dep.Spec.Source
+	if src == nil || datasetPath == "" {
+		return false
 	}
-	return names
+	if src.Volume != "" && strings.Trim(src.Volume, "/") == datasetPath {
+		return true
+	}
+	if src.Snapshot != "" {
+		ds, _ := splitSnapshot(src.Snapshot)
+		return strings.Trim(ds, "/") == datasetPath
+	}
+	return false
 }
 
-// beforeDestroy prepares vol for a non-recursive `zfs destroy` (D11) by
-// promoting away every tracked dependent first, so vol is guaranteed to have
-// zero snapshots/clones of its own left by the time destroy runs. Returns an
-// error (causing a requeue) when it isn't yet safe to proceed: an in-flight
-// standalone-mode snapshot (D3), or a still-live integrated-mode dependent
-// (§3.2), neither of which have anything to promote.
+// beforeDestroy prepares vol for a non-recursive `zfs destroy` (D11/D22).
+//
+// It first applies the policies ZFS cannot express — all reads of Kubernetes
+// *desired* state, never of derived bookkeeping — and then detaches whatever
+// ZFS actually reports as depending on vol.
 func (r *ZfsDatasetReconciler) beforeDestroy(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, full string) error {
-	if err := r.promoteSnapshotDependents(ctx, vol, poolName); err != nil {
+	if err := r.checkSnapshotDependents(ctx, vol); err != nil {
 		return err
 	}
-	if err := r.promoteDirectCloneDependents(ctx, vol, poolName); err != nil {
+	if err := r.checkOwningSnapshotLive(ctx, vol); err != nil {
 		return err
 	}
-	if err := r.promoteTrackedDependents(ctx, vol, poolName); err != nil {
+	if err := r.checkPendingCloneDependents(ctx, vol, poolName); err != nil {
 		return err
 	}
-
-	// D15: if vol is itself a standalone-mode backing clone, its own
-	// "@restore-source" self-snapshot (and, if the true source volume was
-	// deleted earlier and this backing clone was promoted as a result, the raw
-	// origin snapshot relocated here by that promote) are internal artifacts,
-	// never CSI-visible, and safe to destroy directly now that every clone
-	// dependent of them has been promoted away above (a snapshot with no
-	// remaining clones can be destroyed directly, no -r needed). Destroy() is
-	// idempotent/NotExist-tolerant, so this is a no-op wherever it doesn't apply.
-	snapName, isBackingClone, err := r.backingCloneOwnerSnapshotName(ctx, vol)
-	if err != nil {
-		return err
-	}
-	if isBackingClone {
-		if err := r.ZFS.Destroy(ctx, full+"@"+restoreSourceSnapshotName, false); err != nil {
-			return fmt.Errorf("destroy backing-clone self-snapshot %s@%s: %w", full, restoreSourceSnapshotName, err)
-		}
-		if snapName != "" {
-			if err := r.ZFS.Destroy(ctx, full+"@"+snapName, false); err != nil {
-				return fmt.Errorf("destroy relocated origin snapshot %s@%s: %w", full, snapName, err)
-			}
-		}
-	}
-	return nil
+	return detachAndCleanSnapshots(ctx, r.Client, r.ZFS, vol.Spec.PoolGUID, poolName, full)
 }
 
-// promoteSnapshotDependents implements D3/§3.1-3.2: blocks (returns an error,
-// causing a requeue) on any dependent ZfsSnapshot not yet Ready, and on any
-// live integrated-mode dependent (which has no promote mechanism to fall back
-// on). Ready standalone-mode dependents get their backing clone promoted away
-// unconditionally.
-func (r *ZfsDatasetReconciler) promoteSnapshotDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName string) error {
+// checkSnapshotDependents implements D3/§3.2: the two situations where a
+// volume's deletion must block rather than proceed, because there is nothing
+// safe to promote yet.
+//
+//   - A dependent ZfsSnapshot that is not Ready is still being taken, so its
+//     backing clone may not exist yet.
+//   - A live integrated-mode snapshot has no backing clone at all, and so no
+//     promote mechanism to fall back on — destroying the volume would take the
+//     user's snapshot with it.
+func (r *ZfsDatasetReconciler) checkSnapshotDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
 	var snaps storagev1alpha1.ZfsSnapshotList
 	if err := r.List(ctx, &snaps); err != nil {
 		return err
 	}
 	for i := range snaps.Items {
 		snap := &snaps.Items[i]
-		if snap.Spec.SourceVolume != vol.Name {
+		if snap.Spec.SourceVolume != vol.Name || !snap.DeletionTimestamp.IsZero() {
 			continue
 		}
 		if snap.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
@@ -155,223 +157,236 @@ func (r *ZfsDatasetReconciler) promoteSnapshotDependents(ctx context.Context, vo
 		if effectiveSnapshotMode(snap) != storagev1alpha1.SnapshotModeStandalone {
 			return fmt.Errorf("volume %q has a live integrated-mode snapshot %q; delete it before deleting the volume", vol.Name, snap.Name)
 		}
-		backing := &storagev1alpha1.ZfsDataset{}
-		if err := r.Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing); err != nil {
+	}
+	return nil
+}
+
+// checkOwningSnapshotLive refuses to destroy a standalone-mode backing clone
+// while the ZfsSnapshot that owns it is still live (F7).
+//
+// The only sanctioned ways a backing clone is deleted are garbage collection
+// after its owner went away, and the explicit Delete in
+// ZfsSnapshotReconciler.reconcileDelete — both imply the owner is already
+// terminating. A `kubectl delete zfsdataset csi-snap-<uuid>` run by hand does
+// not, and proceeding would destroy the snapshot's only copy of the data while
+// the user's VolumeSnapshot still claims to hold it.
+func (r *ZfsDatasetReconciler) checkOwningSnapshotLive(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
+	for _, ref := range vol.OwnerReferences {
+		if ref.Kind != "ZfsSnapshot" {
+			continue
+		}
+		owner := &storagev1alpha1.ZfsSnapshot{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref.Name}, owner); err != nil {
 			if apierrors.IsNotFound(err) {
-				continue // backing clone already gone; nothing to promote
+				continue // owner already gone: the normal garbage-collection path
 			}
 			return err
 		}
-		backingFull, err := datasetName(poolName, backing.Spec.Dataset)
-		if err != nil {
-			return err
-		}
-		if err := r.ZFS.Promote(ctx, backingFull); err != nil {
-			return fmt.Errorf("promote backing clone %q for snapshot %q: %w", backingFull, snap.Name, err)
+		if owner.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("refusing to destroy backing clone %q: its ZfsSnapshot %q is still live; delete the snapshot instead",
+				vol.Name, owner.Name)
 		}
 	}
 	return nil
 }
 
-// promoteDirectCloneDependents implements D7/D9: direct PVC-to-PVC clones
-// (ADR-0009, no VolumeSnapshot involved) are always promoted away
-// unconditionally — no mode toggle applies since there is no
-// VolumeSnapshotClass in this path, and blocking here would be confusing (no
-// visible object the user is managing).
-func (r *ZfsDatasetReconciler) promoteDirectCloneDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName string) error {
+// checkPendingCloneDependents implements D21: block while some ZfsDataset has
+// declared vol as its clone source but its own ZFS dataset does not exist yet.
+//
+// Such a dependent is invisible in the ZFS clone graph — the object is created
+// by the CSI controller before the agent runs `zfs clone` — so without this
+// check the detach below would find nothing, destroy vol, and leave the pending
+// restore permanently unable to complete. Spec is desired state, written once
+// at creation and never recomputed, so reading it here does not reintroduce the
+// mirror D17 removed.
+func (r *ZfsDatasetReconciler) checkPendingCloneDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName string) error {
 	var list storagev1alpha1.ZfsDatasetList
 	if err := r.List(ctx, &list); err != nil {
 		return err
 	}
 	for i := range list.Items {
 		dep := &list.Items[i]
-		if dep.Name == vol.Name || dep.Spec.Source == nil || dep.Spec.Source.Volume != vol.Spec.Dataset {
+		if dep.Name == vol.Name || dep.Spec.PoolGUID != vol.Spec.PoolGUID || !dep.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if !sourceDependsOn(dep, strings.Trim(vol.Spec.Dataset, "/")) {
 			continue
 		}
 		depFull, err := datasetName(poolName, dep.Spec.Dataset)
 		if err != nil {
 			return err
 		}
-		if err := r.ZFS.Promote(ctx, depFull); err != nil {
-			return fmt.Errorf("promote direct clone %q of %q: %w", depFull, vol.Name, err)
+		if _, err := r.ZFS.Get(ctx, depFull, "type"); err != nil {
+			if errors.Is(err, zpool.ErrNotExist) {
+				return fmt.Errorf("volume %q is the clone source of %q, which has not been provisioned yet; "+
+					"waiting for it before destroying (delete %q instead if it is stuck)", vol.Name, dep.Name, dep.Name)
+			}
+			return err
 		}
 	}
 	return nil
 }
 
-// promoteTrackedDependents promotes away every ZfsDataset tracked (via
-// promoted-onto.*/restored-by.* finalizers on vol, D12/D15) as depending on it,
-// removing each finalizer once its dependent is confirmed independent. If
-// promoting one dependent doesn't fully detach it — it's now a clone of a
-// sibling dependent instead, real documented ZFS "move any clone references"
-// behaviour when multiple clones share one snapshot (§2.9) — the tracking
-// finalizer is re-registered on whichever ZfsDataset now owns that dependency
-// instead of being dropped. Runs as a bounded fixpoint (D16): re-reads vol's
-// finalizers fresh at the start of every round (earlier rounds' removals must
-// be visible, or this would never converge) and repeats until nothing is left
-// to track, capped at a small number of rounds — degrading to a single cheap
-// pass whenever nothing needs reparenting, which D16's live-pool verification
-// found to be the common case.
-func (r *ZfsDatasetReconciler) promoteTrackedDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName string) error {
-	const maxRounds = 10
-	for round := 0; round < maxRounds; round++ {
-		cur := &storagev1alpha1.ZfsDataset{}
-		if err := r.Get(ctx, client.ObjectKey{Name: vol.Name}, cur); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil // vol itself is already gone
+// detachAndCleanSnapshots leaves `full` with zero snapshots of its own, which
+// is exactly the precondition a non-recursive `zfs destroy` needs (D11/D22).
+//
+// Each round asks ZFS which snapshots `full` still owns and which datasets
+// clone them. If any snapshot is still cloned, that clone is promoted away —
+// which relocates the snapshot, and every snapshot older than it, onto the
+// clone — and the round restarts from freshly read state, because one promote
+// can move several snapshots and re-parent several clones at once. Once nothing
+// clones anything any more, whatever remains is leftover driver artifacts that
+// an earlier promote relocated here, and they are destroyed directly.
+//
+// For the overwhelmingly common case of a dataset with no snapshots at all this
+// is a single `zfs list` and done.
+func detachAndCleanSnapshots(ctx context.Context, c client.Client, z zpool.ZFS, poolGUID, poolName, full string) error {
+	logger := log.FromContext(ctx)
+	for round := 0; round < maxDetachRounds; round++ {
+		snaps, err := z.ListSnapshots(ctx, full)
+		if err != nil {
+			if errors.Is(err, zpool.ErrNotExist) {
+				return nil // dataset already gone; nothing to detach
 			}
 			return err
 		}
-		names := trackedDependentNames(cur)
-		if len(names) == 0 {
+		if len(snaps) == 0 {
 			return nil
 		}
-		for _, depName := range names {
-			dep := &storagev1alpha1.ZfsDataset{}
-			if err := r.Get(ctx, client.ObjectKey{Name: depName}, dep); err != nil {
-				if apierrors.IsNotFound(err) {
-					if err := r.removeTrackingFinalizer(ctx, vol.Name, depName); err != nil {
-						return err
-					}
+
+		promoted := false
+		for _, snap := range snaps {
+			clones, err := z.Clones(ctx, snap)
+			if err != nil {
+				if errors.Is(err, zpool.ErrNotExist) {
 					continue
 				}
 				return err
 			}
-			depFull, err := datasetName(poolName, dep.Spec.Dataset)
-			if err != nil {
-				return err
-			}
-			if err := r.ZFS.Promote(ctx, depFull); err != nil {
-				return fmt.Errorf("promote tracked dependent %q: %w", depFull, err)
-			}
-			origin, err := r.ZFS.Get(ctx, depFull, "origin")
-			if err != nil {
-				return err
-			}
-			if isOriginEmptyValue(origin) {
-				if err := r.removeTrackingFinalizer(ctx, vol.Name, depName); err != nil {
-					return err
-				}
+			if len(clones) == 0 {
 				continue
 			}
-			// Still a clone of something (D12/§2.9): find whichever ZfsDataset now
-			// owns that origin dataset and move the tracking finalizer there instead.
-			ownerPath := originDatasetPath(origin, poolName)
-			owner, err := r.findDatasetByPath(ctx, vol.Spec.PoolGUID, ownerPath)
-			if err != nil {
+			if err := assertKnownDatasets(ctx, c, poolGUID, poolName, snap, clones); err != nil {
 				return err
 			}
-			if owner == nil {
-				return fmt.Errorf("promote tracked dependent %q: new origin %q does not belong to any known ZfsDataset", depFull, origin)
+			// Promoting any one clone detaches the snapshot from all of them:
+			// ZFS re-parents the siblings onto the promoted clone as part of the
+			// same operation. The next round picks up whatever is left.
+			if err := z.Promote(ctx, clones[0]); err != nil {
+				return fmt.Errorf("promote %q away from %q: %w", clones[0], snap, err)
 			}
-			if owner.Name != vol.Name {
-				if err := r.addTrackingFinalizer(ctx, owner.Name, promotedOntoFinalizer(depName)); err != nil {
-					return err
-				}
-			}
-			if err := r.removeTrackingFinalizer(ctx, vol.Name, depName); err != nil {
-				return err
-			}
+			logger.Info("promoted dependent away", "dependent", clones[0], "detachedFrom", snap, "destroying", full)
+			promoted = true
+			break
 		}
-	}
-	return fmt.Errorf("promoteTrackedDependents: did not converge for %q after %d rounds", vol.Name, maxRounds)
-}
-
-// findDatasetByPath returns the ZfsDataset on poolGUID whose Spec.Dataset
-// equals datasetPath, or nil if none is found.
-func (r *ZfsDatasetReconciler) findDatasetByPath(ctx context.Context, poolGUID, datasetPath string) (*storagev1alpha1.ZfsDataset, error) {
-	var list storagev1alpha1.ZfsDatasetList
-	if err := r.List(ctx, &list); err != nil {
-		return nil, err
-	}
-	for i := range list.Items {
-		d := &list.Items[i]
-		if d.Spec.PoolGUID == poolGUID && d.Spec.Dataset == datasetPath {
-			return d, nil
-		}
-	}
-	return nil, nil
-}
-
-// backingCloneOwnerSnapshotName reports whether vol is a standalone-mode
-// backing clone (D15: it has an ownerReference to a ZfsSnapshot), returning
-// that ZfsSnapshot's Spec.SnapshotName (the CSI-visible raw-snapshot suffix
-// that may have relocated onto vol via an earlier promote of the true source
-// volume). Returns ok=false when vol isn't a backing clone, and a zero value
-// with ok=false (not an error) if the owning ZfsSnapshot is already gone.
-func (r *ZfsDatasetReconciler) backingCloneOwnerSnapshotName(ctx context.Context, vol *storagev1alpha1.ZfsDataset) (name string, ok bool, err error) {
-	for _, ref := range vol.OwnerReferences {
-		if ref.Kind != "ZfsSnapshot" {
+		if promoted {
 			continue
 		}
-		owner := &storagev1alpha1.ZfsSnapshot{}
-		if getErr := r.Get(ctx, client.ObjectKey{Name: ref.Name}, owner); getErr != nil {
-			if apierrors.IsNotFound(getErr) {
-				return "", true, nil
-			}
-			return "", false, getErr
-		}
-		return owner.Spec.SnapshotName, true, nil
-	}
-	return "", false, nil
-}
 
-// addTrackingFinalizer adds finalizer to the named ZfsDataset, retrying on
-// update conflicts. A no-op if already present.
-func (r *ZfsDatasetReconciler) addTrackingFinalizer(ctx context.Context, name, finalizer string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		cur := &storagev1alpha1.ZfsDataset{}
-		if err := r.Get(ctx, client.ObjectKey{Name: name}, cur); err != nil {
-			return err
-		}
-		if controllerutil.ContainsFinalizer(cur, finalizer) {
-			return nil
-		}
-		controllerutil.AddFinalizer(cur, finalizer)
-		return r.Update(ctx, cur)
-	})
-}
-
-// removeTrackingFinalizer removes any promoted-onto.<dependentName>/
-// restored-by.<dependentName> finalizer from the named ZfsDataset, retrying on
-// update conflicts. A no-op if the object is gone or neither finalizer is
-// present.
-func (r *ZfsDatasetReconciler) removeTrackingFinalizer(ctx context.Context, name, dependentName string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		cur := &storagev1alpha1.ZfsDataset{}
-		if err := r.Get(ctx, client.ObjectKey{Name: name}, cur); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
-			return err
-		}
-		removed := controllerutil.RemoveFinalizer(cur, promotedOntoFinalizer(dependentName))
-		removed = controllerutil.RemoveFinalizer(cur, restoredByFinalizer(dependentName)) || removed
-		if !removed {
-			return nil
-		}
-		return r.Update(ctx, cur)
-	})
-}
-
-// clearTrackingFinalizersReferencing best-effort removes any
-// promoted-onto.<depName>/restored-by.<depName> finalizer that references
-// depName, wherever it currently lives (D12/D15). Called when depName's own
-// ZfsDataset is being destroyed, so a stale reference never lingers forever on
-// whichever object happened to be tracking it (that object may otherwise never
-// be deleted itself, and so never get a chance to notice depName is gone).
-func (r *ZfsDatasetReconciler) clearTrackingFinalizersReferencing(ctx context.Context, depName string) error {
-	var list storagev1alpha1.ZfsDatasetList
-	if err := r.List(ctx, &list); err != nil {
-		return err
-	}
-	for i := range list.Items {
-		owner := &list.Items[i]
-		if controllerutil.ContainsFinalizer(owner, promotedOntoFinalizer(depName)) ||
-			controllerutil.ContainsFinalizer(owner, restoredByFinalizer(depName)) {
-			if err := r.removeTrackingFinalizer(ctx, owner.Name, depName); err != nil {
+		// Nothing clones any of the remaining snapshots, so they are leftover
+		// driver artifacts relocated here by an earlier promote. Verify every one
+		// of them is ours (D18) before destroying anything: failing loud leaves
+		// the object visibly Terminating, which is strictly better than deleting
+		// data the driver did not create.
+		for _, snap := range snaps {
+			if err := assertDriverSnapshot(ctx, c, snap); err != nil {
 				return err
 			}
+		}
+		for _, snap := range snaps {
+			if err := z.Destroy(ctx, snap, false); err != nil {
+				return fmt.Errorf("destroy leftover snapshot %q: %w", snap, err)
+			}
+			logger.Info("destroyed leftover snapshot artifact", "snapshot", snap, "destroying", full)
+		}
+		return nil
+	}
+	return fmt.Errorf("detaching dependents of %q did not converge after %d rounds", full, maxDetachRounds)
+}
+
+// detachSnapshotClones promotes away every clone of a single snapshot so that
+// snapshot can be destroyed on its own (D19).
+//
+// Used by ZfsSnapshotReconciler for the raw origin snapshot, which lives on the
+// still-live source volume and is therefore never reached by that volume's own
+// delete path. Promoting the first clone relocates the snapshot onto it and
+// re-parents the rest, so one pass normally suffices and the destroy that
+// follows becomes a NotExist no-op; the loop only guards against a clone
+// appearing concurrently.
+func detachSnapshotClones(ctx context.Context, c client.Client, z zpool.ZFS, poolGUID, poolName, snap string) error {
+	logger := log.FromContext(ctx)
+	for round := 0; round < maxDetachRounds; round++ {
+		clones, err := z.Clones(ctx, snap)
+		if err != nil {
+			if errors.Is(err, zpool.ErrNotExist) {
+				return nil // already relocated elsewhere, or already destroyed
+			}
+			return err
+		}
+		if len(clones) == 0 {
+			return nil
+		}
+		if err := assertKnownDatasets(ctx, c, poolGUID, poolName, snap, clones); err != nil {
+			return err
+		}
+		if err := z.Promote(ctx, clones[0]); err != nil {
+			return fmt.Errorf("promote %q away from %q: %w", clones[0], snap, err)
+		}
+		logger.Info("promoted dependent away", "dependent", clones[0], "detachedFrom", snap)
+	}
+	return fmt.Errorf("detaching clones of %q did not converge after %d rounds", snap, maxDetachRounds)
+}
+
+// assertKnownDatasets refuses to promote anything the driver does not manage
+// (D18). `zfs promote` is not destructive, but it rewrites which dataset owns a
+// shared snapshot history, which would surprise an administrator or an external
+// tool that created the clone. The datasetPrefix is designated to the driver,
+// so a clone with no corresponding ZfsDataset means something outside
+// Kubernetes put it there and a human should decide what happens to it.
+func assertKnownDatasets(ctx context.Context, c client.Client, poolGUID, poolName, snap string, clones []string) error {
+	var list storagev1alpha1.ZfsDatasetList
+	if err := c.List(ctx, &list); err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	for i := range list.Items {
+		if d := &list.Items[i]; d.Spec.PoolGUID == poolGUID {
+			known[strings.Trim(d.Spec.Dataset, "/")] = true
+		}
+	}
+	for _, clone := range clones {
+		if !known[datasetPathOf(poolName, clone)] {
+			return fmt.Errorf("snapshot %q is cloned by %q, which is not a known ZfsDataset on this pool; "+
+				"refusing to promote a dataset the driver does not manage — resolve it manually", snap, clone)
+		}
+	}
+	return nil
+}
+
+// assertDriverSnapshot refuses to destroy a snapshot the driver did not create
+// (D18), and — for a CSI-visible raw snapshot — refuses to destroy one whose
+// ZfsSnapshot object is still live.
+//
+// The second check cannot fail through any driver-driven sequence, because a
+// raw snapshot only ever relocates onto a dataset whose own deletion is already
+// under way. It is kept as a cheap assertion that the allow-list can never be
+// turned against real snapshot data.
+func assertDriverSnapshot(ctx context.Context, c client.Client, full string) error {
+	_, suffix := splitSnapshot(full)
+	if !driverSnapshotSuffix.MatchString(suffix) {
+		return fmt.Errorf("snapshot %q was not created by this driver; refusing to destroy it — remove it manually to continue", full)
+	}
+	if !strings.HasPrefix(suffix, "csi-snap-") {
+		return nil
+	}
+	var snaps storagev1alpha1.ZfsSnapshotList
+	if err := c.List(ctx, &snaps); err != nil {
+		return err
+	}
+	for i := range snaps.Items {
+		s := &snaps.Items[i]
+		if s.Spec.SnapshotName == suffix && s.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("refusing to destroy snapshot %q: ZfsSnapshot %q still claims it", full, s.Name)
 		}
 	}
 	return nil

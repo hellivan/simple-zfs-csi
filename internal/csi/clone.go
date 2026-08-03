@@ -34,6 +34,27 @@ func normalizedDatasetPrefix(prefix string) string {
 	return prefix
 }
 
+// checkSamePrefix implements D6 (docs/snapshot-lifecycle-redesign.md): a
+// clone/restore whose origin lives under a different datasetPrefix than the new
+// volume would leave that volume's clone-origin outside its own replicated
+// subtree, silently breaking `zfs send -R <prefix>` backup replication (§2.5).
+// Reject it outright rather than letting the footgun exist.
+//
+// D6 says this "applies identically to both modes", and it applies to direct
+// PVC-to-PVC clones too — the clone's origin snapshot lives under the source's
+// prefix there as well. sourceDataset is whichever dataset physically holds the
+// origin: the backing clone in standalone mode, the source volume itself in
+// integrated mode and for volume clones.
+func checkSamePrefix(rp *ResolvedParams, sourceDataset, kind, id string) error {
+	srcPrefix := path.Dir(strings.Trim(sourceDataset, "/"))
+	if want := normalizedDatasetPrefix(rp.DatasetPrefix); srcPrefix != want {
+		return status.Errorf(codes.InvalidArgument,
+			"cross-prefix %s unsupported: %q's data lives under prefix %q, target prefix is %q",
+			kind, id, srcPrefix, want)
+	}
+	return nil
+}
+
 // resolveContentSource turns a CSI VolumeContentSource (snapshot or volume) into
 // a ZfsDataset clone source. Clones are same-pool and same-type by ZFS
 // constraint, so it validates that the source lives on the target pool and
@@ -64,12 +85,16 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		if srcType := c.snapshotSourceType(ctx, snap); srcType != "" && srcType != rp.DatasetType {
 			return nil, status.Errorf(codes.InvalidArgument, "cannot restore a %s snapshot into a %s (protocol %s) volume", srcType, rp.DatasetType, rp.Protocol)
 		}
-		if err := c.checkCloneCompatibility(ctx, rp, snap.Spec.SourceVolume, req.GetVolumeCapabilities()); err != nil {
+		if err := c.checkCloneCompatibility(ctx, rp, snap, req.GetVolumeCapabilities()); err != nil {
 			return nil, err
 		}
 
 		if effectiveMode(snap.Spec) != storagev1alpha1.SnapshotModeStandalone {
-			// integrated mode: unchanged, clone directly from the raw snapshot.
+			// integrated mode: clone directly from the raw snapshot, which lives on
+			// the source volume itself — so D6 compares against that dataset.
+			if err := checkSamePrefix(rp, snap.Spec.Dataset, "restore", id); err != nil {
+				return nil, err
+			}
 			return &storagev1alpha1.DatasetSource{Snapshot: snap.Spec.Dataset + "@" + snap.Spec.SnapshotName}, nil
 		}
 
@@ -81,16 +106,10 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		if err := c.Client.Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing); err != nil {
 			return nil, status.Errorf(codes.Internal, "get backing clone %q for snapshot %q: %v", snap.Spec.SnapshotName, id, err)
 		}
-		// D6: restoring into a different datasetPrefix than the source would
-		// leave the new volume's clone-origin outside its own replicated subtree
-		// (zfs send -R backup compatibility, §2.5) — reject outright rather than
-		// let that footgun exist silently.
-		if path.Dir(strings.Trim(backing.Spec.Dataset, "/")) != normalizedDatasetPrefix(rp.DatasetPrefix) {
-			return nil, status.Errorf(codes.InvalidArgument,
-				"cross-prefix restore unsupported: snapshot %q's data lives under prefix %q, target prefix is %q",
-				id, path.Dir(strings.Trim(backing.Spec.Dataset, "/")), normalizedDatasetPrefix(rp.DatasetPrefix))
+		if err := checkSamePrefix(rp, backing.Spec.Dataset, "restore", id); err != nil {
+			return nil, err
 		}
-		if err := c.addRestoredByFinalizer(ctx, backing.Name, req.GetName()); err != nil {
+		if err := c.checkBackingCloneUsable(ctx, backing.Name); err != nil {
 			return nil, err
 		}
 		return &storagev1alpha1.DatasetSource{Snapshot: backing.Spec.Dataset + "@" + restoreSourceSnapshotName}, nil
@@ -112,6 +131,12 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		}
 		if src.Spec.Type != rp.DatasetType {
 			return nil, status.Errorf(codes.InvalidArgument, "cannot clone a %s volume into a %s (protocol %s) volume", src.Spec.Type, rp.DatasetType, rp.Protocol)
+		}
+		// D6 applies here too: ADR-0009's intermediate "@clone-<hash>" snapshot is
+		// taken on the source dataset, so a cross-prefix clone has the identical
+		// `zfs send -R` locality problem as a cross-prefix restore.
+		if err := checkSamePrefix(rp, src.Spec.Dataset, "clone", id); err != nil {
+			return nil, err
 		}
 		if err := checkCloneCompatibility(rp, src, requestedFsType(req.GetVolumeCapabilities())); err != nil {
 			return nil, err
@@ -221,19 +246,52 @@ func checkCloneCompatibility(rp *ResolvedParams, src *storagev1alpha1.ZfsDataset
 	return nil
 }
 
-// checkCloneCompatibility (snapshot-restore variant) looks up the true source
-// volume live (it may have been deleted, e.g. only the snapshot was retained)
-// and delegates to the Spec-to-Spec check above. Deliberately does not use the
-// standalone-mode backing clone as the comparison source: a backing clone is
-// never mounted (canmount=off/volmode=none), so its own Status.FSType would
-// always be empty regardless of what the real source was formatted as.
-func (c *ControllerServer) checkCloneCompatibility(ctx context.Context, rp *ResolvedParams, sourceVolumeID string, caps []*csi.VolumeCapability) error {
-	if sourceVolumeID == "" {
+// checkCloneCompatibility (snapshot-restore variant) prefers the live source
+// volume and falls back to the structural properties captured on the
+// ZfsSnapshot at creation time (D25) when it is gone.
+//
+// That fallback is the important half: for a standalone-mode snapshot the
+// source outliving the snapshot is the exception, not the rule, so looking the
+// source up live and returning "compatible" when absent left D10's checks dead
+// exactly where they matter. A mismatched fsType then surfaced much later as a
+// NodeStageVolume failure, and a mismatched volblocksize was ignored entirely
+// and silently (clone() never passes it, so ZFS raises nothing either).
+//
+// Deliberately does not use the standalone-mode backing clone as the comparison
+// source: a backing clone is never mounted (canmount=off/volmode=none), so its
+// own Status.FSType would always be empty regardless of what the real source
+// was formatted as.
+func (c *ControllerServer) checkCloneCompatibility(ctx context.Context, rp *ResolvedParams, snap *storagev1alpha1.ZfsSnapshot, caps []*csi.VolumeCapability) error {
+	if snap.Spec.SourceVolume != "" {
+		src := &storagev1alpha1.ZfsDataset{}
+		if err := c.Client.Get(ctx, client.ObjectKey{Name: snap.Spec.SourceVolume}, src); err == nil {
+			return checkCloneCompatibility(rp, src, requestedFsType(caps))
+		}
+	}
+	return checkCloneCompatibility(rp, capturedSourceDataset(snap), requestedFsType(caps))
+}
+
+// capturedSourceDataset rebuilds just enough of the (possibly long-gone) source
+// ZfsDataset from what CreateSnapshot recorded on the ZfsSnapshot, so the same
+// Spec-to-Spec comparison can run against it. Returns nil when the snapshot
+// carries no captured structure at all (created before D25), which
+// checkCloneCompatibility treats as "unconstrained" — the same convention as an
+// empty Status.FSType.
+func capturedSourceDataset(snap *storagev1alpha1.ZfsSnapshot) *storagev1alpha1.ZfsDataset {
+	if snap.Spec.SourceFSType == "" && snap.Spec.SourceVolblocksize == "" && len(snap.Spec.SourceProperties) == 0 {
 		return nil
 	}
-	src := &storagev1alpha1.ZfsDataset{}
-	if err := c.Client.Get(ctx, client.ObjectKey{Name: sourceVolumeID}, src); err != nil {
-		return nil // source gone or unreachable: nothing to compare against
+	name := snap.Spec.SourceVolume
+	if name == "" {
+		name = snap.Name
 	}
-	return checkCloneCompatibility(rp, src, requestedFsType(caps))
+	ds := &storagev1alpha1.ZfsDataset{}
+	ds.Name = name
+	ds.Spec.Type = snap.Spec.SourceType
+	ds.Spec.Properties = snap.Spec.SourceProperties
+	ds.Status.FSType = snap.Spec.SourceFSType
+	if snap.Spec.SourceVolblocksize != "" {
+		ds.Spec.Volume = &storagev1alpha1.VolumeConfig{Volblocksize: snap.Spec.SourceVolblocksize}
+	}
+	return ds
 }

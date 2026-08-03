@@ -52,6 +52,15 @@ func blockCaps() []*csi.VolumeCapability {
 	}}
 }
 
+// mountCapsWithFsType requests a filesystem volume with an explicit fsType, so
+// the D10 clone/restore compatibility checks have something to compare against.
+func mountCapsWithFsType(fsType string) []*csi.VolumeCapability {
+	return []*csi.VolumeCapability{{
+		AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: fsType}},
+		AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+	}}
+}
+
 // multiNodeMountCaps requests a multi-node (RWX) filesystem access mode.
 func multiNodeMountCaps() []*csi.VolumeCapability {
 	return []*csi.VolumeCapability{{
