@@ -163,6 +163,38 @@ func TestNodePublish_NFS(t *testing.T) {
 	}
 }
 
+// TestNodePublish_NFS_LiveResolvesRenamedDataset is the regression test for
+// the production incident where a manually-renamed ZFS dataset (with
+// ZfsDataset.Spec.Dataset updated to match) was not picked up on mount,
+// because NodePublishVolume trusted the CSI volume_context's cached dataset
+// path — which external-provisioner bakes into the immutable PV object once,
+// at CreateVolume time, and never refreshes. NodePublishVolume must prefer a
+// live lookup of the ZfsDataset CR (keyed by the stable VolumeId) over the
+// stale volume_context value.
+func TestNodePublish_NFS_LiveResolvesRenamedDataset(t *testing.T) {
+	m := newFakeMounter()
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/renamed-pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), vol)
+
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-1",
+		TargetPath:       "/var/lib/kubelet/pods/x/vol",
+		VolumeCapability: mountCap(),
+		// Stale cached path, as it would be in an immutable PV after a rename.
+		VolumeContext: map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-1", CtxProtocol: "nfs"},
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	want := "10.0.0.5:/mnt/tank/k8s/renamed-pvc-1"
+	if got := m.nfsMounts["/var/lib/kubelet/pods/x/vol"]; got != want {
+		t.Errorf("nfs source = %q, want %q (live ZfsDataset.Spec.Dataset, not stale volume_context)", got, want)
+	}
+}
+
 func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 	m := newFakeMounter()
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"}}

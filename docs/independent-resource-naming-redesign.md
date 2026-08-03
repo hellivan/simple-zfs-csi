@@ -230,5 +230,8 @@ to derive itself.
 
 ## 6. Open items / not yet decided
 
-- Step 4's exact mechanism (hash `vol.Name` vs. persist a new field) — lean toward
-  hashing, final call during implementation.
+- ~~Step 4's exact mechanism (hash `vol.Name` vs. persist a new field) — lean toward
+  hashing, final call during implementation.~~ **Resolved during implementation
+  (2026-08-02): hashing was used** (`cloneSnapshotSuffix` in
+  `internal/controller/zfsdataset_controller.go`, SHA-256 of the destination object
+  name, truncated to 16 hex chars) — no new persisted field was added. None outstanding.

@@ -900,6 +900,59 @@ F11, which D19 turned from latent into live).
 
 ---
 
+## 18. CSI `volume_context` is a one-time, immutable cache — don't trust it for anything that can change later
+
+**Symptom (production incident, 2026-08):** operator scaled a deployment to 0,
+renamed the backing dataset with `zfs rename`, updated the `ZfsDataset`
+CR's `Spec.Dataset` to match, and scaled back up. Pods failed to start with a
+mount error still referencing the **old** dataset path. `kubectl get zfsdataset`
+showed the correct new path; the NFS server itself was already exporting the
+new path correctly (its reconciler chain reads `ZfsDataset` live — see pitfall
+#17's guard). Only the mount attempt used the stale path.
+
+**Root cause:** `CreateVolume` returns a `volume_context` map (dataset path,
+pool GUID, protocol) that `external-provisioner` copies **once** into
+`PersistentVolume.spec.csi.volumeAttributes`. That field is immutable by
+Kubernetes/CSI protocol — not a bug in this driver, but a hard constraint of
+the upstream sidecar and API (confirmed via `kubectl edit`/`patch`, both
+rejected as read-only). `NodePublishVolume` read `vctx[CtxDataset]` from this
+cached copy instead of asking the authoritative source (the `ZfsDataset` CR,
+keyed by the stable `VolumeId`/`ObjectMeta.Name` per
+[independent-resource-naming-redesign.md](independent-resource-naming-redesign.md)),
+so any rename made after volume creation was invisible to every future mount —
+exactly the "cache used as authority" class in pitfall #17, just at the CSI
+protocol boundary instead of inside a finalizer.
+
+**Guard:** `NodePublishVolume` now live-resolves poolGUID, dataset path *and*
+protocol from the `ZfsDataset` CR (`resolveVolume` in
+[internal/csi/node.go](../internal/csi/node.go); protocol is derived from
+`Spec.Type` — the same 1:1 mapping `ParseParams` enforces at `CreateVolume`
+time, so nothing protocol-specific was ever unique to `volume_context`) and
+only falls back to the cached `volume_context` fields if that lookup errors
+*and* the request's `volume_context` is itself complete. Since
+`ObjectMeta.Name` never changes, this makes dataset renames (and, in
+principle, any future poolGUID/protocol drift) take effect on the very next
+mount/remount with no PV surgery required. Regression test:
+`TestNodePublish_NFS_LiveResolvesRenamedDataset` in
+[internal/csi/node_test.go](../internal/csi/node_test.go), which seeds a
+`ZfsDataset` with a `Spec.Dataset` deliberately different from the request's
+`VolumeContext[CtxDataset]` and asserts the live value wins.
+
+**Scope check:** as of this fix, `internal/csi/*.go` has no other
+`GetVolumeContext()`/`vctx[CtxDataset]` call sites — `NodePublishVolume` was
+the only consumer. `NodeExpandVolume` already resolved its NQN/pool live and
+was unaffected. There is no `NodeStageVolume`/`NodeUnstageVolume`
+implementation in this driver to audit.
+
+**Related, same family:** pitfall #17 above (ZFS clone graph mirrored into
+finalizers instead of queried live) — same root lesson, different boundary:
+prefer a live read of the one authoritative source over any cached/mirrored
+copy, no matter how convenient or "obviously stable" the cache seemed at
+design time.
+
+
+---
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing

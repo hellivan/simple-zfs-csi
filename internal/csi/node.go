@@ -76,13 +76,27 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		return nil, status.Error(codes.InvalidArgument, "volume capability is required")
 	}
 
+	// The CSI VolumeId doubles as the ZfsDataset CR's name (guaranteed stable —
+	// independent-resource-naming-redesign.md), so it's already a proper
+	// reference to the authoritative object. Resolve poolGUID/dataset/protocol
+	// live from that CR rather than trusting volume_context's cached copies:
+	// external-provisioner bakes volume_context into the PV's
+	// spec.csi.volumeAttributes once, at CreateVolume time, and that field is
+	// immutable thereafter (a Kubernetes/CSI protocol constraint, not something
+	// this driver controls) — so it never reflects a later operator-performed
+	// dataset rename or any other drift. Falls back to volume_context only if
+	// the ZfsDataset is somehow unreachable (defense in depth; also keeps
+	// already-provisioned PVs working during/after a rollout of this change).
 	vctx := req.GetVolumeContext()
-	poolGUID := vctx[CtxPoolGUID]
-	dataset := vctx[CtxDataset]
-	protocol := storagev1alpha1.Protocol(vctx[CtxProtocol])
-	if poolGUID == "" || dataset == "" || protocol == "" {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"volume_context must carry %s, %s and %s", CtxPoolGUID, CtxDataset, CtxProtocol)
+	poolGUID, dataset, protocol, err := n.resolveVolume(ctx, volumeID)
+	if err != nil {
+		fbPoolGUID, fbDataset, fbProtocol := vctx[CtxPoolGUID], vctx[CtxDataset], storagev1alpha1.Protocol(vctx[CtxProtocol])
+		if fbPoolGUID == "" || fbDataset == "" || fbProtocol == "" {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"resolve ZfsDataset %q: %v; volume_context is also incomplete (must carry %s, %s, %s)",
+				volumeID, err, CtxPoolGUID, CtxDataset, CtxProtocol)
+		}
+		poolGUID, dataset, protocol = fbPoolGUID, fbDataset, fbProtocol
 	}
 
 	pool, err := n.resolvePool(ctx, poolGUID)
@@ -194,6 +208,34 @@ func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 
 	n.Log.Info("expanded volume on node", "volume", volumeID, "device", device, "path", volumePath)
 	return &csi.NodeExpandVolumeResponse{}, nil
+}
+
+// resolveVolume loads the current poolGUID, dataset path and protocol live from
+// the ZfsDataset CR (ObjectMeta.Name == volumeID, immutable —
+// independent-resource-naming-redesign.md). protocol is derived from Spec.Type
+// (filesystem<->nfs, volume<->nvmeof, the same 1:1 mapping ParseParams enforces
+// at CreateVolume time), so there is nothing protocol-specific left for
+// volume_context to carry that isn't already on the CR.
+func (n *NodeServer) resolveVolume(ctx context.Context, volumeID string) (poolGUID, dataset string, protocol storagev1alpha1.Protocol, err error) {
+	ds := &storagev1alpha1.ZfsDataset{}
+	if err := n.Client.Get(ctx, client.ObjectKey{Name: volumeID}, ds); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", "", "", status.Errorf(codes.NotFound, "ZfsDataset %q not found", volumeID)
+		}
+		return "", "", "", status.Errorf(codes.Internal, "get ZfsDataset %q: %v", volumeID, err)
+	}
+	if ds.Spec.PoolGUID == "" || ds.Spec.Dataset == "" {
+		return "", "", "", status.Errorf(codes.Internal, "ZfsDataset %q has no poolGUID/dataset", volumeID)
+	}
+	switch ds.Spec.Type {
+	case storagev1alpha1.DatasetTypeFilesystem:
+		protocol = storagev1alpha1.ProtocolNFS
+	case storagev1alpha1.DatasetTypeVolume:
+		protocol = storagev1alpha1.ProtocolNVMeoF
+	default:
+		return "", "", "", status.Errorf(codes.Internal, "ZfsDataset %q has unknown type %q", volumeID, ds.Spec.Type)
+	}
+	return ds.Spec.PoolGUID, ds.Spec.Dataset, protocol, nil
 }
 
 // resolvePool loads the ZfsPool for a GUID and validates it is reachable.

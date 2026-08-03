@@ -25,6 +25,13 @@ import (
 
 // Volume context keys returned to the node plugin. The controller never returns
 // an absolute path; the node resolves routing from ZfsPool.status.
+//
+// These are a one-time snapshot: external-provisioner bakes them into the PV's
+// immutable spec.csi.volumeAttributes at CreateVolume time and never refreshes
+// them. VolumeId is the real reference (it equals the ZfsDataset CR's name,
+// guaranteed stable — independent-resource-naming-redesign.md), so
+// NodePublishVolume treats these as a fallback only and otherwise re-resolves
+// poolGUID/dataset/protocol live from that CR on every publish (ADR-0021).
 const (
 	CtxPoolGUID = "poolGUID"
 	CtxDataset  = "dataset"

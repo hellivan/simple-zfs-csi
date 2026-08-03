@@ -10,6 +10,67 @@ recurring bug classes and their guards are catalogued in
 
 ---
 
+## ADR-0021 — `NodePublishVolume` resolves poolGUID/dataset/protocol live from `ZfsDataset`, not from cached CSI `volume_context`
+
+**Status:** Accepted (2026-08) · **Scope:** `internal/csi/node.go` (`NodePublishVolume`, new `resolveVolume` helper) · **Full record and incident writeup:** [known-pitfalls.md](known-pitfalls.md) §18.
+
+### Context
+
+`CreateVolume` returns a `volume_context` map (dataset path, pool GUID, protocol),
+which `external-provisioner` copies once into `PersistentVolume.spec.csi.volumeAttributes`
+— a field that is immutable thereafter by Kubernetes/CSI protocol, not something this
+driver controls. `NodePublishVolume` read the dataset path straight out of that cached
+copy. This broke down in a real incident: an operator renamed a dataset with `zfs
+rename` and updated `ZfsDataset.Spec.Dataset` to match (exactly the workflow
+independent-resource-naming-redesign.md was meant to make safe, since `ObjectMeta.Name`
+— the stable `VolumeId` — never changes), but every subsequent mount still used the
+stale pre-rename path baked into the PV, because nothing ever re-reads
+`volume_context` after volume creation.
+
+This is the same bug class as ADR-0020/pitfall #17 (a mirrored/cached copy of external
+state being trusted as authoritative), just at the CSI protocol boundary: the one
+genuinely authoritative source for "what dataset backs this volume right now" is the
+`ZfsDataset` CR, keyed by the immutable `VolumeId`, not the one-time `volume_context`
+snapshot frozen into an unmodifiable Kubernetes object.
+
+The same reasoning extends to `poolGUID` and `protocol`: `protocol` is a pure
+function of `Spec.Type` (`ParseParams` enforces the 1:1 mapping
+filesystem↔nfs, volume↔nvmeof at `CreateVolume` time — see
+[internal/csi/params.go](../internal/csi/params.go)), and `poolGUID` is stored
+verbatim on the CR. There was never anything protocol-specific that
+`volume_context` carried that isn't already, and more durably, on the
+`ZfsDataset` CR reachable via the one reference CSI already guarantees is
+stable (`VolumeId`).
+
+### Decision
+
+`NodePublishVolume` now calls `resolveVolume(ctx, volumeID)`, which does a live `Get`
+of the `ZfsDataset` CR named `volumeID` and returns its `Spec.PoolGUID`, `Spec.Dataset`,
+and a `protocol` derived from `Spec.Type`. The cached `volume_context` fields are used
+**only** as a fallback if that lookup errors *and* the request's `volume_context` is
+itself complete (e.g. the CR is genuinely missing but this is an old/already-published
+PV) — otherwise the caller gets an `InvalidArgument` naming both failures. No PV field is
+touched; existing PVs need no migration. csi-node's RBAC already grants `get` on
+`zfsdatasets` (added alongside ADR-0019's D10 FSType tracking), so no chart change was
+required. `CreateVolume` keeps populating `volume_context` as before, purely to keep that
+fallback path meaningful.
+
+### Consequences
+
+- A dataset rename (`zfs rename` + `Spec.Dataset` edit) now takes effect on the very next
+  mount/remount, with no PV delete/recreate needed — closing the gap the incident
+  exposed. The same is true of any future change to how poolGUID/protocol are
+  represented, since neither is trusted from the cached copy either.
+- `NodePublishVolume` now issues one extra `Get` per publish call (replacing what was
+  previously zero); negligible against a cached controller-runtime client (pitfall #4
+  already requires the node's client to be configured this way).
+- Scope check: no other `internal/csi/*.go` call site reads `vctx[CtxDataset]`,
+  `vctx[CtxPoolGUID]`, or `vctx[CtxProtocol]`; `NodeExpandVolume` already resolved
+  NQN/pool live and needed no change. This driver has no `NodeStageVolume`/
+  `NodeUnstageVolume` to audit.
+
+---
+
 ## ADR-0020 — The live ZFS clone graph is the source of truth for delete-path dependents
 
 **Status:** Accepted (2026-08-03) · **Scope:** `internal/zpool` (`ZFS.ListSnapshots`, `ZFS.Clones`), `internal/controller` (`promote.go` rewritten, `zfsdataset_controller.go`, `zfssnapshot_controller.go`), `internal/csi` (`clone.go`, `snapshot.go`) · **Supersedes:** the `promoted-onto.<name>`/`restored-by.<name>` finalizer mechanism described in ADR-0019's Decision section (that ADR is otherwise unchanged and still describes the modes, the backing clone, and `zfs promote` as the core primitive) · **Full record:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) D17–D26 and §9.
