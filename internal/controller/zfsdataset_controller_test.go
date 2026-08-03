@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -911,8 +912,16 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 	if o := z.origin["tank/k8s/pvc-r2"]; o != "" {
 		t.Errorf("pvc-r2 origin = %q, want cleared (fully independent)", o)
 	}
-	if len(z.destroyed) != 1 || z.destroyed[0] != "tank/k8s/csi-snap-x" {
-		t.Fatalf("expected backing clone destroyed, got %v", z.destroyed)
+	// D15: a backing clone's own internal snapshot artifacts (its
+	// "@restore-source" self-snapshot and the relocated raw origin snapshot) are
+	// destroyed first, then the clone itself — all non-recursively (D11).
+	want := []string{
+		"tank/k8s/csi-snap-x@" + restoreSourceSnapshotName,
+		"tank/k8s/csi-snap-x@csi-snap-x",
+		"tank/k8s/csi-snap-x",
+	}
+	if !reflect.DeepEqual(z.destroyed, want) {
+		t.Fatalf("destroyed = %v, want %v", z.destroyed, want)
 	}
 
 	// pvc-r1/pvc-r2 remain untouched, independent objects — only the backing

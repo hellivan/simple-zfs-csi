@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -170,10 +171,24 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 }
 
 // releaseFinalizer removes the agent finalizer, allowing the API server to
-// complete deletion.
+// complete deletion. It re-reads the object first and retries on conflict: the
+// delete path (clearTrackingFinalizersReferencing/beforeDestroy) may itself have
+// updated this same object's tracking finalizers, so the copy held by Reconcile
+// is routinely stale by the time we get here.
 func (r *ZfsDatasetReconciler) releaseFinalizer(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
-	controllerutil.RemoveFinalizer(vol, zfsDatasetFinalizer)
-	return r.Update(ctx, vol)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cur := &storagev1alpha1.ZfsDataset{}
+		if err := r.Get(ctx, client.ObjectKey{Name: vol.Name}, cur); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if !controllerutil.RemoveFinalizer(cur, zfsDatasetFinalizer) {
+			return nil
+		}
+		return r.Update(ctx, cur)
+	})
 }
 
 // create provisions the filesystem or volume described by the volume spec. When
