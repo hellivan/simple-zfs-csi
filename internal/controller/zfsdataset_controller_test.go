@@ -924,4 +924,3 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 		}
 	}
 }
-

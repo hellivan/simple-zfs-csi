@@ -165,12 +165,12 @@ func TestList_ParsesTabSeparated(t *testing.T) {
 // dataset whose origin can be scripted to change on a chosen promote call
 // (D13: a single call is not always immediately sufficient).
 type promoteRunner struct {
-	origin        string
-	promoteCalls  int
-	getCalls      int
-	changeOnCall  int // origin changes to changedTo on this 1-indexed promote call; 0 = never
-	changedTo     string
-	promoteErrOn  int // if set, the promote call at this index returns an error
+	origin       string
+	promoteCalls int
+	getCalls     int
+	changeOnCall int // origin changes to changedTo on this 1-indexed promote call; 0 = never
+	changedTo    string
+	promoteErrOn int // if set, the promote call at this index returns an error
 }
 
 func (p *promoteRunner) run(_ context.Context, _ string, args ...string) (string, error) {
@@ -244,4 +244,3 @@ func TestPromote_PropagatesCommandError(t *testing.T) {
 		t.Fatal("expected the underlying zfs promote error to propagate")
 	}
 }
-
