@@ -6,7 +6,67 @@ decision, the context, the options weighed, and the consequences. Newest first.
 The complementary conventions doc is [api-conventions.md](api-conventions.md);
 the build plan is [implementation-strategy.md](implementation-strategy.md);
 recurring bug classes and their guards are catalogued in
-[known-pitfalls.md](known-pitfalls.md).
+[known-pitfalls.md](known-pitfalls.md); step-by-step operational procedures are
+in [runbooks.md](runbooks.md).
+
+---
+
+## ADR-0025 — A `ZfsSnapshot` resolves its source dataset path through `SourceVolume`, treating `Spec.Dataset` as a fallback record
+
+**Status:** Accepted (2026-08-04) · **Scope:** `internal/controller/zfssnapshot_controller.go` (new `sourceDatasetPath`), `internal/csi/clone.go` (new `snapshotDatasetPath`), `api/v1alpha1/zfssnapshot_types.go` (field doc) · **Related:** ADR-0021/ADR-0022, [known-pitfalls.md](known-pitfalls.md) #18, [runbooks.md](runbooks.md).
+
+### Context
+
+`CreateSnapshot` copies the source's `Spec.Dataset` onto the new `ZfsSnapshot`,
+and every consumer then rebuilt the full ZFS name from that copy —
+`<poolName>/<Spec.Dataset>@<Spec.SnapshotName>` — in the create path, the delete
+path, the backing clone's sibling path and its `Source.Snapshot`, plus the
+integrated-mode restore in the CSI controller.
+
+Location fields are deliberately mutable (api-conventions §5) precisely so a
+`zfs rename` can be followed by repointing `ZfsDataset.Spec.Dataset`. A ZFS
+snapshot moves with its dataset, so after such a rename the snapshot is still
+perfectly intact at the new path — but the copy recorded on the `ZfsSnapshot`
+still names the old one. Every existing snapshot of a renamed dataset therefore
+pointed at a path that no longer exists: creates and deletes would target
+nothing, and an integrated-mode restore would clone from a stale name. The only
+repair was to hand-edit every affected `ZfsSnapshot`.
+
+This is ADR-0021's finding one layer down. The CR already carries the right
+reference — `Spec.SourceVolume`, the source `ZfsDataset`'s object name, which is
+stable by construction (independent-resource-naming-redesign.md) — and it was
+being used only for back-references and `ListSnapshots` reporting, while the
+derived, drift-prone copy drove the actual ZFS commands.
+
+### Decision
+
+Both consumers resolve the path through `SourceVolume` when it is set and the
+object still exists, and fall back to `Spec.Dataset` otherwise. The fallback is
+not a hedge: a standalone snapshot is *designed* to outlive its source (D15), and
+once the source is gone the recorded copy is both the only answer available and
+the correct one — by then the raw snapshot has been relocated onto the backing
+clone anyway, and the delete path's `Destroy` is `NotExist`-tolerant.
+
+`Spec.Dataset` is not rewritten to match. Keeping it as a historical record
+avoids re-creating the mirror problem of pitfall #17; the field doc now says so
+explicitly.
+
+### Consequences
+
+- Renaming a dataset no longer strands its snapshots; nothing has to be
+  hand-edited alongside it. The supported procedure is in
+  [runbooks.md](runbooks.md).
+- One extra `Get` per snapshot reconcile and per snapshot-sourced `CreateVolume`.
+  In the reconciler it uses the cached client on the create path and the
+  uncached `gateReader()` on the delete path (ADR-0023).
+- `reconcileStandaloneCreate` takes the resolved path as a parameter rather than
+  reading `snap.Spec.Dataset` itself, so there is a single resolution point per
+  reconcile.
+- Pre-existing snapshots with no `SourceVolume` keep working through the
+  fallback, unchanged.
+- Regression test: `TestZfsSnapshotReconcile_FollowsRenamedSourceDataset` gives a
+  snapshot a deliberately stale `Spec.Dataset` and asserts the ZFS command lands
+  on the source's current path.
 
 ---
 

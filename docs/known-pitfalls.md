@@ -106,9 +106,10 @@ forbidden, the informer never syncs, and the read never returns.
   [cmd/nvmeof-controller/main.go](../cmd/nvmeof-controller/main.go); see
   [internal/controller/nvmeof_controller.go](../internal/controller/nvmeof_controller.go).
 - Or scope the manager cache with `cache.Options{DefaultNamespaces: …}` (the
-  operator does this from `POD_NAMESPACE` in
+  operator does this from its resolved namespace — `--namespace`, defaulting to
+  `$POD_NAMESPACE` — in
   [cmd/operator/main.go](../cmd/operator/main.go), which now **exits at startup**
-  if that variable is unset — the scoping is what keeps its namespaced Secret
+  if that resolves to empty — the scoping is what keeps its namespaced Secret
   RBAC sufficient, so silently falling back to a cluster-wide cache would
   reintroduce exactly this class).
 - csi-controller / csi-node use a **direct `client.New`** (uncached) client and
@@ -950,6 +951,11 @@ fails instead of mounting the cached path.
 NQN/pool live and was unaffected. There is no `NodeStageVolume`/
 `NodeUnstageVolume` implementation in this driver to audit.
 
+**Doing the rename safely:** the supported procedure — including why consumers
+have to be scaled to zero first, and what happens if the `zfs rename` and the
+`spec.dataset` edit drift apart — is written up in [runbooks.md](runbooks.md).
+Snapshots of the renamed dataset follow it automatically (ADR-0025).
+
 **Related, same family:** pitfall #17 above (ZFS clone graph mirrored into
 finalizers instead of queried live) — same root lesson, different boundary:
 prefer a live read of the one authoritative source over any cached/mirrored
@@ -1002,8 +1008,9 @@ adding a gate, ask which way it fails before deciding which reader it needs.
 
 Related and deliberately unfixed by this mechanism: the operator's namespaced
 cache scoping is what keeps its Secret RBAC sufficient, so `cmd/operator` now
-exits at startup when `POD_NAMESPACE` is unset rather than silently starting
-cluster-wide informers (class 4).
+exits at startup when its namespace resolves to empty (`--namespace`, defaulting
+to `$POD_NAMESPACE`) rather than silently starting cluster-wide informers
+(class 4).
 
 **Guarded by:** ADR-0023 (destructive reads) and ADR-0024 (readiness gates read
 the object the write returned, not a re-`Get` that the cache may answer with the
