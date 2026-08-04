@@ -128,7 +128,12 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	full, err := snapshotFullName(pool.Status.PoolName, snap.Spec.Dataset, snap.Spec.SnapshotName)
+	datasetPath, err := r.sourceDatasetPath(ctx, r.Client, &snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	full, err := snapshotFullName(pool.Status.PoolName, datasetPath, snap.Spec.SnapshotName)
 	if err != nil {
 		return ctrl.Result{}, r.setSnapshotStatus(ctx, &snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
 			"InvalidSnapshot", err.Error())
@@ -158,7 +163,7 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// standalone mode (D15): provision/await the owned backing-clone ZfsDataset,
 	// then take its "@restore-source" self-snapshot (D5) — restores always clone
 	// from that, never from the raw snapshot above directly (D0/§3.1).
-	return r.reconcileStandaloneCreate(ctx, &snap, &pool, full)
+	return r.reconcileStandaloneCreate(ctx, &snap, &pool, datasetPath, full)
 }
 
 // releaseSnapshotFinalizer removes the agent finalizer, allowing deletion. It
@@ -183,6 +188,35 @@ func (r *ZfsSnapshotReconciler) releaseSnapshotFinalizer(ctx context.Context, sn
 	})
 }
 
+// sourceDatasetPath returns the dataset path this snapshot's raw ZFS snapshot
+// lives on.
+//
+// Spec.Dataset is a *record* taken at CreateSnapshot time, not a pointer: the
+// authoritative answer, while the source still exists, is that ZfsDataset's own
+// Spec.Dataset. Location fields are deliberately mutable (api-conventions §5) —
+// an operator may `zfs rename` a dataset and repoint its CR, and the ZFS
+// snapshot moves with its dataset, but the copy recorded here cannot follow.
+// Trusting the copy is the same mistake as trusting the CSI volume_context
+// (ADR-0022), one layer down.
+//
+// Standalone snapshots deliberately outlive their source (D15), so the recorded
+// copy remains the fallback for when SourceVolume is unset (snapshots predating
+// that field) or the source object is already gone.
+func (r *ZfsSnapshotReconciler) sourceDatasetPath(ctx context.Context, reader client.Reader, snap *storagev1alpha1.ZfsSnapshot) (string, error) {
+	if snap.Spec.SourceVolume == "" {
+		return snap.Spec.Dataset, nil
+	}
+	src := &storagev1alpha1.ZfsDataset{}
+	err := reader.Get(ctx, client.ObjectKey{Name: snap.Spec.SourceVolume}, src)
+	switch {
+	case apierrors.IsNotFound(err):
+		return snap.Spec.Dataset, nil
+	case err != nil:
+		return "", err
+	}
+	return src.Spec.Dataset, nil
+}
+
 // reconcileDelete tears down a ZfsSnapshot on the node hosting its pool.
 // Integrated mode is unchanged: destroy the raw snapshot directly (ZFS's own
 // "has dependent clones" protection naturally blocks/retries if something
@@ -196,7 +230,11 @@ func (r *ZfsSnapshotReconciler) releaseSnapshotFinalizer(ctx context.Context, sn
 func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	rawFull, err := snapshotFullName(pool.Status.PoolName, snap.Spec.Dataset, snap.Spec.SnapshotName)
+	datasetPath, err := r.sourceDatasetPath(ctx, r.gateReader(), snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	rawFull, err := snapshotFullName(pool.Status.PoolName, datasetPath, snap.Spec.SnapshotName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -253,11 +291,11 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 // "@restore-source" self-snapshot (D5). Restores always clone from that, never
 // from the raw snapshot directly (D0/§3.1), so they keep working regardless of
 // what later happens to the true source volume.
-func (r *ZfsSnapshotReconciler) reconcileStandaloneCreate(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool, rawFull string) (ctrl.Result, error) {
+func (r *ZfsSnapshotReconciler) reconcileStandaloneCreate(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool, datasetPath, rawFull string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	backingName := snap.Spec.SnapshotName
-	backingDataset := path.Join(path.Dir(strings.Trim(snap.Spec.Dataset, "/")), backingName)
+	backingDataset := path.Join(path.Dir(strings.Trim(datasetPath, "/")), backingName)
 
 	backing := &storagev1alpha1.ZfsDataset{}
 	err := r.Get(ctx, client.ObjectKey{Name: backingName}, backing)
@@ -281,7 +319,7 @@ func (r *ZfsSnapshotReconciler) reconcileStandaloneCreate(ctx context.Context, s
 				Dataset:    backingDataset,
 				Type:       sourceType,
 				Properties: backingCloneProperties(sourceType),
-				Source:     &storagev1alpha1.DatasetSource{Snapshot: snap.Spec.Dataset + "@" + snap.Spec.SnapshotName},
+				Source:     &storagev1alpha1.DatasetSource{Snapshot: datasetPath + "@" + snap.Spec.SnapshotName},
 			},
 		}
 		if createErr := r.Create(ctx, desired); createErr != nil && !apierrors.IsAlreadyExists(createErr) {

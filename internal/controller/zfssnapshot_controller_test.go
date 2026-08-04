@@ -146,6 +146,53 @@ func TestZfsSnapshotReconcile_DestroysOnDeletion(t *testing.T) {
 	}
 }
 
+// TestZfsSnapshotReconcile_FollowsRenamedSourceDataset pins ADR-0025: the
+// snapshot's Spec.Dataset is only the path recorded when it was taken. Once the
+// source dataset is renamed (`zfs rename` plus a repointed
+// ZfsDataset.Spec.Dataset — a supported recovery workflow, api-conventions §5),
+// the ZFS snapshot has moved with its dataset, so the reconciler must follow
+// the source object rather than the stale copy.
+func TestZfsSnapshotReconcile_FollowsRenamedSourceDataset(t *testing.T) {
+	scheme := newTestScheme(t)
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999",
+			Dataset:  "k8s/renamed-pvc-1",
+			Type:     storagev1alpha1.DatasetTypeFilesystem,
+		},
+	}
+	snap := &storagev1alpha1.ZfsSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
+		Spec: storagev1alpha1.ZfsSnapshotSpec{
+			PoolGUID:     "999",
+			Dataset:      "k8s/pvc-1", // pre-rename copy
+			SnapshotName: "snap-1",
+			SourceVolume: "pvc-1",
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), src, snap).
+		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}).
+		Build()
+
+	z := newFakeZFS()
+	r := &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+
+	if len(z.createdDS) != 1 || z.createdDS[0] != "tank/k8s/renamed-pvc-1@snap-1" {
+		t.Fatalf("expected snapshot on the source's current path tank/k8s/renamed-pvc-1@snap-1, got %v", z.createdDS)
+	}
+}
+
 // TestZfsSnapshotReconcile_StandaloneCreatesBackingCloneAndSelfSnapshot drives
 // both ZfsSnapshotReconciler and ZfsDatasetReconciler (as they'd run
 // concurrently in the real DaemonSet) through a full standalone-mode create

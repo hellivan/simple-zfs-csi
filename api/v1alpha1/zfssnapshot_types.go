@@ -50,11 +50,21 @@ type ZfsSnapshotSpec struct {
 	// Dataset is the source dataset's logical path relative to the pool root, e.g.
 	// "k8s/pvc-123". Combined with the pool name and SnapshotName it yields the
 	// full ZFS snapshot name "<poolName>/<dataset>@<snapshotName>".
+	//
+	// It records where the source was when the snapshot was taken. While
+	// SourceVolume still resolves, that ZfsDataset's current Spec.Dataset is
+	// authoritative instead, so a source renamed afterwards stays usable; this
+	// field is the fallback for a snapshot that has outlived its source
+	// (ADR-0025).
 	// +kubebuilder:validation:MinLength=1
 	Dataset string `json:"dataset"`
 
-	// SnapshotName is the ZFS snapshot short name (the part after "@"). It is
-	// immutable for the lifetime of the snapshot.
+	// SnapshotName is the ZFS snapshot short name (the part after "@").
+	//
+	// Nothing in the driver rewrites it after creation, but like the other
+	// location fields it is deliberately left mutable so it can be repointed by
+	// hand during a recovery. Contrast Mode and SourceType below, which select
+	// behaviour and are CEL-immutable. See api-conventions.md §5.
 	// +kubebuilder:validation:MinLength=1
 	SnapshotName string `json:"snapshotName"`
 

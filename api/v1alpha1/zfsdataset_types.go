@@ -109,8 +109,14 @@ type ZfsDatasetSpec struct {
 	PoolGUID string `json:"poolGUID"`
 
 	// Dataset is the logical dataset path relative to the pool root, e.g.
-	// "k8s/pvc-123". It names the ZFS object (filesystem or volume) and is
-	// immutable for the lifetime of the volume.
+	// "k8s/pvc-123". It names the ZFS object (filesystem or volume).
+	//
+	// Nothing in the driver rewrites it after creation, but it is deliberately
+	// left mutable: repointing it by hand — after a `zfs rename`, or to adopt a
+	// dataset prepared with matching properties — is a supported recovery
+	// workflow. Rename the ZFS object first, then edit this field to match; the
+	// node re-resolves the mount path from here on every publish. See
+	// api-conventions.md §5 and the runbook in docs/runbooks.md.
 	// +kubebuilder:validation:MinLength=1
 	Dataset string `json:"dataset"`
 
