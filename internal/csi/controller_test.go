@@ -112,16 +112,20 @@ func TestCreateVolume_NFSFilesystem(t *testing.T) {
 	if resp.GetVolume().GetVolumeId() != "pvc-1" {
 		t.Errorf("volumeId = %q, want pvc-1", resp.GetVolume().GetVolumeId())
 	}
-	vctx := resp.GetVolume().GetVolumeContext()
-	// The dataset leaf is now an independent, opaque identifier
-	// (independent-resource-naming-redesign.md), not derived from the CSI name.
-	if vctx[CtxPoolGUID] != "999" || !strings.HasPrefix(vctx[CtxDataset], "k8s/csi-vol-") || vctx[CtxProtocol] != "nfs" {
-		t.Errorf("volume_context = %+v", vctx)
+	// The volume id is the only thing handed to the node: no routing facts are
+	// frozen into the PV's immutable volume_context (ADR-0022).
+	if vctx := resp.GetVolume().GetVolumeContext(); len(vctx) != 0 {
+		t.Errorf("volume_context = %+v, want empty", vctx)
 	}
 
 	vol := &storagev1alpha1.ZfsDataset{}
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, vol); err != nil {
 		t.Fatalf("get ZfsDataset: %v", err)
+	}
+	// The dataset leaf is an independent, opaque identifier
+	// (independent-resource-naming-redesign.md), not derived from the CSI name.
+	if vol.Spec.PoolGUID != "999" || !strings.HasPrefix(vol.Spec.Dataset, "k8s/csi-vol-") {
+		t.Errorf("poolGUID/dataset = %q/%q, want 999 and k8s/csi-vol-<uuid>", vol.Spec.PoolGUID, vol.Spec.Dataset)
 	}
 	if vol.Spec.Type != storagev1alpha1.DatasetTypeFilesystem {
 		t.Errorf("type = %q, want filesystem", vol.Spec.Type)
@@ -407,17 +411,27 @@ func TestCreateVolume_IdempotentSameParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first CreateVolume: %v", err)
 	}
+	first := &storagev1alpha1.ZfsDataset{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-5"}, first); err != nil {
+		t.Fatalf("get ZfsDataset: %v", err)
+	}
 	resp2, err := cs.CreateVolume(context.Background(), req)
 	if err != nil {
 		t.Fatalf("second CreateVolume should be idempotent: %v", err)
 	}
+	second := &storagev1alpha1.ZfsDataset{}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-5"}, second); err != nil {
+		t.Fatalf("get ZfsDataset (2nd): %v", err)
+	}
+	if resp1.GetVolume().GetVolumeId() != resp2.GetVolume().GetVolumeId() {
+		t.Errorf("volume id changed across idempotent retry: %q vs %q",
+			resp1.GetVolume().GetVolumeId(), resp2.GetVolume().GetVolumeId())
+	}
 	// The independent, opaque dataset identifier (independent-resource-naming-
 	// redesign.md) must be generated exactly once and reused on retry, not
 	// regenerated.
-	d1 := resp1.GetVolume().GetVolumeContext()[CtxDataset]
-	d2 := resp2.GetVolume().GetVolumeContext()[CtxDataset]
-	if d1 == "" || d1 != d2 {
-		t.Errorf("dataset changed across idempotent retry: %q vs %q", d1, d2)
+	if first.Spec.Dataset == "" || first.Spec.Dataset != second.Spec.Dataset {
+		t.Errorf("dataset changed across idempotent retry: %q vs %q", first.Spec.Dataset, second.Spec.Dataset)
 	}
 }
 
@@ -461,7 +475,7 @@ func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 	cs.AnnotationPrefix = "param.simple-zfs-csi.io/"
 	markReadyAsync(cl, "pvc-7")
 
-	resp, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+	if _, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
 		Name:               "pvc-7",
 		VolumeCapabilities: mountCaps(),
 		CapacityRange:      &csi.CapacityRange{RequiredBytes: 1 << 30},
@@ -472,23 +486,22 @@ func TestCreateVolume_PVCAnnotationsOverride(t *testing.T) {
 			"csi.storage.k8s.io/pvc/name":      "claim-a",
 			"csi.storage.k8s.io/pvc/namespace": "team-a",
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	vctx := resp.GetVolume().GetVolumeContext()
-	// StorageClass-only params keep their StorageClass values.
-	if vctx[CtxPoolGUID] != "sc-pool" {
-		t.Errorf("poolGUID = %q, want sc-pool (PVC annotation must not override)", vctx[CtxPoolGUID])
-	}
-	if !strings.HasPrefix(vctx[CtxDataset], "sc-pfx/csi-vol-") {
-		t.Errorf("dataset = %q, want sc-pfx/csi-vol-<uuid> (datasetPrefix is StorageClass-only)", vctx[CtxDataset])
-	}
-	// Non-restricted param from the annotation layer takes effect.
+
 	vol := &storagev1alpha1.ZfsDataset{}
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-7"}, vol); err != nil {
 		t.Fatalf("get ZfsDataset: %v", err)
 	}
+	// StorageClass-only params keep their StorageClass values.
+	if vol.Spec.PoolGUID != "sc-pool" {
+		t.Errorf("poolGUID = %q, want sc-pool (PVC annotation must not override)", vol.Spec.PoolGUID)
+	}
+	if !strings.HasPrefix(vol.Spec.Dataset, "sc-pfx/csi-vol-") {
+		t.Errorf("dataset = %q, want sc-pfx/csi-vol-<uuid> (datasetPrefix is StorageClass-only)", vol.Spec.Dataset)
+	}
+	// Non-restricted param from the annotation layer takes effect.
 	if vol.Spec.Properties["compression"] != "lz4" {
 		t.Errorf("property.compression not overridden by annotation: %+v", vol.Spec.Properties)
 	}

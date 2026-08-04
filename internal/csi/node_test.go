@@ -145,15 +145,25 @@ func blockCap() *csi.VolumeCapability {
 	}
 }
 
+// dataset returns the ZfsDataset CR for a volume id. NodePublishVolume resolves
+// poolGUID, dataset path and protocol exclusively from this object (ADR-0022),
+// so every publish test must seed one.
+func dataset(name, path string, typ storagev1alpha1.DatasetType) *storagev1alpha1.ZfsDataset {
+	return &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: path, Type: typ},
+	}
+}
+
 func TestNodePublish_NFS(t *testing.T) {
 	m := newFakeMounter()
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"))
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		dataset("pvc-1", "k8s/pvc-1", storagev1alpha1.DatasetTypeFilesystem))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-1",
 		TargetPath:       "/var/lib/kubelet/pods/x/vol",
 		VolumeCapability: mountCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-1", CtxProtocol: "nfs"},
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume: %v", err)
@@ -163,35 +173,32 @@ func TestNodePublish_NFS(t *testing.T) {
 	}
 }
 
-// TestNodePublish_NFS_LiveResolvesRenamedDataset is the regression test for
-// the production incident where a manually-renamed ZFS dataset (with
-// ZfsDataset.Spec.Dataset updated to match) was not picked up on mount,
-// because NodePublishVolume trusted the CSI volume_context's cached dataset
-// path — which external-provisioner bakes into the immutable PV object once,
-// at CreateVolume time, and never refreshes. NodePublishVolume must prefer a
-// live lookup of the ZfsDataset CR (keyed by the stable VolumeId) over the
-// stale volume_context value.
+// TestNodePublish_NFS_LiveResolvesRenamedDataset is the regression test for the
+// production incident where a manually-renamed ZFS dataset (with
+// ZfsDataset.Spec.Dataset updated to match) was not picked up on mount, because
+// NodePublishVolume trusted the CSI volume_context's cached dataset path — which
+// external-provisioner bakes into the immutable PV object once, at CreateVolume
+// time, and never refreshes. The mount source must follow the CR's current
+// Spec.Dataset, whatever the PV was created with.
 func TestNodePublish_NFS_LiveResolvesRenamedDataset(t *testing.T) {
 	m := newFakeMounter()
-	vol := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
-		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/renamed-pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
-	}
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), vol)
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		dataset("pvc-1", "k8s/renamed-pvc-1", storagev1alpha1.DatasetTypeFilesystem))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-1",
 		TargetPath:       "/var/lib/kubelet/pods/x/vol",
 		VolumeCapability: mountCap(),
-		// Stale cached path, as it would be in an immutable PV after a rename.
-		VolumeContext: map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-1", CtxProtocol: "nfs"},
+		// A stale pre-rename path, as an immutable PV would still carry it. It must
+		// be ignored entirely, not merely deprioritized.
+		VolumeContext: map[string]string{"poolGUID": "999", "dataset": "k8s/pvc-1", "protocol": "nfs"},
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume: %v", err)
 	}
 	want := "10.0.0.5:/mnt/tank/k8s/renamed-pvc-1"
 	if got := m.nfsMounts["/var/lib/kubelet/pods/x/vol"]; got != want {
-		t.Errorf("nfs source = %q, want %q (live ZfsDataset.Spec.Dataset, not stale volume_context)", got, want)
+		t.Errorf("nfs source = %q, want %q (live ZfsDataset.Spec.Dataset, not the PV's cached copy)", got, want)
 	}
 }
 
@@ -199,13 +206,13 @@ func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 	m := newFakeMounter()
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"}}
 	export.Status.NQN = "nqn.2025-01.io.simple-zfs-csi:pvc-2"
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export)
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export,
+		dataset("pvc-2", "k8s/pvc-2", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-2",
 		TargetPath:       "/target/fs",
 		VolumeCapability: mountCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-2", CtxProtocol: "nvmeof"},
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume: %v", err)
@@ -248,7 +255,6 @@ func TestNodePublish_NVMeoF_RecordsFSTypeOnce(t *testing.T) {
 		VolumeId:         "pvc-2",
 		TargetPath:       "/target/fs",
 		VolumeCapability: mountCap(), // requests ext4
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-2", CtxProtocol: "nvmeof"},
 	}); err != nil {
 		t.Fatalf("NodePublishVolume: %v", err)
 	}
@@ -268,7 +274,6 @@ func TestNodePublish_NVMeoF_RecordsFSTypeOnce(t *testing.T) {
 		VolumeId:         "pvc-2",
 		TargetPath:       "/target/fs2",
 		VolumeCapability: mountCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-2", CtxProtocol: "nvmeof"},
 	}); err != nil {
 		t.Fatalf("NodePublishVolume (2nd): %v", err)
 	}
@@ -292,13 +297,13 @@ func TestNodePublish_NVMeoF_DHChap(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "dhchap-pvc-9", Namespace: "sys"},
 		Data:       map[string][]byte{nvmeauth.SecretKeyDHChap: []byte("DHHC-1:00:Zm9v:")},
 	}
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export, sec)
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export, sec,
+		dataset("pvc-9", "k8s/pvc-9", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-9",
 		TargetPath:       "/target/fs",
 		VolumeCapability: mountCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-9", CtxProtocol: "nvmeof"},
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume: %v", err)
@@ -312,13 +317,13 @@ func TestNodePublish_NVMeoF_Block(t *testing.T) {
 	m := newFakeMounter()
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-3"}}
 	export.Status.NQN = "nqn.block"
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export)
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export,
+		dataset("pvc-3", "k8s/pvc-3", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-3",
 		TargetPath:       "/target/block",
 		VolumeCapability: blockCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-3", CtxProtocol: "nvmeof"},
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume: %v", err)
@@ -332,13 +337,12 @@ func TestNodePublish_RefusesNodeOffline(t *testing.T) {
 	m := newFakeMounter()
 	pool := onlinePool("999", "10.0.0.5", "/mnt/tank", "tank")
 	pool.Status.Health = storagev1alpha1.PoolHealthNodeOffline
-	ns := newNodeServer(t, m, pool)
+	ns := newNodeServer(t, m, pool, dataset("pvc-4", "k8s/pvc-4", storagev1alpha1.DatasetTypeFilesystem))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-4",
 		TargetPath:       "/target",
 		VolumeCapability: mountCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-4", CtxProtocol: "nfs"},
 	})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("err = %v, want FailedPrecondition", err)
@@ -347,13 +351,13 @@ func TestNodePublish_RefusesNodeOffline(t *testing.T) {
 
 func TestNodePublish_BlockOnNFSRejected(t *testing.T) {
 	m := newFakeMounter()
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"))
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		dataset("pvc-5", "k8s/pvc-5", storagev1alpha1.DatasetTypeFilesystem))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-5",
 		TargetPath:       "/target",
 		VolumeCapability: blockCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-5", CtxProtocol: "nfs"},
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("err = %v, want InvalidArgument", err)
@@ -363,13 +367,13 @@ func TestNodePublish_BlockOnNFSRejected(t *testing.T) {
 func TestNodePublish_NVMeoFRequiresNQN(t *testing.T) {
 	m := newFakeMounter()
 	// No NetworkExport object -> no NQN available.
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"))
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		dataset("pvc-6", "k8s/pvc-6", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-6",
 		TargetPath:       "/target",
 		VolumeCapability: mountCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-6", CtxProtocol: "nvmeof"},
 	})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("err = %v, want FailedPrecondition", err)
@@ -379,13 +383,13 @@ func TestNodePublish_NVMeoFRequiresNQN(t *testing.T) {
 func TestNodePublish_IdempotentWhenMounted(t *testing.T) {
 	m := newFakeMounter()
 	m.mounted["/target"] = true
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"))
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		dataset("pvc-7", "k8s/pvc-7", storagev1alpha1.DatasetTypeFilesystem))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-7",
 		TargetPath:       "/target",
 		VolumeCapability: mountCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999", CtxDataset: "k8s/pvc-7", CtxProtocol: "nfs"},
 	})
 	if err != nil {
 		t.Fatalf("NodePublishVolume: %v", err)
@@ -395,7 +399,10 @@ func TestNodePublish_IdempotentWhenMounted(t *testing.T) {
 	}
 }
 
-func TestNodePublish_MissingContext(t *testing.T) {
+// TestNodePublish_UnknownVolumeRejected pins ADR-0022: with no ZfsDataset to
+// resolve, the publish fails instead of falling back to whatever the PV's
+// immutable volume_context happens to still say.
+func TestNodePublish_UnknownVolumeRejected(t *testing.T) {
 	m := newFakeMounter()
 	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"))
 
@@ -403,10 +410,13 @@ func TestNodePublish_MissingContext(t *testing.T) {
 		VolumeId:         "pvc-8",
 		TargetPath:       "/target",
 		VolumeCapability: mountCap(),
-		VolumeContext:    map[string]string{CtxPoolGUID: "999"},
+		VolumeContext:    map[string]string{"poolGUID": "999", "dataset": "k8s/pvc-8", "protocol": "nfs"},
 	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("err = %v, want InvalidArgument", err)
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("err = %v, want NotFound", err)
+	}
+	if len(m.nfsMounts) != 0 {
+		t.Errorf("expected no mount for an unknown volume, got %v", m.nfsMounts)
 	}
 }
 

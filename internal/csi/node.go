@@ -27,10 +27,11 @@ const (
 )
 
 // NodeServer implements the CSI Node service. It runs as a privileged DaemonSet
-// on every node and turns a routing-only volume_context into a real mount:
-// NodePublishVolume resolves the ZfsPool's current node/IP/mount root, refuses
-// when the storage node is offline, and mounts NFS or connects+mounts NVMe-oF.
-// It writes no CRDs and learns no absolute path from the controller.
+// on every node and turns a CSI VolumeId into a real mount: NodePublishVolume
+// resolves the volume's ZfsDataset and its ZfsPool's current node/IP/mount root
+// live from the API on every call, refuses when the storage node is offline, and
+// mounts NFS or connects+mounts NVMe-oF. It learns no absolute path from the
+// controller (ADR-0022).
 type NodeServer struct {
 	csi.UnimplementedNodeServer
 
@@ -77,26 +78,18 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	}
 
 	// The CSI VolumeId doubles as the ZfsDataset CR's name (guaranteed stable —
-	// independent-resource-naming-redesign.md), so it's already a proper
-	// reference to the authoritative object. Resolve poolGUID/dataset/protocol
-	// live from that CR rather than trusting volume_context's cached copies:
-	// external-provisioner bakes volume_context into the PV's
-	// spec.csi.volumeAttributes once, at CreateVolume time, and that field is
-	// immutable thereafter (a Kubernetes/CSI protocol constraint, not something
-	// this driver controls) — so it never reflects a later operator-performed
-	// dataset rename or any other drift. Falls back to volume_context only if
-	// the ZfsDataset is somehow unreachable (defense in depth; also keeps
-	// already-provisioned PVs working during/after a rollout of this change).
-	vctx := req.GetVolumeContext()
+	// independent-resource-naming-redesign.md), so it is already a proper
+	// reference to the authoritative object: poolGUID, dataset path and protocol
+	// are resolved live from that CR on every publish. The request's
+	// volume_context is deliberately not consulted at all (ADR-0022) —
+	// external-provisioner bakes it into the PV's spec.csi.volumeAttributes once,
+	// at CreateVolume time, and that field is immutable thereafter, so it can
+	// only ever be a stale mirror of the CR (a dataset rename would be invisible
+	// to every later mount). A failed lookup fails the publish rather than
+	// falling back to a cached path nobody is reconciling any more.
 	poolGUID, dataset, protocol, err := n.resolveVolume(ctx, volumeID)
 	if err != nil {
-		fbPoolGUID, fbDataset, fbProtocol := vctx[CtxPoolGUID], vctx[CtxDataset], storagev1alpha1.Protocol(vctx[CtxProtocol])
-		if fbPoolGUID == "" || fbDataset == "" || fbProtocol == "" {
-			return nil, status.Errorf(codes.InvalidArgument,
-				"resolve ZfsDataset %q: %v; volume_context is also incomplete (must carry %s, %s, %s)",
-				volumeID, err, CtxPoolGUID, CtxDataset, CtxProtocol)
-		}
-		poolGUID, dataset, protocol = fbPoolGUID, fbDataset, fbProtocol
+		return nil, err
 	}
 
 	pool, err := n.resolvePool(ctx, poolGUID)

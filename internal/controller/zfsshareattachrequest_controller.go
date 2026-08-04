@@ -55,6 +55,27 @@ type ZfsShareAttachRequestReconciler struct {
 	// DHChapSecretKey is the data key under which the DH-CHAP secret is stored in
 	// the Secret and recorded on the NetworkExport. Empty defaults to "dhchap-key".
 	DHChapSecretKey string
+	// APIReader reads straight from the API server, bypassing the manager's
+	// informer cache. SetupWithManager wires it; it is used only where a stale
+	// read would tear down or move a live export (see gateReader).
+	APIReader client.Reader
+}
+
+// gateReader returns the reader used for the two decisions whose blast radius is
+// a live export rather than a delayed reconcile: tearing the ZfsShare down
+// because no attach request remains, and picking the single node a zvol is
+// exported to. Attach requests are authored by the CSI controller with an
+// uncached client, and a ZfsShare-triggered reconcile has no ordering
+// relationship to the attach-request informer at all, so a cache that has not
+// caught up can show an empty (or older-entry-missing) set and unexport a volume
+// a node is actively using (known-pitfalls.md #19).
+//
+// Falls back to the cached client when no APIReader is wired (tests).
+func (r *ZfsShareAttachRequestReconciler) gateReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsshareattachrequests,verbs=get;list;watch;update;patch
@@ -130,12 +151,21 @@ func (r *ZfsShareAttachRequestReconciler) Reconcile(ctx context.Context, req ctr
 func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, volume string) (*storagev1alpha1.ZfsShare, []string, error) {
 	logger := log.FromContext(ctx)
 
-	nodes, err := r.activeNodes(ctx, volume)
+	nodes, err := r.activeNodes(ctx, r.Client, volume)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	shareKey := client.ObjectKey{Name: volume}
+
+	// An empty set is the one answer that destroys something, so never act on the
+	// cache's word for it: confirm against the API server first. Costs one live
+	// LIST on the teardown path only.
+	if len(nodes) == 0 {
+		if nodes, err = r.activeNodes(ctx, r.gateReader(), volume); err != nil {
+			return nil, nil, err
+		}
+	}
 
 	// No consumers left: tear the share down (its NetworkExport is GC'd with it),
 	// and remove any per-attach DH-CHAP secret.
@@ -218,11 +248,14 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 		logger.Info("aggregated ZfsShare", "op", op, "volume", volume, "nodes", exported)
 	}
 
-	fresh := &storagev1alpha1.ZfsShare{}
-	if err := r.Get(ctx, shareKey, fresh); err != nil {
-		return nil, nil, err
-	}
-	return fresh, exported, nil
+	// `share` is what the API server returned from the create/update above, so its
+	// Generation and Status are authoritative. Re-reading it through the manager's
+	// cache here would be a read-your-own-write: an informer still holding the
+	// pre-update copy reports the *old* Generation alongside the *old*
+	// ObservedGeneration, which match, so shareReadyForGeneration would report the
+	// attach ready before the node has applied the new allow-list
+	// (known-pitfalls.md #19).
+	return share, exported, nil
 }
 
 // oldestAttachNode returns the node whose non-terminating attach request for the
@@ -230,7 +263,10 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 // winner for a single-node (zvol) volume when more than one node races to attach.
 func (r *ZfsShareAttachRequestReconciler) oldestAttachNode(ctx context.Context, volume string) (string, error) {
 	var list storagev1alpha1.ZfsShareAttachRequestList
-	if err := r.List(ctx, &list); err != nil {
+	// Authoritative: a cached list can only ever *omit* entries, and omitting the
+	// oldest one hands the export to a different node — moving a block device that
+	// may already be mounted.
+	if err := r.gateReader().List(ctx, &list); err != nil {
 		return "", err
 	}
 	var oldest *storagev1alpha1.ZfsShareAttachRequest
@@ -257,10 +293,12 @@ func (r *ZfsShareAttachRequestReconciler) oldestAttachNode(ctx context.Context, 
 }
 
 // activeNodes returns the sorted, de-duplicated set of node names that currently
-// hold a non-terminating attach request for the volume.
-func (r *ZfsShareAttachRequestReconciler) activeNodes(ctx context.Context, volume string) ([]string, error) {
+// hold a non-terminating attach request for the volume, as seen by the given
+// reader (the cached client for routine work, the API server directly when the
+// answer decides whether to tear an export down).
+func (r *ZfsShareAttachRequestReconciler) activeNodes(ctx context.Context, reader client.Reader, volume string) ([]string, error) {
 	var list storagev1alpha1.ZfsShareAttachRequestList
-	if err := r.List(ctx, &list); err != nil {
+	if err := reader.List(ctx, &list); err != nil {
 		return nil, err
 	}
 	seen := map[string]struct{}{}
@@ -434,6 +472,9 @@ func (r *ZfsShareAttachRequestReconciler) requestsForShare(ctx context.Context, 
 // attach-request list and nvmeExportSpec allowing exactly one host NQN, both of
 // which are concurrency-safe on their own.
 func (r *ZfsShareAttachRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsShareAttachRequest{}).
 		Watches(&storagev1alpha1.ZfsShare{}, handler.EnqueueRequestsFromMapFunc(r.requestsForShare)).

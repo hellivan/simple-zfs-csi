@@ -103,13 +103,16 @@ func (r *ZfsShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// re-render (e.g. an allow-list change) is rejected by the generation gate, so
 	// a consumer never mounts against an export that does not yet reflect its
 	// authorization.
-	fresh := &storagev1alpha1.NetworkExport{}
-	if err := r.Get(ctx, client.ObjectKey{Name: share.Name}, fresh); err != nil {
-		return ctrl.Result{}, r.setStatus(ctx, &share, storagev1alpha1.SharePhaseError, pool.Status.CurrentNode, exportPath,
-			"RenderFailed", err.Error())
-	}
-	exported := fresh.Status.Phase == storagev1alpha1.PhaseExported &&
-		fresh.Status.ObservedGeneration >= fresh.Generation
+	//
+	// `export` is the object the API server returned from the create/update above,
+	// so its Generation and Status are authoritative. Re-reading it here through
+	// the manager's cache would be a read-your-own-write and would defeat the gate:
+	// an informer that still holds the pre-update copy reports the *old*
+	// Generation together with the *old* ObservedGeneration, which match, so the
+	// share would be marked Bound against a spec the node has not applied yet
+	// (known-pitfalls.md #19).
+	exported := export.Status.Phase == storagev1alpha1.PhaseExported &&
+		export.Status.ObservedGeneration >= export.Generation
 	if !exported {
 		// The Owns(NetworkExport) watch re-drives us when the aggregator updates
 		// the export status; requeue as a fallback in case the event is missed.

@@ -23,28 +23,15 @@ import (
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
-// Volume context keys returned to the node plugin. The controller never returns
-// an absolute path; the node resolves routing from ZfsPool.status.
-//
-// These are a one-time snapshot: external-provisioner bakes them into the PV's
-// immutable spec.csi.volumeAttributes at CreateVolume time and never refreshes
-// them. VolumeId is the real reference (it equals the ZfsDataset CR's name,
-// guaranteed stable — independent-resource-naming-redesign.md), so
-// NodePublishVolume treats these as a fallback only and otherwise re-resolves
-// poolGUID/dataset/protocol live from that CR on every publish (ADR-0021).
-const (
-	CtxPoolGUID = "poolGUID"
-	CtxDataset  = "dataset"
-	CtxProtocol = "protocol"
-)
-
 // defaultsConfigMapKey is the ConfigMap data key holding the provisioner default
 // parameters (a YAML map of parameter name -> value).
 const defaultsConfigMapKey = "parameters.yaml"
 
 // ControllerServer implements the CSI Controller service by writing the ZFS
-// CRDs. CreateVolume writes a ZfsDataset, waits for it to become Ready, writes a
-// ZfsShare, and returns a routing-only volume_context. DeleteVolume deletes both
+// CRDs. CreateVolume writes a ZfsDataset, waits for it to become Ready, and
+// returns nothing but the volume id — every routing fact (pool, dataset path,
+// protocol) is re-resolved live from that CR by the node plugin, never carried
+// in the PV's immutable volume_context (ADR-0022). DeleteVolume deletes the
 // CRDs; finalizers on the agent/operator drive the actual teardown.
 type ControllerServer struct {
 	csi.UnimplementedControllerServer
@@ -74,7 +61,7 @@ type ControllerServer struct {
 }
 
 // CreateVolume provisions a ZfsDataset (the export stays lazy until attach) and
-// returns the volume context.
+// returns the volume id.
 func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	name := req.GetName()
 	if name == "" {
@@ -139,15 +126,14 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	// export is created on demand at ControllerPublishVolume (attach) and torn
 	// down at the last detach, so nothing is exported until a node is authorized.
 	c.Log.Info("provisioned volume", "name", name, "pool", rp.PoolGUID, "dataset", dataset, "protocol", rp.Protocol, "path", ready.Status.Path)
+	// No volume_context: the node resolves poolGUID/dataset/protocol from the
+	// ZfsDataset named by VolumeId on every publish (ADR-0022). Anything returned
+	// here would be frozen into the PV's immutable spec.csi.volumeAttributes and
+	// could only ever go stale.
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			VolumeId:      name,
 			CapacityBytes: sizeBytes,
-			VolumeContext: map[string]string{
-				CtxPoolGUID: rp.PoolGUID,
-				CtxDataset:  dataset,
-				CtxProtocol: string(rp.Protocol),
-			},
 			ContentSource: req.GetVolumeContentSource(),
 		},
 	}, nil

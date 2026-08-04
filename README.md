@@ -12,7 +12,7 @@ node-pinned *exports*, and per-node aggregators execute those exports.
 
 | Component | Image | Kind | Reconciles | Mechanism |
 |-----------|-------|------|------------|-----------|
-| `csi-controller` | `simple-zfs-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` + `ControllerPublish`/`Unpublish` | thin gRPC adapter: writes `ZfsDataset`; at attach writes one `ZfsShareAttachRequest` per node; returns a routing-only volume context |
+| `csi-controller` | `simple-zfs-csi-controller` | Deployment (cluster-wide) | CSI `CreateVolume`/`DeleteVolume` + `ControllerPublish`/`Unpublish` | thin gRPC adapter: writes `ZfsDataset`; at attach writes one `ZfsShareAttachRequest` per node; returns only the volume id |
 | `csi-node` | `simple-zfs-csi-node` | DaemonSet (all nodes) | CSI `NodePublishVolume` | resolves `ZfsPool.status`, `mount -t nfs` / `nvme connect`; refuses `NODE_OFFLINE` |
 | `zpool-discovery` (agent) | `simple-zfs-csi-discovery` | DaemonSet (storage nodes) | local pools (Tier 1) + `ZfsDataset` | polls `zpool`/`zfs` into `ZfsPool`; `zfs create/destroy` for datasets/zvols |
 | `operator` | `simple-zfs-csi-operator` | Deployment (x1, leader-elected) | `Node` (Tier 2) + `ZfsShareAttachRequest` + `ZfsShare` | offlines dead nodes' `ZfsPool`; aggregates attach requests into a lazy `ZfsShare` → `NetworkExport` |
@@ -62,11 +62,45 @@ The CSI plane is deliberately **thin**: `csi-controller` performs no ZFS work �
 at `CreateVolume` it records a `ZfsDataset` (the export stays lazy), and at
 `ControllerPublishVolume` (driven by `external-attacher`) it records one
 `ZfsShareAttachRequest` per consuming node, then waits for the export to go live.
-It returns only a routing-only volume context (`poolGUID`, `dataset`,
-`protocol`). All ZFS allocation happens in the per-node agent; the operator
-aggregates attach requests into a ref-counted `ZfsShare` → `NetworkExport` (torn
-down at the last detach); `csi-node` only resolves the live `ZfsPool.status` and
-mounts.
+It returns nothing but the volume id — which is the `ZfsDataset`'s name, so
+`csi-node` re-resolves pool, dataset path and protocol live from that object on
+every publish (ADR-0022). All ZFS allocation happens in the per-node agent; the
+operator aggregates attach requests into a ref-counted `ZfsShare` →
+`NetworkExport` (torn down at the last detach); `csi-node` only resolves the live
+`ZfsPool.status` and mounts.
+
+### Who owns what: the two-tier ownership rule
+
+The driver has a strict two-tier split, and it is the single most useful thing to
+know when reading the code:
+
+> **The control plane declares what should exist. Node agents make it so.**
+> Nothing in the node tier ever authors a Kubernetes object.
+
+| Tier | Component | Workload | Authors (creates/deletes) | Reads |
+|---|---|---|---|---|
+| Control plane | `csi-controller` | Deployment, cluster-wide | `ZfsDataset`, `ZfsSnapshot`, `ZfsShareAttachRequest` | `ZfsPool`, PVCs, StorageClasses |
+| Control plane | `operator` | Deployment, cluster-wide | `ZfsShare`, `NetworkExport` | `ZfsShareAttachRequest`, `ZfsDataset`, `ZfsPool`, Nodes |
+| Node | `discovery` agent | DaemonSet, every storage node | `ZfsPool` (its own node's, discovery-only) | `ZfsDataset`, `ZfsSnapshot`, `ZfsPool` |
+| Node | `nfs` / `nvmeof` controllers | DaemonSet | — | `NetworkExport` |
+| Node | `csi-node` | DaemonSet, every node | — | `ZfsPool.status` |
+
+Why it matters, beyond tidiness: a node agent is privileged (host root, direct
+`zfs` access) but is only ever *entitled to its own node*. A Kubernetes object,
+by contrast, carries a `poolGUID` — so an agent that can author objects can
+induce a **different** node's agent to act on a pool it doesn't host. Keeping
+authoring in the control plane keeps that blast radius closed, and it is why
+`csi-controller` performs no ZFS work while the agents write no objects.
+
+Status writes are exempt: every component reports `status` on the objects it
+acts on. The rule is about `spec`/lifecycle authorship.
+
+> **One exception exists today and is being removed.** `ZfsSnapshotReconciler`
+> (node tier) authors the backing-clone `ZfsDataset` for `standalone` snapshots.
+> That is a layering violation, it is what forced `create`/`delete` on
+> `zfsdatasets` into the discovery role, and it directly produced a blocker-level
+> RBAC defect. It moves to the operator — see D27 in
+> [docs/snapshot-lifecycle-redesign.md](docs/snapshot-lifecycle-redesign.md).
 
 ### Export execution
 

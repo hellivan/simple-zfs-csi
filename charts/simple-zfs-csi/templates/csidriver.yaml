@@ -11,7 +11,8 @@ spec:
   # ControllerPublishVolume. This is mandatory for mounting, so it is not
   # configurable.
   attachRequired: true
-  # The node plugin reads the volume_context at publish time.
+  # The node plugin needs no pod metadata: it resolves everything it mounts from
+  # the ZfsDataset named by the volume id (ADR-0022).
   podInfoOnMount: false
   # fsGroup ownership. ReadWriteOnceWithFSType (the CSI default, made explicit)
   # makes kubelet apply pod.spec.securityContext.fsGroup only to single-node

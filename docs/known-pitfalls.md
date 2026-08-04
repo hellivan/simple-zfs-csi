@@ -107,8 +107,10 @@ forbidden, the informer never syncs, and the read never returns.
   [internal/controller/nvmeof_controller.go](../internal/controller/nvmeof_controller.go).
 - Or scope the manager cache with `cache.Options{DefaultNamespaces: …}` (the
   operator does this from `POD_NAMESPACE` in
-  [cmd/operator/main.go](../cmd/operator/main.go) — **note:** this fail-safe only
-  holds while `POD_NAMESPACE` is set).
+  [cmd/operator/main.go](../cmd/operator/main.go), which now **exits at startup**
+  if that variable is unset — the scoping is what keeps its namespaced Secret
+  RBAC sufficient, so silently falling back to a cluster-wide cache would
+  reintroduce exactly this class).
 - csi-controller / csi-node use a **direct `client.New`** (uncached) client and
   are immune to this class.
 
@@ -923,26 +925,30 @@ so any rename made after volume creation was invisible to every future mount —
 exactly the "cache used as authority" class in pitfall #17, just at the CSI
 protocol boundary instead of inside a finalizer.
 
-**Guard:** `NodePublishVolume` now live-resolves poolGUID, dataset path *and*
+**Guard:** `NodePublishVolume` live-resolves poolGUID, dataset path *and*
 protocol from the `ZfsDataset` CR (`resolveVolume` in
 [internal/csi/node.go](../internal/csi/node.go); protocol is derived from
 `Spec.Type` — the same 1:1 mapping `ParseParams` enforces at `CreateVolume`
-time, so nothing protocol-specific was ever unique to `volume_context`) and
-only falls back to the cached `volume_context` fields if that lookup errors
-*and* the request's `volume_context` is itself complete. Since
-`ObjectMeta.Name` never changes, this makes dataset renames (and, in
-principle, any future poolGUID/protocol drift) take effect on the very next
-mount/remount with no PV surgery required. Regression test:
-`TestNodePublish_NFS_LiveResolvesRenamedDataset` in
-[internal/csi/node_test.go](../internal/csi/node_test.go), which seeds a
-`ZfsDataset` with a `Spec.Dataset` deliberately different from the request's
-`VolumeContext[CtxDataset]` and asserts the live value wins.
+time, so nothing protocol-specific was ever unique to `volume_context`), and
+the request's `volume_context` is **not consulted at all**. A failed lookup
+fails the publish (`NotFound` when the CR is gone) rather than falling back to
+a cached path nobody is reconciling. `CreateVolume` correspondingly returns no
+`volume_context`, so no routing fact is frozen into a PV in the first place —
+there is nothing left to go stale, and nothing for a future reader to trust by
+mistake (ADR-0021 introduced the live lookup; ADR-0022 removed the fallback and
+the population). Since `ObjectMeta.Name` never changes, dataset renames (and any
+future poolGUID/protocol drift) take effect on the very next mount with no PV
+surgery. Regression tests in
+[internal/csi/node_test.go](../internal/csi/node_test.go):
+`TestNodePublish_NFS_LiveResolvesRenamedDataset` seeds a `ZfsDataset` whose
+`Spec.Dataset` deliberately differs from the request's `VolumeContext`, and
+`TestNodePublish_UnknownVolumeRejected` asserts a publish with no `ZfsDataset`
+fails instead of mounting the cached path.
 
-**Scope check:** as of this fix, `internal/csi/*.go` has no other
-`GetVolumeContext()`/`vctx[CtxDataset]` call sites — `NodePublishVolume` was
-the only consumer. `NodeExpandVolume` already resolved its NQN/pool live and
-was unaffected. There is no `NodeStageVolume`/`NodeUnstageVolume`
-implementation in this driver to audit.
+**Scope check:** `internal/csi/*.go` has no `GetVolumeContext()` consumer left —
+`NodePublishVolume` was the only one. `NodeExpandVolume` already resolved its
+NQN/pool live and was unaffected. There is no `NodeStageVolume`/
+`NodeUnstageVolume` implementation in this driver to audit.
 
 **Related, same family:** pitfall #17 above (ZFS clone graph mirrored into
 finalizers instead of queried live) — same root lesson, different boundary:
@@ -950,6 +956,61 @@ prefer a live read of the one authoritative source over any cached/mirrored
 copy, no matter how convenient or "obviously stable" the cache seemed at
 design time.
 
+---
+
+## 19. Deciding something irreversible from the informer cache
+
+**Symptom (latent; found by audit, not by an incident):** a `zfs destroy` gets
+past a gate that exists to stop it, or a `ZfsShare` is torn down while a node is
+still attached — and everything looks correct afterwards, because the object
+that should have blocked it *does* exist, it just wasn't visible at the instant
+the decision was made.
+
+**Root cause:** `mgr.GetClient()` reads the manager's informer cache, which is
+eventually consistent *by design*. That is exactly right for level-triggered
+reconciliation, where being one watch event behind only delays convergence. It
+is exactly wrong for a read whose answer authorises an irreversible act, because
+those reads all **fail open**: an object the cache has not received yet reads as
+"absent", which every one of these gates interprets as "nothing to protect".
+
+Two properties turn that from theory into a likely race:
+
+1. **Cross-process.** The objects being looked for (`ZfsSnapshot`, clone
+   `ZfsDataset`, `ZfsShareAttachRequest`) are authored by the CSI controller,
+   which uses an uncached `client.New` — its writes are at the API server
+   immediately, while the agent/operator only learn of them via watch delivery.
+2. **Cross-kind.** Most of these gates read a *different kind* than the one that
+   triggered the reconcile (a `ZfsDataset` delete listing `ZfsSnapshot`s). Within
+   one informer, events arrive in resourceVersion order, so a same-kind list is
+   at least consistent with the event being processed. Across two informers there
+   is no ordering relationship at all — that guarantee simply does not exist.
+
+**Guard:** the affected reconcilers carry an `APIReader client.Reader`, wired in
+`SetupWithManager` from `mgr.GetAPIReader()` and reached via `gateReader()`. Only
+these reads use it — everything else keeps the cache:
+
+| Reader | Decision it authorises |
+|---|---|
+| `ZfsDatasetReconciler.gateReader()` | `checkSnapshotDependents`, `checkOwningSnapshotLive`, `checkPendingCloneDependents`, `assertDriverSnapshot` — all gating a `zfs destroy` |
+| `ZfsSnapshotReconciler.gateReader()` | the backing-clone lookup before destroying the raw origin snapshot |
+| `ZfsShareAttachRequestReconciler.gateReader()` | "no attach requests left" (deletes a live export) and the oldest-request winner (moves a zvol export between nodes) |
+
+Note the polarity distinction: `assertKnownDatasets` reads the same cache and is
+*not* wired to the API reader, because it fails **closed** — an unknown clone
+refuses the promote. Stale data there can only over-block, which is safe. When
+adding a gate, ask which way it fails before deciding which reader it needs.
+
+Related and deliberately unfixed by this mechanism: the operator's namespaced
+cache scoping is what keeps its Secret RBAC sufficient, so `cmd/operator` now
+exits at startup when `POD_NAMESPACE` is unset rather than silently starting
+cluster-wide informers (class 4).
+
+**Guarded by:** ADR-0023 (destructive reads) and ADR-0024 (readiness gates read
+the object the write returned, not a re-`Get` that the cache may answer with the
+pre-update copy) in [design-decisions.md](design-decisions.md). Regression tests
+model the lag by handing a reconciler a cached client and an `APIReader` backed
+by *different* fake objects: `TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader`
+and `TestAttachRequest_StaleCacheDoesNotTearDownLiveShare`.
 
 ---
 

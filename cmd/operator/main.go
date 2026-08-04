@@ -40,6 +40,7 @@ func main() {
 	var (
 		metricsAddr     string
 		probeAddr       string
+		namespace       string
 		leaderElect     bool
 		leaderElecNS    string
 		dhchapEnabled   bool
@@ -48,6 +49,7 @@ func main() {
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe binds to.")
+	flag.StringVar(&namespace, "namespace", os.Getenv("POD_NAMESPACE"), "Namespace the operator runs in: scopes the manager's namespaced cache and holds the per-attach DH-CHAP Secrets (defaults to $POD_NAMESPACE).")
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election so only one operator acts at a time.")
 	flag.StringVar(&leaderElecNS, "leader-election-namespace", os.Getenv("POD_NAMESPACE"), "Namespace for the leader-election lease (defaults to $POD_NAMESPACE).")
 	flag.BoolVar(&dhchapEnabled, "nvmeof-dhchap", true, "Enable NVMe-oF DH-CHAP in-band authentication (ADR-0011); NQN allow-listing applies regardless.")
@@ -62,15 +64,24 @@ func main() {
 	ctrl.SetLogger(logger)
 	setupLog := ctrl.Log.WithName("setup")
 
-	podNamespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		// Not optional, and deliberately not defaulted: it scopes the cache below
+		// *and* names the namespace the DH-CHAP Secrets are created in. Left empty,
+		// the manager would start cluster-wide Secret informers that the operator's
+		// namespaced RBAC forbids — and a forbidden informer never syncs, so the
+		// operator would stall silently rather than fail (known-pitfalls.md #4).
+		// The chart always supplies POD_NAMESPACE from the downward API; --namespace
+		// covers running the binary outside a pod.
+		setupLog.Error(nil, "namespace is required; set --namespace or the POD_NAMESPACE env var")
+		os.Exit(1)
+	}
 
 	// Scope the cache's namespaced reads (Secrets, ConfigMaps, CronJobs, Leases,
-	// Events) to the release namespace so the operator needs only namespaced RBAC
-	// for them; cluster-scoped resources (ZfsPool, Node, the ZFS CRDs) are still
+	// Events) to that namespace so the operator needs only namespaced RBAC for
+	// them; cluster-scoped resources (ZfsPool, Node, the ZFS CRDs) are still
 	// watched cluster-wide.
-	cacheOpts := cache.Options{}
-	if podNamespace != "" {
-		cacheOpts.DefaultNamespaces = map[string]cache.Config{podNamespace: {}}
+	cacheOpts := cache.Options{
+		DefaultNamespaces: map[string]cache.Config{namespace: {}},
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -105,7 +116,7 @@ func main() {
 	if err := (&controller.ZfsShareAttachRequestReconciler{
 		Client:          mgr.GetClient(),
 		Scheme:          mgr.GetScheme(),
-		Namespace:       os.Getenv("POD_NAMESPACE"),
+		Namespace:       namespace,
 		DHChapEnabled:   dhchapEnabled,
 		DHChapSecretKey: dhchapSecretKey,
 	}).SetupWithManager(mgr); err != nil {
@@ -116,7 +127,7 @@ func main() {
 	if scrubConfigMap != "" {
 		if err := (&controller.ScrubReconciler{
 			Client:        mgr.GetClient(),
-			Namespace:     os.Getenv("POD_NAMESPACE"),
+			Namespace:     namespace,
 			ConfigMapName: scrubConfigMap,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to set up scrub reconciler")

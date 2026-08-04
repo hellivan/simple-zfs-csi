@@ -129,7 +129,7 @@ func (r *ZfsDatasetReconciler) beforeDestroy(ctx context.Context, vol *storagev1
 	if err := r.checkPendingCloneDependents(ctx, vol, poolName); err != nil {
 		return err
 	}
-	return detachAndCleanSnapshots(ctx, r.Client, r.ZFS, vol.Spec.PoolGUID, poolName, full)
+	return detachAndCleanSnapshots(ctx, r.gateReader(), r.ZFS, vol.Spec.PoolGUID, poolName, full)
 }
 
 // checkSnapshotDependents implements D3/§3.2: the two situations where a
@@ -143,7 +143,7 @@ func (r *ZfsDatasetReconciler) beforeDestroy(ctx context.Context, vol *storagev1
 //     user's snapshot with it.
 func (r *ZfsDatasetReconciler) checkSnapshotDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
 	var snaps storagev1alpha1.ZfsSnapshotList
-	if err := r.List(ctx, &snaps); err != nil {
+	if err := r.gateReader().List(ctx, &snaps); err != nil {
 		return err
 	}
 	for i := range snaps.Items {
@@ -176,7 +176,7 @@ func (r *ZfsDatasetReconciler) checkOwningSnapshotLive(ctx context.Context, vol 
 			continue
 		}
 		owner := &storagev1alpha1.ZfsSnapshot{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref.Name}, owner); err != nil {
+		if err := r.gateReader().Get(ctx, client.ObjectKey{Name: ref.Name}, owner); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue // owner already gone: the normal garbage-collection path
 			}
@@ -201,7 +201,7 @@ func (r *ZfsDatasetReconciler) checkOwningSnapshotLive(ctx context.Context, vol 
 // mirror D17 removed.
 func (r *ZfsDatasetReconciler) checkPendingCloneDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName string) error {
 	var list storagev1alpha1.ZfsDatasetList
-	if err := r.List(ctx, &list); err != nil {
+	if err := r.gateReader().List(ctx, &list); err != nil {
 		return err
 	}
 	for i := range list.Items {
@@ -240,7 +240,7 @@ func (r *ZfsDatasetReconciler) checkPendingCloneDependents(ctx context.Context, 
 //
 // For the overwhelmingly common case of a dataset with no snapshots at all this
 // is a single `zfs list` and done.
-func detachAndCleanSnapshots(ctx context.Context, c client.Client, z zpool.ZFS, poolGUID, poolName, full string) error {
+func detachAndCleanSnapshots(ctx context.Context, c client.Reader, z zpool.ZFS, poolGUID, poolName, full string) error {
 	logger := log.FromContext(ctx)
 	for round := 0; round < maxDetachRounds; round++ {
 		snaps, err := z.ListSnapshots(ctx, full)
@@ -313,7 +313,7 @@ func detachAndCleanSnapshots(ctx context.Context, c client.Client, z zpool.ZFS, 
 // re-parents the rest, so one pass normally suffices and the destroy that
 // follows becomes a NotExist no-op; the loop only guards against a clone
 // appearing concurrently.
-func detachSnapshotClones(ctx context.Context, c client.Client, z zpool.ZFS, poolGUID, poolName, snap string) error {
+func detachSnapshotClones(ctx context.Context, c client.Reader, z zpool.ZFS, poolGUID, poolName, snap string) error {
 	logger := log.FromContext(ctx)
 	for round := 0; round < maxDetachRounds; round++ {
 		clones, err := z.Clones(ctx, snap)
@@ -343,7 +343,7 @@ func detachSnapshotClones(ctx context.Context, c client.Client, z zpool.ZFS, poo
 // tool that created the clone. The datasetPrefix is designated to the driver,
 // so a clone with no corresponding ZfsDataset means something outside
 // Kubernetes put it there and a human should decide what happens to it.
-func assertKnownDatasets(ctx context.Context, c client.Client, poolGUID, poolName, snap string, clones []string) error {
+func assertKnownDatasets(ctx context.Context, c client.Reader, poolGUID, poolName, snap string, clones []string) error {
 	var list storagev1alpha1.ZfsDatasetList
 	if err := c.List(ctx, &list); err != nil {
 		return err
@@ -371,7 +371,7 @@ func assertKnownDatasets(ctx context.Context, c client.Client, poolGUID, poolNam
 // raw snapshot only ever relocates onto a dataset whose own deletion is already
 // under way. It is kept as a cheap assertion that the allow-list can never be
 // turned against real snapshot data.
-func assertDriverSnapshot(ctx context.Context, c client.Client, full string) error {
+func assertDriverSnapshot(ctx context.Context, c client.Reader, full string) error {
 	_, suffix := splitSnapshot(full)
 	if !driverSnapshotSuffix.MatchString(suffix) {
 		return fmt.Errorf("snapshot %q was not created by this driver; refusing to destroy it — remove it manually to continue", full)

@@ -48,6 +48,23 @@ type ZfsSnapshotReconciler struct {
 	NodeName string
 	// ZFS performs the snapshot create and destroy operations on the host.
 	ZFS zpool.ZFS
+	// APIReader reads straight from the API server, bypassing the manager's
+	// informer cache. SetupWithManager wires it; it is used only by the delete
+	// path's gating reads (see gateReader).
+	APIReader client.Reader
+}
+
+// gateReader returns the reader used for decisions that guard an irreversible
+// `zfs destroy`, for the same reason as ZfsDatasetReconciler.gateReader: the
+// backing-clone ZfsDataset it looks up is a different kind than the ZfsSnapshot
+// that triggered the reconcile, so the two informers have no ordering
+// relationship and a stale NotFound would let the raw origin snapshot be torn
+// down while its backing clone is still live (known-pitfalls.md #19).
+func (r *ZfsSnapshotReconciler) gateReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots,verbs=get;list;watch;update;patch
@@ -186,7 +203,7 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 
 	if effectiveSnapshotMode(snap) == storagev1alpha1.SnapshotModeStandalone {
 		backing := &storagev1alpha1.ZfsDataset{}
-		getErr := r.Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing)
+		getErr := r.gateReader().Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing)
 		switch {
 		case apierrors.IsNotFound(getErr):
 			// Backing clone is fully gone; fall through to the raw-origin cleanup.
@@ -218,7 +235,7 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	// destroy a snapshot that still has dependent clones. Promote those away
 	// first — that relocates the snapshot onto the dependent and turns the
 	// destroy into a NotExist no-op — rather than deadlocking here forever.
-	if err := detachSnapshotClones(ctx, r.Client, r.ZFS, snap.Spec.PoolGUID, pool.Status.PoolName, rawFull); err != nil {
+	if err := detachSnapshotClones(ctx, r.gateReader(), r.ZFS, snap.Spec.PoolGUID, pool.Status.PoolName, rawFull); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.ZFS.Destroy(ctx, rawFull, false); err != nil {
@@ -416,6 +433,9 @@ func (r *ZfsSnapshotReconciler) snapshotsForPool(ctx context.Context, obj client
 
 // SetupWithManager wires the reconciler into the manager.
 func (r *ZfsSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsSnapshot{}).
 		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.snapshotsForPool)).

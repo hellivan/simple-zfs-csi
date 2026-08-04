@@ -10,6 +10,197 @@ recurring bug classes and their guards are catalogued in
 
 ---
 
+## ADR-0024 — Readiness gates evaluate the object the write returned, never a re-read
+
+**Status:** Accepted (2026-08-04) · **Scope:** `internal/controller/zfsshare_controller.go` (`Reconcile`), `internal/controller/zfsshareattachrequest_controller.go` (`reconcileVolume`) · **Related:** [known-pitfalls.md](known-pitfalls.md) #19.
+
+### Context
+
+Both aggregation reconcilers write a child object with `controllerutil.CreateOrUpdate`
+and then decide whether the child is *live for its current spec*, by comparing
+`Status.ObservedGeneration >= Generation`. Both did that comparison on a **fresh
+`Get`** issued immediately after the write — through the manager's cache.
+
+That is a read-your-own-write, and it inverts the gate. An informer that has not
+yet received the update event returns the pre-update copy, whose *old*
+`ObservedGeneration` matches its *old* `Generation`. The gate therefore passes at
+exactly the moment it should fail: right after the spec changed. Concretely, an
+allow-list change (a second node attaching, or a node detaching) could mark the
+`ZfsShare` `Bound` and the attach request `Ready` while the node-local aggregator
+had not yet applied the new authorization — so `ControllerPublishVolume` returns
+and kubelet mounts against an export that does not yet permit it. Rejecting that
+precise situation is the stated purpose of the generation gate (ADR-0010).
+
+### Decision
+
+Drop the re-`Get`. `CreateOrUpdate` writes the API server's response back into the
+object it was handed, so after it returns that object carries the authoritative
+`Generation` *and* the server's current `Status`. Both reconcilers now evaluate
+the gate on it directly, and the attach-request reconciler returns that same
+object to its caller instead of a re-read one.
+
+### Consequences
+
+- The gate can no longer pass on stale data. When the object was just updated the
+  new `Generation` outruns `ObservedGeneration`, so the share reports `Exporting`
+  and requeues until the node confirms — the intended behaviour.
+- When `CreateOrUpdate` is a no-op the object is the copy its internal `Get`
+  produced, which may be *behind* on status. That only ever delays readiness by
+  one watch event, never advances it: the failure direction is safe.
+- One fewer API/cache read per reconcile in both controllers.
+- Not unit-testable with the controller-runtime fake client, which has no cache
+  and therefore cannot be stale against itself. The invariant is carried by the
+  code comments at both sites; the cache-lag cases that *are* reproducible (by
+  handing a reconciler divergent cached/API readers) are covered under ADR-0023.
+
+---
+
+## ADR-0023 — Decisions that destroy or move something read through the API server, not the informer cache
+
+**Status:** Accepted (2026-08-04) · **Scope:** `internal/controller/zfsdataset_controller.go`, `internal/controller/zfssnapshot_controller.go`, `internal/controller/promote.go`, `internal/controller/zfsshareattachrequest_controller.go` (new `gateReader()` on each reconciler), `cmd/operator/main.go` · **Related:** [known-pitfalls.md](known-pitfalls.md) #19 and #4.
+
+### Context
+
+The agent and the operator read through `mgr.GetClient()`, i.e. the manager's
+informer cache — eventually consistent by construction. That is the right default
+for level-triggered reconciliation, where being a watch event behind only delays
+convergence. It is the wrong default for the handful of reads whose answer
+authorises an **irreversible** act:
+
+- `beforeDestroy`'s gates (`checkSnapshotDependents`, `checkOwningSnapshotLive`,
+  `checkPendingCloneDependents`, plus `assertDriverSnapshot`) decide whether a
+  `zfs destroy` may proceed;
+- `ZfsSnapshotReconciler.reconcileDelete` decides whether the backing clone is
+  gone before tearing down the raw origin snapshot;
+- `reconcileVolume` deletes the `ZfsShare` — unexporting a volume a node may be
+  mounted on — when it sees no attach requests, and picks the single node a zvol
+  is exported to.
+
+Every one of these fails **open** on a stale read: an object the cache has not
+received yet reads as "absent", i.e. "nothing to protect". Two properties make
+that likely rather than theoretical. The objects are authored by a *different
+process* — the CSI controller, which uses an uncached `client.New` and so writes
+land at the API server instantly — and most of the gates read a *different kind*
+than the one that triggered the reconcile (a `ZfsDataset` reconcile listing
+`ZfsSnapshot`s), so the two informers have no ordering relationship whatsoever.
+The window is a normal delete-then-recreate flow, not an exotic race.
+
+That `checkPendingCloneDependents` exists at all is itself an acknowledgement of
+this ordering problem (D21: "the object is created by the CSI controller before
+the agent runs `zfs clone`") — it was just being enforced against a data source
+that cannot see the object it is looking for.
+
+### Decision
+
+Each affected reconciler gains an `APIReader client.Reader` field, wired
+automatically in `SetupWithManager` from `mgr.GetAPIReader()` (so production
+cannot forget it) and exposed through a `gateReader()` accessor. Only the reads
+listed above use it; everything else keeps the cache. The operator additionally
+now **fails fast when `POD_NAMESPACE` is unset**, because the namespaced cache
+scoping that keeps its Secret informers legal is conditional on that variable
+(pitfall #4).
+
+The rule this generalises to: *the cache answers "what is the world like?"; the
+API server answers "may I destroy this?"*.
+
+### Alternatives considered
+
+- **Make every read authoritative.** Rejected: it discards the informer's entire
+  purpose and turns steady-state reconciliation into API-server load, to fix a
+  problem that only exists on a handful of branches.
+- **Give the gates a fail-closed polarity instead** (treat "absent" as
+  "blocked"). Rejected: it would block every legitimate delete, since "absent" is
+  also the normal answer. Note `assertKnownDatasets` already has this polarity
+  naturally — an unknown clone refuses the promote — which is why it was never
+  exposed.
+
+### Consequences
+
+- A live LIST/GET on the delete path (rare) and on the share-teardown and
+  zvol-winner paths; steady-state reconciliation is untouched.
+- The window narrows to a genuine race: a live read still cannot see an object
+  created a microsecond later. Ordering of the actual create/delete sequence
+  remains the responsibility of finalizers and the pending-dependent gate; this
+  removes the *systematic* multi-second lag on top of it.
+- Reproducible in tests by handing a reconciler a cached client and an
+  `APIReader` backed by different fake objects — the shape used by
+  `TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader` and
+  `TestAttachRequest_StaleCacheDoesNotTearDownLiveShare`.
+- `detachAndCleanSnapshots`, `detachSnapshotClones`, `assertKnownDatasets` and
+  `assertDriverSnapshot` now take a `client.Reader` rather than a
+  `client.Client`, which also documents at the type level that they only read.
+
+---
+
+## ADR-0022 — The CSI `volume_context` carries no routing information at all
+
+**Status:** Accepted (2026-08-04) · **Scope:** `internal/csi/controller.go` (`CreateVolume`; the `CtxPoolGUID`/`CtxDataset`/`CtxProtocol` constants are deleted), `internal/csi/node.go` (`NodePublishVolume`) · **Refines:** ADR-0021, which kept the cached `volume_context` fields as a fallback and kept `CreateVolume` populating them. That fallback and that population are both removed here; ADR-0021 is otherwise unchanged and still records why the live `ZfsDataset` lookup is the right resolution mechanism.
+
+### Context
+
+ADR-0021 made `NodePublishVolume` resolve poolGUID, dataset and protocol live from
+the `ZfsDataset` CR, but left the cached `volume_context` values in place as a
+fallback, and left `CreateVolume` populating them so that fallback stayed
+meaningful. Reviewing that immediately afterwards, the fallback turns out to be
+unjustified on every axis:
+
+- **It cannot help in the case that motivates it.** A publish also needs
+  `resolvePool`, an equally live, equally *uncached* `Get`
+  ([cmd/csi-node/main.go](../cmd/csi-node/main.go) builds the node client with
+  `client.New`, deliberately — pitfall #4) with no fallback of its own. If the
+  API server is unreachable the publish fails regardless, so the fallback never
+  buys availability.
+- **The one case it does cover should fail.** `ZfsDataset` missing while a PV is
+  still being mounted means mounting a dataset nothing reconciles any more.
+  Failing loudly is the correct answer.
+- **It silently re-creates the bug it was added to fix.** A transient API error
+  would mount the stale pre-rename path with no signal at all — pitfall #18,
+  reintroduced through the back door.
+- **There is no compatibility to preserve.** The project is pre-1.0 with no
+  installed base; "keeps already-provisioned PVs working during a rollout" buys
+  nothing, and every PV that exists has its `ZfsDataset` anyway.
+
+With the fallback gone, populating `volume_context` at `CreateVolume` has no
+consumer left. Keeping it would persist an immutable, never-read mirror of
+mutable ZFS state into every PV — exactly the trap catalogued as pitfalls #17
+and #18, left lying around for the next reader to trust.
+
+### Decision
+
+`NodePublishVolume` resolves poolGUID, dataset path and protocol **exclusively**
+from the `ZfsDataset` named by `VolumeId`; any failure of that lookup fails the
+publish (`NotFound` when the CR is gone, `Internal` otherwise). `CreateVolume`
+returns **no** `volume_context`, and the `Ctx*` key constants are deleted. The
+volume id is the only thing the controller hands the node; every other fact is
+re-derived live, on every call, from the objects that own it.
+
+### Alternatives considered
+
+- **Keep the fallback but log loudly when it fires.** Rejected: it only adds a
+  code path that can fire in situations where failing is the right behaviour.
+- **Keep populating `volume_context` for observability** (`kubectl describe pv`
+  showing the dataset). Rejected: a stale copy that *looks* authoritative is
+  worse than no copy, and `kubectl get zfsdataset <volume-id>` is the live
+  answer, one command away.
+
+### Consequences
+
+- A publish for a volume whose `ZfsDataset` was deleted now fails `NotFound`
+  instead of quietly mounting a path no controller is maintaining.
+- The node plugin's publish path has exactly two live reads (`ZfsDataset`,
+  `ZfsPool`), both mandatory, neither cached — a simpler, more honest contract
+  than "two live reads plus one snapshot that may disagree with them".
+- Test fallout worth noting: most `node_test.go` publish tests never seeded a
+  `ZfsDataset` and were therefore exercising the *fallback*, not the ADR-0021
+  path. They now seed one via the new `dataset(...)` helper, so they cover what
+  production actually does. `TestNodePublish_MissingContext` is replaced by
+  `TestNodePublish_UnknownVolumeRejected`.
+- PVs created before this change keep their now-ignored `volumeAttributes`; no
+  migration is needed (`volume_context` is optional in the CSI spec, and an
+  empty `spec.csi.volumeAttributes` is fine for Kubernetes).
+
+---
+
 ## ADR-0021 — `NodePublishVolume` resolves poolGUID/dataset/protocol live from `ZfsDataset`, not from cached CSI `volume_context`
 
 **Status:** Accepted (2026-08) · **Scope:** `internal/csi/node.go` (`NodePublishVolume`, new `resolveVolume` helper) · **Full record and incident writeup:** [known-pitfalls.md](known-pitfalls.md) §18.

@@ -149,6 +149,62 @@ func TestAttachRequest_LastDetachDeletesShare(t *testing.T) {
 	}
 }
 
+// TestAttachRequest_StaleCacheDoesNotTearDownLiveShare pins ADR-0023: "no attach
+// requests left" is the one answer that destroys a live export, so it is
+// confirmed against the API server rather than taken from the informer. Attach
+// requests are authored by the CSI controller with an uncached client, so a
+// cache that has not caught up can show an empty set while another node is
+// attaching — modelled here by a cached client that never sees node-b's request.
+func TestAttachRequest_StaleCacheDoesNotTearDownLiveShare(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-4"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-4", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	nodeA := nodeWithIP("node-a", "10.0.0.7")
+	nodeB := nodeWithIP("node-b", "10.0.0.8")
+	arA := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-4-node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-4", NodeName: "node-a"},
+	}
+	arB := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-4-node-b"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-4", NodeName: "node-b"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, nodeA, nodeB, arA).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+	// The API server already holds node-b's request; the informer behind `c` does not.
+	api := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, nodeA, nodeB, arB).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme, APIReader: api}
+	reconcileAttach(t, r, "pvc-4-node-a") // add finalizer
+	reconcileAttach(t, r, "pvc-4-node-a") // aggregate the share for node-a
+
+	// node-a detaches. Its own request is terminating and node-b's is invisible
+	// to the cache, so a cached read alone would conclude "no consumers left".
+	if err := c.Delete(context.Background(), arA); err != nil {
+		t.Fatalf("delete attach request: %v", err)
+	}
+	reconcileAttach(t, r, "pvc-4-node-a")
+
+	share := &storagev1alpha1.ZfsShare{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-4"}, share); err != nil {
+		t.Fatalf("share must survive while node-b still holds an attach request: %v", err)
+	}
+	if share.Spec.NFS == nil || len(share.Spec.NFS.Clients) != 1 || share.Spec.NFS.Clients[0].Client != "10.0.0.8" {
+		t.Errorf("allow-list should have been re-rendered for node-b, got %+v", share.Spec.NFS)
+	}
+}
+
 func TestAttachRequest_NVMeoFSingleNodeShare(t *testing.T) {
 	scheme := newAttachScheme(t)
 

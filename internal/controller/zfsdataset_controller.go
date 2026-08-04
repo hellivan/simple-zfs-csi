@@ -49,6 +49,27 @@ type ZfsDatasetReconciler struct {
 	NodeName string
 	// ZFS performs the dataset/zvol create and destroy operations on the host.
 	ZFS zpool.ZFS
+	// APIReader reads straight from the API server, bypassing the manager's
+	// informer cache. SetupWithManager wires it; it is used only by the delete
+	// path's gating reads (see gateReader).
+	APIReader client.Reader
+}
+
+// gateReader returns the reader used for decisions that guard an irreversible
+// `zfs destroy`. Those reads must be read-your-writes, not eventually
+// consistent: the objects they look for are authored by *other* processes (the
+// CSI controller writes ZfsSnapshot/clone ZfsDataset objects with an uncached
+// client) and are usually of a *different kind* than the one that triggered
+// this reconcile, so no informer ordering relates them — a cache that has not
+// caught up returns an incomplete list and the gate silently fails **open**,
+// destroying data it was written to protect (known-pitfalls.md #19).
+//
+// Falls back to the cached client when no APIReader is wired (tests).
+func (r *ZfsDatasetReconciler) gateReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets,verbs=get;list;watch;update;patch
@@ -469,6 +490,9 @@ func (r *ZfsDatasetReconciler) volumesForPool(ctx context.Context, obj client.Ob
 
 // SetupWithManager wires the reconciler into the manager.
 func (r *ZfsDatasetReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsDataset{}).
 		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.volumesForPool)).
