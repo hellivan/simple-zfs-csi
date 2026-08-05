@@ -80,9 +80,11 @@ changes.
   rename` in step 2 then fails with "dataset already exists".
 
 - **Do not leave a long gap after renaming either.** In that order, a reconcile
-  landing between steps 2 and 3 recreates an empty dataset at the *old* path.
-  It is orphaned — the finalizer only ever destroys the path currently in
-  `spec.dataset` — so remove it by hand once you have confirmed it is empty:
+  landing between steps 2 and 3 recreates an empty dataset at the *old* path —
+  intended behaviour, not a defect: the CR still declares that a dataset must
+  exist there (ADR-0026). It is orphaned — the finalizer only ever destroys the
+  path currently in `spec.dataset` — so remove it by hand once you have
+  confirmed it is empty:
 
   ```sh
   nsenter -t 1 -m -- zfs list -o name,used tank/k8s/<old>

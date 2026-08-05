@@ -11,6 +11,66 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0026 — A `ZfsDataset` spec is a standing declaration: a dataset that disappears is recreated
+
+**Status:** Accepted (2026-08-05) · **Scope:** `internal/controller/zfsdataset_controller.go` — **no code change**; this records existing behaviour as intentional · **Related:** [runbooks.md](runbooks.md), [known-pitfalls.md](known-pitfalls.md) #18.
+
+### Context
+
+The reconciler provisions with "only create when the object is absent", which
+cannot distinguish *never provisioned* from *provisioned once, gone now*. A
+review raised the second case as a data-loss hazard: a dataset that vanishes is
+silently recreated empty, the export comes up, the workload starts on empty
+storage, and nothing anywhere reports that data was lost.
+
+The guard proposed was to refuse creation when `status.phase` was already
+`Ready`, reporting a `DatasetVanished` error instead.
+
+### Decision
+
+**Recreate.** `ZfsDataset.spec` declares that a dataset must exist at
+`spec.dataset`; when it does not, the reconciler makes it exist. That is the
+plain level-triggered reading of a spec, and it is also what makes **resetting a
+volume by destroying its dataset** a supported operation — destroy it on the
+host, and the agent rebuilds it empty from the spec.
+
+Why this beats the guard:
+
+- `status.phase == Ready` is a poor proxy for "data existed": it is equally true
+  in the seconds after a deliberate reset.
+- The guard would turn a one-command reset into CR surgery (clear the status, or
+  delete and recreate the object), for a signal that is unreliable anyway.
+- The recreate path is already built for it. `applyRootOwnership` runs in the
+  create-absent branch, so uid/gid/mode are reapplied; `create` applies the
+  spec's properties; and for zvols `FormatAndMount` finds no filesystem on the
+  fresh device and formats it with the fsType the PV requested (`Status.FSType`
+  is not consulted for that branch), so a reset zvol returns usable rather than
+  tripping the mismatch check.
+
+### Alternatives considered
+
+- **Refuse to recreate once `status.phase` was `Ready`.** Rejected as above: it
+  removes a supported capability to guard against a case it cannot reliably
+  detect.
+- **Recreate, but mark the object Degraded.** Rejected: every deliberate reset
+  would then leave the volume permanently looking broken.
+
+### Consequences
+
+- Destroying a dataset on the host is a supported reset; the driver restores it
+  with the declared properties and ownership.
+- Recreation is **silent**. An unintended disappearance is indistinguishable
+  from a deliberate reset, so detecting one is the operator's job (pool health,
+  backups) — not something the driver claims to do.
+- During a rename, a reconcile landing between the `zfs rename` and the
+  `spec.dataset` edit recreates an empty dataset at the *old* path. That orphan
+  is a consequence of this decision rather than a defect; keeping the two steps
+  adjacent, and cleaning up afterwards, is covered in [runbooks.md](runbooks.md).
+- No code changes. This entry exists so the behaviour is not re-raised as a bug
+  — it was, once, precisely because nothing recorded it as deliberate.
+
+---
+
 ## ADR-0025 — A `ZfsSnapshot` resolves its source dataset path through `SourceVolume`, treating `Spec.Dataset` as a fallback record
 
 **Status:** Accepted (2026-08-04) · **Scope:** `internal/controller/zfssnapshot_controller.go` (new `sourceDatasetPath`), `internal/csi/clone.go` (new `snapshotDatasetPath`), `api/v1alpha1/zfssnapshot_types.go` (field doc) · **Related:** ADR-0021/ADR-0022, [known-pitfalls.md](known-pitfalls.md) #18, [runbooks.md](runbooks.md).
