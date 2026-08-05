@@ -308,3 +308,178 @@ out not to apply, and correctly repairs it if it does. **Flagged as needing hand
 verification before implementation**, not treated as fully closed. See
 [§2.11](snapshot-lifecycle-redesign.md#211-does-promote-iteration-order-matter-when-a-source-has-multiple-independent-snapshots-raised-by-the-user-see-d16---corrected-after-further-review)
 and D16.
+
+---
+
+## 2026-08-05 — re-opening the backing-clone design
+
+> These entries follow the 2026-08-03 review and ADR-0020. They lead to the **proposal in
+> [§10](snapshot-lifecycle-redesign.md)**, which is not yet decided or implemented.
+
+**Q: I heard the current implementation is an architecture smell. Could we add a new
+`ZfsSnapshotSource` CRD, reconciled by the controller, that creates the actual
+`ZfsDataset`? Then the DaemonSet wouldn't need write access, we wouldn't duplicate code,
+and it would match patterns we already have — or am I missing something?**
+
+A: The smell is real, and precisely nameable: **a layering violation — a node-scoped
+executor authoring control-plane objects**. The project has a strict two-tier split (the
+control plane declares what should exist, node agents make it so) and
+`ZfsSnapshotReconciler` authoring `ZfsDataset` objects is its only exception. Three
+symptoms confirm it rather than it being aesthetic: it forced `create`/`delete` on
+`zfsdatasets` into the discovery role (letting a node author objects carrying an arbitrary
+`poolGUID`, and so reach another node's pool); it produced the review's only Blocker (F1);
+and D26 had to be written to explain why the exception exists, which is usually the tell.
+
+The instinct about matching existing patterns is right too — the operator already does
+exactly this shape twice (`ZfsShareAttachRequest` → `ZfsShare`, `ZfsShare` →
+`NetworkExport`). D26 had rejected moving authoring to the *CSI controller* and then
+treated the question as closed without considering that third home. That gap became D27.
+
+**But the proposed CRD would trade one smell for another.** `ZfsSnapshotSource` would be a
+*middle man*: 1:1 with `ZfsSnapshot`, carrying the same fields, no independent lifecycle,
+nothing to aggregate — unlike `ZfsShareAttachRequest`, which earns its existence by
+collapsing N per-node requests into one `ZfsShare`. And it would not even fix the
+privilege problem: if the *agent* creates it, a node still authors an object carrying a
+`poolGUID`; if the CSI controller creates it, it is redundant with `ZfsSnapshot`, which
+that controller already authors with every field needed. A misplaced responsibility is
+fixed by moving the responsibility, not by inserting an indirection in front of it.
+
+---
+
+**Q: This all sounds very complicated and I don't get it. Isn't there a simpler solution?**
+
+A: Yes, and the question was the right one — every hard sub-problem (who authors the
+object, RBAC widening, owner references, GC, readiness signals, delete handshakes, all of
+D26/D27) exists **only because the backing clone is a Kubernetes object at all**.
+
+It became one in D15, for exactly one reason: to reuse `ZfsDatasetReconciler`'s
+clone-creation and promote-then-destroy logic rather than write a second copy. That was
+correct when the logic *was* methods on that reconciler.
+
+**ADR-0020 dissolved that premise without anyone noticing.** The delete logic is now free
+functions (`detachAndCleanSnapshots`, `detachSnapshotClones`, `assertKnownDatasets`,
+`assertDriverSnapshot`) taking a `client.Reader` and a `zpool.ZFS` — and
+`ZfsSnapshotReconciler` *already calls one of them* for D19. The shared behaviour is shared
+by being a shared function, so the object is no longer what delivers the reuse, and
+dropping it duplicates nothing. (The clone-creation "reuse" was always one line:
+`r.ZFS.Clone(...)`.)
+
+So the simpler answer is to stop making it an object: one reconciler, one finalizer, four
+`zfs` calls, and the layering violation has nothing left to violate. Written up as §10.
+
+Worth recording that this was the *third* design proposed in two days (D26 keep-in-agent →
+D27 move-to-operator → §10 remove-the-object). The first two were not preferences that
+changed; a fact changed, and neither of us spotted it until the "isn't there something
+simpler" question forced a step back.
+
+---
+
+**Q: Scanning all known usages of `Spec.Source` is bad design — it will rot, and no other
+developer will know about it. Aren't finalizers the default Kubernetes concept for this?**
+
+A: Yes, and there are three in-tree precedents: `kubernetes.io/pvc-protection`,
+`kubernetes.io/pv-protection`, and
+`snapshot.storage.kubernetes.io/volumesnapshot-as-source-protection` — the last being this
+exact problem one layer up.
+
+Two clarifications worth keeping, because they cut in opposite directions:
+
+1. **A finalizer does not remove the need to know who depends on you.** `pvc-protection`
+   is itself computed by scanning Pods. What changes is the *direction*: the referencer
+   declares itself at reference time, instead of the deleter guessing at delete time. That
+   inversion is the real win, and it is what stops the rot.
+2. **The scan is worse than "fragile" — it is incomplete by construction.** It can only
+   see objects that already exist, but the dangerous window opens when
+   `resolveContentSource` decides to restore, *before* the dependent object is created. A
+   lease taken at that moment closes the window; a scan structurally cannot.
+
+The distinction from the `restored-by.*` finalizers ADR-0020 removed must be stated
+loudly, or someone will reintroduce the bug: those stored a **graph** — multi-edge derived
+state that ZFS rewrote behind our back — and were read back to decide *what to promote*. A
+lease is a **binary flag** that gates object deletion and never informs a ZFS decision.
+Same mechanism, categorically different use.
+
+---
+
+**Q: Why should the protected resource manage the finalizers placed on it? Shouldn't that
+be done by the resources that reference it? I'd expect: I want to create something from a
+source, so I put a finalizer on the source, create the thing, then remove the finalizer.
+Everything cleaned up — and idempotent?**
+
+A: Correct, and this replaced an earlier, worse answer of mine ("the protected object walks
+its own finalizers and reaps stale ones"). That was copying `pvc-protection`, which is a
+*long-lived in-use marker*; what this actually needs is a **short-lived lease around a
+critical section**.
+
+It works because `CreateVolume` already blocks until Ready (`waitVolumeReady`), so the
+whole lease lifetime fits inside one call:
+
+```
+add    in-use-by.<pvc>     ← before anything exists
+create the ZfsDataset
+wait   until Ready         ← the zfs clone now exists
+remove in-use-by.<pvc>     ← ZFS truth covers it from here
+```
+
+Idempotent at every step — `AddFinalizer`/`RemoveFinalizer` are no-ops when already
+present/absent, `ensureVolume` tolerates `AlreadyExists`, `waitVolumeReady` re-polls — so a
+retried `CreateVolume` resumes wherever it died, and `external-provisioner` retries until
+success.
+
+One residual case, and it is not new: if `CreateVolume` never completes and is never
+retried (PVC deleted while pending), the lease persists — but in that same scenario the
+`ZfsDataset` created mid-flight also leaks, since no PV was created and `DeleteVolume` is
+never called. That orphan is a pre-existing condition, and the lease is *correct* while it
+exists. Cheap safety net: have `DeleteVolume` also release any lease its volume holds.
+
+**Caveat that must not be forgotten:** extra finalizers do *not* gate our ZFS work — the
+delete paths run on `deletionTimestamp` regardless of which finalizers remain. So
+`beforeDestroy` and `reconcileDelete` must explicitly refuse while any `in-use-by.*` is
+present, or the protection is cosmetic.
+
+---
+
+**Q: What is the general strategy for this across CSI drivers — how do others handle it?**
+
+A: The CSI spec defines the contract, and it is the same for everyone. From the vendored
+`spec@v1.11.0`, both `DeleteSnapshot` and `DeleteVolume` list:
+
+> **Snapshot in use** — `9 FAILED_PRECONDITION` — "…could not be deleted because it is in
+> use by another resource." Recovery: *"Caller SHOULD ensure that there are no other
+> resources using the snapshot, and then retry with exponential back off."*
+
+So: the driver detects in-use and returns `FAILED_PRECONDITION`; the CO retries with
+backoff. *How* in-use is detected is left entirely to the driver — Ceph-CSI uses its OMAP
+journal, democratic-csi a live check, and we would use the lease.
+
+Three things fell out of reading that text:
+
+- `DeleteVolume`'s condition reads "…or **has snapshots and the plugin doesn't treat them
+  as independent entities**". The spec explicitly contemplates both of D8's modes, and
+  `standalone` is the "independent entities" branch. Direct validation of D8.
+- The spec *would* permit `DeleteSnapshot` to return `FAILED_PRECONDITION` while a lease is
+  held, instead of accepting the delete and stalling internally. **Deliberately not doing
+  that** — it contradicts D4's "always succeeds, never blocks", and the window is
+  sub-second. Recorded so it isn't rediscovered as a novelty.
+- **Asymmetry worth knowing:** a `VolumeSnapshot` can be protected by the
+  snapshot-controller when installed, but a PVC used as a *clone dataSource* has no in-tree
+  equivalent — `kubernetes.io/pvc-protection` only guards deletion while mounted by a pod.
+  So for direct PVC-to-PVC clones our lease is the only protection that exists, which is
+  why §10.5 covers both paths rather than restores alone.
+
+---
+
+**Q: Can we rely on the cluster's snapshot-controller to close this window for us?**
+
+A: No. Checked against the live cluster: there are **no `snapshot.storage.k8s.io` CRDs and
+no snapshot-controller deployment**, so `volumesnapshot-as-source-protection` is not
+available — and in fact the entire `VolumeSnapshot` path is unusable there today, which is
+also why the review's F1 RBAC blocker was never observed in practice: nothing could
+exercise it.
+
+More generally the snapshot-controller is an **optional, admin-installed** cluster
+component that a CSI driver cannot assume is present. The lease is therefore the primary
+protection, not a redundant second layer. (The chart is safe either way: the
+`VolumeSnapshotClass` template is gated behind `range .Values.volumeSnapshotClasses` and
+the sidecar behind `csiController.snapshotter.enabled`, so a missing CRD does not break
+`helm install`. The prerequisite is documented in the README's host/cluster requirements.)

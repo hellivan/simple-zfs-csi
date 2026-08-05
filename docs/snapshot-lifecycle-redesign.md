@@ -801,7 +801,7 @@ in the user's cluster yet, so no migration concern — go straight to the better
 | D24 | Which spec fields are immutable (§9.1, F10) | **Freeze behaviour, not location.** `ZfsSnapshot.Spec.Mode` and `Spec.SourceType` get `+kubebuilder:validation:XValidation:rule="self == oldSelf"`: neither points at anything, and flipping `Mode` on a live object silently inverts its teardown semantics (promote path ⇄ blocking path) against ZFS state built for the other mode, orphaning a backing clone, its `@restore-source`, and any PVC restored from it. There is no repair scenario either field enables. **Deliberately left mutable:** `ZfsDataset.Spec.Dataset`, `ZfsSnapshot.Spec.Dataset`, `ZfsSnapshot.Spec.SnapshotName`. Those are *locations*, and repointing them by hand is a supported emergency workflow (moving datasets to a different prefix, renames, pointing a CR at a dataset prepared with matching properties). Freezing them would turn a recoverable incident into "delete the CR and hope the finalizer doesn't destroy the wrong thing", and would make the structure rigid for no safety gain. Safe to leave mutable specifically because nothing in the delete path resolves dependents through those fields any more (D17). Generalised as a repo-wide rule in [api-conventions.md](api-conventions.md) §5. |
 | D25 | D10's clone/restore compatibility checks when the source volume is already gone (§9.1, F12) | **Capture the source's structural properties onto `ZfsSnapshotSpec` at `CreateSnapshot` time.** The restore-side check looks the source `ZfsDataset` up live and returns "compatible" when it is missing — but a source that no longer exists is the *headline* scenario for `standalone` snapshots, so D10's checks were effectively dead exactly where they matter most: a restore into a StorageClass with a different `fsType` passed the controller and failed much later at `NodeStageVolume`, and a different `volblocksize` was ignored entirely and silently (`clone()` never passes it, so ZFS raises nothing either). New optional fields `sourceFSType`, `sourceVolblocksize`, `sourceProperties` mirror exactly what `SourceType` already does for the identical reason, and are compared against when the live source is unavailable. Excluded from `ensureSnapshot`'s idempotency comparison — the persisted object stays authoritative, same convention as `SnapshotName` — so a source whose `Status.FSType` is populated between CSI retries cannot cause a spurious `AlreadyExists`. |
 | D26 | Which component authors the backing-clone `ZfsDataset` **object**: the CSI controller (as for every other `ZfsDataset`) or the node agent? (raised while fixing F1, since that finding is a direct consequence of the answer) | **The node agent — `ZfsSnapshotReconciler` — deliberately, as the project's one documented exception to "the control plane authors CRDs, node agents execute ZFS".** The standalone create flow inherently alternates between the two: `zfs snapshot` (host) → create the backing-clone object (API) → `zfs clone` (host) → `zfs snapshot @restore-source` (host). Only the middle step could move, and moving it costs more than it buys: `ZfsSnapshot.Status.Phase == Ready` currently means "backing clone exists *and* `@restore-source` taken", so the controller would need a **new intermediate status field or condition** whose sole purpose is to signal "raw snapshot taken, you may create the clone now"; the flow would ping-pong controller→agent→controller→agent; `CreateSnapshot` is a request/response RPC with a deadline, a poor host for multi-step convergence with external side effects; the reconciler's self-healing property is lost (today a backing-clone object deleted by accident is recreated on the next pass — controller-authored, nothing would ever recreate it); and `backingCloneProperties` plus the dataset-path derivation would have to move into or be duplicated in `internal/csi`, directly against D15's purpose of collapsing two implementations into one. Deletion cannot be delegated to Kubernetes garbage collection either: the `ZfsSnapshot`'s finalizer will not release until the backing clone is gone, and GC will not remove the backing clone until the `ZfsSnapshot` is actually out of etcd — a deadlock with or without `blockOwnerDeletion`, which is why `reconcileDelete` does an explicit `Delete` and polls. **Accepted trade-off, recorded explicitly:** the discovery role must therefore hold `create`/`delete` on `zfsdatasets`, and a `ZfsDataset` object carries a `poolGUID` — so a compromised node agent can author objects that induce a *different* node's agent to act on a pool it does not host. That is lateral movement a node-root component does not otherwise have. Judged acceptable: modest next to the host root the agent already holds, and RBAC cannot express the constraint that would actually close it ("only `ZfsDataset`s owned by a `ZfsSnapshot`") — that would need a `ValidatingAdmissionPolicy`, disproportionate here. **SUPERSEDED by D27 — see below.** |
-| D27 | Re-opened: is the D26 exception acceptable at all? (raised by the user, who had been told the current shape is an architecture smell) | **No — move backing-clone authoring to the operator, which watches `ZfsSnapshot` and authors the `ZfsDataset`. Supersedes D26. No new CRD.** D26's analysis was incomplete: it weighed only "node agent" against "`CreateSnapshot` RPC", correctly rejected the RPC as a home for multi-step convergence, and then treated the question as settled — without considering the third home. The operator is a cluster-scoped, level-triggered reconciler that **already implements this exact pattern twice**: it watches `ZfsShareAttachRequest` and authors `ZfsShare`, and watches `ZfsShare` and authors `NetworkExport`. Moving the backing clone there removes the project's only layering violation entirely, so that afterwards *no* node agent authors any object (README, "Who owns what"). Every D26 objection dissolves except one: the RPC-deadline and lost-self-healing arguments simply do not apply to a reconciler, and no helper moves into `internal/csi` — `backingCloneProperties` and the dataset-path derivation move to a sibling reconciler in `internal/controller`, so nothing is duplicated. **Rejected alternative: a new `ZfsSnapshotSource` CRD** (the user's initial proposal). It would be a middle man — 1:1 with `ZfsSnapshot`, carrying the same fields, with no independent lifecycle and nothing to aggregate, unlike `ZfsShareAttachRequest` which earns its existence by collapsing N per-node requests into one `ZfsShare`. Worse, it would only relocate the privilege rather than remove it: if the *agent* creates the `ZfsSnapshotSource`, a node can still author an object carrying an arbitrary `poolGUID`; and if the CSI controller creates it, it is plainly redundant with `ZfsSnapshot`, which that controller already authors with every field the backing clone's spec is derived from. A misplaced responsibility is fixed by moving the responsibility, not by inserting an indirection in front of it. **Costs accepted, and they are real:** (a) the one D26 objection that survives — the operator must not create the clone before the raw snapshot exists, and `Status.Phase == Ready` cannot be that trigger, so `ZfsSnapshot` needs a new condition (e.g. `RawSnapshotReady`); cheap in a reconciler, and the CRD already carries `Conditions`; (b) deletion becomes a two-component handshake (the operator deletes the backing clone on seeing the `ZfsSnapshot` terminate, the agent keeps polling until it is gone before the D19 raw-origin cleanup) — GC still cannot do it, the D26 deadlock is unaffected by who authors the object; (c) a new availability coupling — snapshot creation stalls while the operator is down, where today a node agent can finish one alone. Judged consistent rather than a regression, since attaching any NFS/NVMe-oF volume already requires the operator to author `ZfsShare`/`NetworkExport`. **Not yet implemented as of 2026-08-04**; ADR-0021 follows once it is, per the repo's write-the-ADR-after-implementation precedent. |
+| D27 | Re-opened: is the D26 exception acceptable at all? (raised by the user, who had been told the current shape is an architecture smell) | **No — move backing-clone authoring to the operator, which watches `ZfsSnapshot` and authors the `ZfsDataset`. Supersedes D26. No new CRD.** D26's analysis was incomplete: it weighed only "node agent" against "`CreateSnapshot` RPC", correctly rejected the RPC as a home for multi-step convergence, and then treated the question as settled — without considering the third home. The operator is a cluster-scoped, level-triggered reconciler that **already implements this exact pattern twice**: it watches `ZfsShareAttachRequest` and authors `ZfsShare`, and watches `ZfsShare` and authors `NetworkExport`. Moving the backing clone there removes the project's only layering violation entirely, so that afterwards *no* node agent authors any object (README, "Who owns what"). Every D26 objection dissolves except one: the RPC-deadline and lost-self-healing arguments simply do not apply to a reconciler, and no helper moves into `internal/csi` — `backingCloneProperties` and the dataset-path derivation move to a sibling reconciler in `internal/controller`, so nothing is duplicated. **Rejected alternative: a new `ZfsSnapshotSource` CRD** (the user's initial proposal). It would be a middle man — 1:1 with `ZfsSnapshot`, carrying the same fields, with no independent lifecycle and nothing to aggregate, unlike `ZfsShareAttachRequest` which earns its existence by collapsing N per-node requests into one `ZfsShare`. Worse, it would only relocate the privilege rather than remove it: if the *agent* creates the `ZfsSnapshotSource`, a node can still author an object carrying an arbitrary `poolGUID`; and if the CSI controller creates it, it is plainly redundant with `ZfsSnapshot`, which that controller already authors with every field the backing clone's spec is derived from. A misplaced responsibility is fixed by moving the responsibility, not by inserting an indirection in front of it. **Costs accepted, and they are real:** (a) the one D26 objection that survives — the operator must not create the clone before the raw snapshot exists, and `Status.Phase == Ready` cannot be that trigger, so `ZfsSnapshot` needs a new condition (e.g. `RawSnapshotReady`); cheap in a reconciler, and the CRD already carries `Conditions`; (b) deletion becomes a two-component handshake (the operator deletes the backing clone on seeing the `ZfsSnapshot` terminate, the agent keeps polling until it is gone before the D19 raw-origin cleanup) — GC still cannot do it, the D26 deadlock is unaffected by who authors the object; (c) a new availability coupling — snapshot creation stalls while the operator is down, where today a node agent can finish one alone. Judged consistent rather than a regression, since attaching any NFS/NVMe-oF volume already requires the operator to author `ZfsShare`/`NetworkExport`. **Not yet implemented as of 2026-08-04**; ADR-0021 follows once it is, per the repo's write-the-ADR-after-implementation precedent. **STATUS (2026-08-05): challenged — do not implement.** §10 proposes removing the backing-clone object entirely, which would make this decision moot rather than merely superseded: with nothing to author, there is no authoring question. Resolve §10 first. |
 
 ## 5. Rejected alternatives (and why)
 
@@ -1233,4 +1233,233 @@ of being silently re-created or re-cloned. Surfaced while confirming that `Spec.
 read only from the `ErrNotExist` branch, which is what makes a stale `Source.Volume`
 harmless for a live dataset — but also what makes an *absent* dataset silently
 re-provision.
+
+---
+
+## 10. PROPOSAL (under discussion, 2026-08-05) — the backing clone stops being a Kubernetes object
+
+> **Status: proposal, not a decision.** Nothing here is agreed or implemented. It is
+> written down so it can be reviewed as a whole. If accepted it becomes D28+ in §4 and an
+> ADR; until then §4 (D0–D27) remains authoritative and this section is editable.
+
+### 10.1 What problem this solves
+
+`ZfsSnapshotReconciler` (node tier) authors the backing-clone `ZfsDataset` object. That is
+the project's **only** violation of the two-tier ownership rule (README, "Who owns what"):
+the control plane declares what should exist, node agents make it so, and nothing in the
+node tier authors objects.
+
+It is not a cosmetic complaint. It forced `create`/`delete` on `zfsdatasets` into the
+discovery role — letting a node author objects carrying an arbitrary `poolGUID`, and so
+induce a *different* node's agent to act on a pool it does not host — and it produced the
+2026-08-03 review's only Blocker (F1). D26 documented the exception; D27 proposed moving
+authoring to the operator. This proposal argues both were solving the wrong problem.
+
+### 10.2 The change
+
+**The backing clone stops being a Kubernetes object.** It becomes what it always was in
+substance: an implementation detail of a snapshot, created and destroyed by the reconciler
+that owns snapshots, exactly like the raw snapshot and `@restore-source` already are.
+
+There is then nothing to author, so the layering violation, the RBAC widening, the operator
+question, owner references, garbage collection, readiness signals and the delete handshake
+all cease to exist rather than being relocated.
+
+### 10.3 Why this is possible now, and was not when D15 was written
+
+D15 made the backing clone an object for exactly one reason: to reuse
+`ZfsDatasetReconciler`'s clone-creation and promote-then-destroy logic instead of writing a
+second copy. That was correct at the time — the logic *was* methods on that reconciler.
+
+ADR-0020 dissolved it without anyone noticing. The delete-path logic is now free functions:
+
+```go
+func detachAndCleanSnapshots(ctx, c client.Reader, z zpool.ZFS, poolGUID, poolName, full string) error
+func detachSnapshotClones(ctx, c client.Reader, z zpool.ZFS, poolGUID, poolName, snap string) error
+func assertKnownDatasets(ctx, c client.Reader, poolGUID, poolName, snap string, clones []string) error
+func assertDriverSnapshot(ctx, c client.Reader, full string) error
+```
+
+`ZfsSnapshotReconciler` **already calls one of them** (`detachSnapshotClones`, for D19). So
+the shared behaviour is shared by being a shared function — the object is no longer what
+delivers the reuse, and dropping it duplicates nothing.
+
+The clone-creation "reuse" was always thin: `r.ZFS.Clone(ctx, snapFull, dest, props)`.
+
+### 10.4 Flows
+
+**Create** (all in `ZfsSnapshotReconciler`, which already takes the raw snapshot):
+
+```
+zfs snapshot  tank/k8s/pvc-a@csi-snap-7f3e
+zfs clone     ...@csi-snap-7f3e  tank/k8s/csi-snap-7f3e   (canmount=off / volmode=none)
+zfs snapshot  tank/k8s/csi-snap-7f3e@restore-source
+→ status Ready
+```
+
+Each step is already idempotent (`Clone` tolerates an existing dest, `Snapshot` tolerates an
+existing snapshot), so the reconcile is naturally resumable.
+
+**Restore** — the CSI controller derives the backing path instead of reading it from an
+object: `path.Join(path.Dir(sourceDatasetPath), snap.Spec.SnapshotName)`. The
+"is it being torn down?" precondition becomes a check on the `ZfsSnapshot`'s own
+`deletionTimestamp`, which is more direct than today's check on the backing clone's.
+
+**Delete snapshot** (same reconciler, same shared helpers):
+
+```
+detachAndCleanSnapshots(tank/k8s/csi-snap-7f3e)   → promote away restores, destroy artifacts
+zfs destroy tank/k8s/csi-snap-7f3e
+detachSnapshotClones(tank/k8s/pvc-a@csi-snap-7f3e)  → D19, unchanged
+zfs destroy tank/k8s/pvc-a@csi-snap-7f3e
+release finalizer
+```
+
+No `client.Delete`, no `RequeueAfter` polling loop, one finalizer instead of two.
+
+**A second D15 premise is also already void.** D15 ordered the teardown "delete the backing
+clone object, wait for it to be gone, *then* clean up the raw snapshot" because the backing
+clone is a dependent clone of the raw snapshot and the two could not coexist with
+destroying it first. **D19 replaced "require dependents gone" with "promote dependents
+away"**, which dissolves that constraint: the raw snapshot's clones are promoted off it and
+the destroy becomes a `NotExist` no-op regardless of what still exists. The ordering
+rationale in `reconcileDelete`'s doc comment is stale as written today, independently of
+whether this proposal is accepted — worth correcting either way.
+
+**Delete source volume** — unchanged. `detachAndCleanSnapshots` finds the backing clone
+through the `clones` property and promotes it away, exactly as verified on the live pool.
+
+### 10.5 In-use protection (replaces D21)
+
+D21 currently guards the window where a restore's `ZfsDataset` exists but its `zfs clone`
+has not run, by **scanning** all `ZfsDataset`s for a matching `Spec.Source`. Two objections,
+both accepted:
+
+- It is a "know all your callers" design. `Spec.Source` is the only declaration mechanism
+  *today* (verified: `DatasetSource` has two fields, three construction sites, all in
+  `resolveContentSource`), but a fourth reference type added later is silently missed.
+- **It is incomplete by construction.** A scan can only see objects that already exist; the
+  window opens when `resolveContentSource` decides to restore, before the object is created.
+
+Replace it with a short-lived **lease finalizer**, the Kubernetes idiom for this
+(`kubernetes.io/pvc-protection`, `kubernetes.io/pv-protection`, and
+`snapshot.storage.kubernetes.io/volumesnapshot-in-use-protection` — the last being this
+exact problem one layer up).
+
+`storage.simple-zfs-csi.io/in-use-by.<dependentName>`, taken on the object being cloned
+from: the `ZfsSnapshot` for a restore, the source `ZfsDataset` for a direct PVC-to-PVC
+clone.
+
+**Held only across the critical section**, by the referencer, entirely inside `CreateVolume`
+— which already blocks until Ready (`waitVolumeReady`):
+
+```
+1. resolveContentSource     → source resolved
+2. add    in-use-by.<pvc>       ← before anything exists
+3. ensureVolume             → create the ZfsDataset
+4. waitVolumeReady          → blocks until the zfs clone exists
+5. remove in-use-by.<pvc>       ← ZFS truth covers it from here on
+```
+
+Every step is idempotent — `AddFinalizer`/`RemoveFinalizer` are no-ops when already
+present/absent, `ensureVolume` tolerates `AlreadyExists`, `waitVolumeReady` re-polls — so a
+retried `CreateVolume` resumes wherever it died, and `external-provisioner` retries until
+success.
+
+**Rules that keep this from becoming `restored-by.*`:**
+
+1. **It gates object deletion only; it never informs a ZFS decision.** That is precisely
+   what `restored-by.*` got wrong. The live ZFS clone graph remains the sole authority for
+   promote/destroy (ADR-0020/D17).
+2. **The referencer takes it and the referencer releases it.** The protected object never
+   manages finalizers placed on it by others.
+3. **Added in one place** — `resolveContentSource`, the single funnel every content source
+   already passes through.
+4. **The delete paths must consult their own finalizers.** Extra finalizers do *not* gate
+   our ZFS work — `beforeDestroy` and `reconcileDelete` run on `deletionTimestamp`
+   regardless of which finalizers remain — so each must explicitly refuse while any
+   `in-use-by.*` is present, or the protection is cosmetic. (This is a check of an explicit
+   list, not a scan.)
+
+**Residual case, and why it is not new:** if `CreateVolume` never completes and is never
+retried (PVC deleted while pending), the lease persists. But in that same scenario the
+`ZfsDataset` created at step 3 also leaks — no PV was created, so `DeleteVolume` is never
+called — which is a pre-existing condition. The lease is *correct* in that state: an
+unprovisioned dependent really does exist. Cheap safety net: have `DeleteVolume` also
+release any lease its volume holds.
+
+### 10.6 Code impact
+
+| Area | Change |
+|---|---|
+| `zfssnapshot_controller.go` | `reconcileStandaloneCreate`: object create + Ready-poll → `zfs clone` + `zfs snapshot`. `reconcileDelete`: `Delete` + poll loop → `detachAndCleanSnapshots` + `zfs destroy` |
+| `csi/clone.go` | derive the backing path; precondition becomes the `ZfsSnapshot`'s own `deletionTimestamp`; take the lease |
+| `csi/controller.go` | release the lease after `waitVolumeReady`; release on `DeleteVolume` |
+| `promote.go` | `assertKnownDatasets` must also treat a dataset as known when its leaf name equals a live `ZfsSnapshot`'s `snapshotName` — **required, not optional**: without it, deleting any volume that has a standalone snapshot sees the backing clone as a foreign clone and refuses. `checkPendingCloneDependents` (D21) deleted; `checkOwningSnapshotLive` (F7) deleted |
+| chart RBAC | discovery loses `create`/`delete` on `zfsdatasets` and the `zfssnapshots/finalizers` rule |
+| README | the "one exception exists today" note is removed |
+
+Verified as complete: `Spec.SnapshotName` is used as a `ZfsDataset` object name in exactly
+three places; there is **no `ListVolumes`** in the CSI controller, so backing clones were
+never at risk of being reported as volumes; and the only other `ZfsDatasetList` consumer is
+the `ZfsPool` watch mapper, which simply stops seeing them.
+
+### 10.7 What is given up
+
+- **`kubectl get zfsdataset csi-snap-<uuid>` stops working.** The backing clone becomes
+  invisible from the API; its existence is implied by the `ZfsSnapshot` being Ready, and
+  `zfs list` shows it on the host.
+- **F7's guard becomes unnecessary** — nobody can `kubectl delete` an object that does not
+  exist — so that hazard disappears with it. `assertDriverSnapshot`'s "a live `ZfsSnapshot`
+  still claims this" check carries the remaining weight.
+- **It reverses D15**, which must be recorded as such rather than quietly dropped.
+
+### 10.8 Open questions — resolved 2026-08-05
+
+**1. Can the lease lean on the CO's own protection? No — it must stand alone.**
+Checked against the live cluster: there are **no `snapshot.storage.k8s.io` CRDs and no
+snapshot-controller deployment**. So `snapshot.storage.kubernetes.io/volumesnapshot-as-source-protection`
+is not available, and in fact the whole `VolumeSnapshot` path is currently unusable there
+(which is also why F1's blocker was never observed in practice — nothing could exercise it).
+More generally the snapshot-controller is an **optional, admin-installed** cluster
+component that a CSI driver cannot assume is present, so §10.5's lease is the primary
+protection, not a redundant second layer.
+
+**2. Cover direct PVC-to-PVC clones as well? Yes — and they matter more than restores.**
+The CSI spec (`spec@v1.11.0`) defines the general strategy for every driver: both
+`DeleteSnapshot` and `DeleteVolume` return `9 FAILED_PRECONDITION` for "in use by another
+resource", with the CO retrying with exponential back off. How in-use is *detected* is left
+entirely to the driver. There is an asymmetry worth noting: a `VolumeSnapshot` can be
+protected by the snapshot-controller when installed, but a PVC used as a *clone dataSource*
+has no in-tree equivalent — `kubernetes.io/pvc-protection` only guards deletion while
+mounted by a pod. So for volume clones our lease is the only protection that exists.
+
+Two incidental findings from the same spec text:
+
+- `DeleteVolume`'s "in use" condition reads "…or **has snapshots and the plugin doesn't
+  treat them as independent entities**" — the spec explicitly contemplates both of D8's
+  modes, and `standalone` is the "independent entities" branch. Direct validation of D8.
+- The spec would permit `DeleteSnapshot` to return `FAILED_PRECONDITION` while a lease is
+  held, rather than accepting the delete and stalling internally. **Deliberately not
+  doing that:** it contradicts D4's "always succeeds, never blocks", and the lease window
+  is sub-second. Recorded so the option isn't rediscovered as a novelty.
+
+**3. Does anything outside the repo consume the backing-clone object? Not today; possibly
+later.** If it ever does, the cheap answer is to expose the backing dataset path on
+`ZfsSnapshot.status` — derived, read-only — rather than reintroducing an object.
+
+
+### 10.9 If accepted, this supersedes
+
+- **D15** — backing clone represented as an owned child `ZfsDataset`.
+- **D26** — the node agent authoring it, deliberately, as a documented exception.
+- **D27** — moving authoring to the operator.
+- **D21** — the scan-based pending-dependent guard, replaced by §10.5.
+
+Note this **removes all three costs D27 accepted**, rather than paying them somewhere else:
+no new `RawSnapshotReady` condition (nothing waits on a cross-tier status contract), no
+two-component delete handshake (nothing to hand off), and no new availability coupling to
+the operator (the operator is not involved at all). D27's costs were the price of keeping
+the object; §10 stops paying for the object.
+
 
