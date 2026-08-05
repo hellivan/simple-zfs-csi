@@ -107,13 +107,37 @@ forbidden, the informer never syncs, and the read never returns.
   [internal/controller/nvmeof_controller.go](../internal/controller/nvmeof_controller.go).
 - Or scope the manager cache with `cache.Options{DefaultNamespaces: …}` (the
   operator does this from its resolved namespace — `--namespace`, defaulting to
-  `$POD_NAMESPACE` — in
+  `$POD_NAMESPACE` and then to the pod's service-account namespace file, the
+  same three-step resolution controller-runtime uses for the leader-election
+  lease — in
   [cmd/operator/main.go](../cmd/operator/main.go), which now **exits at startup**
   if that resolves to empty — the scoping is what keeps its namespaced Secret
   RBAC sufficient, so silently falling back to a cluster-wide cache would
   reintroduce exactly this class).
 - csi-controller / csi-node use a **direct `client.New`** (uncached) client and
-  are immune to this class.
+  are immune to the informer half of this class.
+- **An unresolved namespace is a second, quieter failure mode.** An empty
+  namespace does not fail cleanly at the API: the request addresses no valid
+  endpoint, comes back `NotFound`, and callers routinely read `NotFound` as
+  "absent, therefore not configured". csi-controller was exposed exactly this
+  way — `DefaultsNamespace` was a bare `os.Getenv("POD_NAMESPACE")`, and
+  [defaultParams](../internal/csi/controller.go) deliberately tolerates
+  `NotFound` ("a missing ConfigMap is not an error"), so an unset variable
+  silently dropped the entire provisioner-defaults layer and volumes were
+  provisioned with StorageClass values alone. The operator had the analogous
+  exposure through DH-CHAP: an empty namespace is stamped onto every
+  `NetworkExport` as `dhchapSecretNamespace`, so the node finds no Secret and
+  connects unauthenticated.
+
+  Both binaries now resolve it through one shared helper,
+  [`kubeenv.Namespace`](../internal/kubeenv/namespace.go) — explicit value
+  (`--namespace`, itself defaulting to `$POD_NAMESPACE`), then the pod's
+  service-account namespace file, which is the same fallback controller-runtime
+  applies to the leader-election lease — and refuse to start when it is needed
+  but unresolvable: the operator always, csi-controller only when
+  `--default-parameters-configmap` is set (without it the value is genuinely
+  unused). Prefer one resolver over per-binary `os.Getenv`: the three call sites
+  had drifted into three different behaviours before this.
 
 **Guarded by:** the *"permission secret error"* fix and ADR-0014 in
 [design-decisions.md](design-decisions.md). (Not to be confused with the earlier
@@ -1008,9 +1032,12 @@ adding a gate, ask which way it fails before deciding which reader it needs.
 
 Related and deliberately unfixed by this mechanism: the operator's namespaced
 cache scoping is what keeps its Secret RBAC sufficient, so `cmd/operator` now
-exits at startup when its namespace resolves to empty (`--namespace`, defaulting
-to `$POD_NAMESPACE`) rather than silently starting cluster-wide informers
-(class 4).
+exits at startup when its namespace resolves to empty rather than silently
+starting cluster-wide informers (class 4). It resolves `--namespace`, then
+`$POD_NAMESPACE`, then `/var/run/secrets/kubernetes.io/serviceaccount/namespace`,
+so only a genuinely out-of-cluster run without the flag can reach the failure —
+and an empty namespace would also quietly disable DH-CHAP, since it is stamped
+onto every `NetworkExport` for the node to resolve the Secret with.
 
 **Guarded by:** ADR-0023 (destructive reads) and ADR-0024 (readiness gates read
 the object the write returned, not a re-`Get` that the cache may answer with the

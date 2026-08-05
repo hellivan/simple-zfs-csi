@@ -19,6 +19,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 	zfscsi "github.com/hellivan/simple-zfs-csi/internal/csi"
+	"github.com/hellivan/simple-zfs-csi/internal/kubeenv"
 )
 
 // version is overridable at build time via -ldflags.
@@ -35,6 +36,7 @@ func main() {
 	var (
 		endpoint            string
 		driverName          string
+		namespace           string
 		defaultsConfigMap   string
 		annotationPrefix    string
 		createTimeout       time.Duration
@@ -43,6 +45,7 @@ func main() {
 	)
 	flag.StringVar(&endpoint, "endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint the plugin listens on.")
 	flag.StringVar(&driverName, "driver-name", "simple-zfs-csi.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
+	flag.StringVar(&namespace, "namespace", os.Getenv("POD_NAMESPACE"), "Namespace holding the default-parameters ConfigMap (defaults to $POD_NAMESPACE, then to the pod's service-account namespace).")
 	flag.StringVar(&defaultsConfigMap, "default-parameters-configmap", "", "Optional ConfigMap (in the controller namespace) whose \"parameters.yaml\" key holds provisioner default parameters, read live per CreateVolume (empty disables the defaults layer).")
 	flag.StringVar(&annotationPrefix, "pvc-annotation-prefix", "param.simple-zfs-csi.io/", "PVC annotation prefix whose keys override parameters (empty disables the PVC layer).")
 	flag.DurationVar(&createTimeout, "create-timeout", 2*time.Minute, "How long CreateVolume waits for a ZfsDataset to become Ready.")
@@ -56,6 +59,17 @@ func main() {
 	logger := zap.New(zap.UseFlagOptions(&opts))
 	ctrl.SetLogger(logger)
 	setupLog := ctrl.Log.WithName("setup")
+
+	namespace = kubeenv.Namespace(namespace)
+	if defaultsConfigMap != "" && namespace == "" {
+		// Only required when the defaults layer is actually configured. Proceeding
+		// with an empty namespace would not fail cleanly: the ConfigMap read comes
+		// back NotFound, which defaultParams deliberately treats as "no defaults
+		// configured", so every volume would silently be provisioned without the
+		// operator's default parameters (known-pitfalls.md #4).
+		setupLog.Error(nil, "namespace is required with --default-parameters-configmap and could not be determined; set --namespace or the POD_NAMESPACE env var")
+		os.Exit(1)
+	}
 
 	cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 	if err != nil {
@@ -74,7 +88,7 @@ func main() {
 	cs := &zfscsi.ControllerServer{
 		Client:              cl,
 		DefaultsConfigMap:   defaultsConfigMap,
-		DefaultsNamespace:   os.Getenv("POD_NAMESPACE"),
+		DefaultsNamespace:   namespace,
 		AnnotationPrefix:    annotationPrefix,
 		CreateTimeout:       createTimeout,
 		PollInterval:        pollInterval,

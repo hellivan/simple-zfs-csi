@@ -27,6 +27,7 @@ import (
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 	"github.com/hellivan/simple-zfs-csi/internal/controller"
+	"github.com/hellivan/simple-zfs-csi/internal/kubeenv"
 )
 
 var scheme = runtime.NewScheme()
@@ -49,7 +50,7 @@ func main() {
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probe binds to.")
-	flag.StringVar(&namespace, "namespace", os.Getenv("POD_NAMESPACE"), "Namespace the operator runs in: scopes the manager's namespaced cache and holds the per-attach DH-CHAP Secrets (defaults to $POD_NAMESPACE).")
+	flag.StringVar(&namespace, "namespace", os.Getenv("POD_NAMESPACE"), "Namespace the operator runs in: scopes the manager's namespaced cache and holds the per-attach DH-CHAP Secrets (defaults to $POD_NAMESPACE, then to the pod's service-account namespace).")
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election so only one operator acts at a time.")
 	flag.StringVar(&leaderElecNS, "leader-election-namespace", os.Getenv("POD_NAMESPACE"), "Namespace for the leader-election lease (defaults to $POD_NAMESPACE).")
 	flag.BoolVar(&dhchapEnabled, "nvmeof-dhchap", true, "Enable NVMe-oF DH-CHAP in-band authentication (ADR-0011); NQN allow-listing applies regardless.")
@@ -64,15 +65,20 @@ func main() {
 	ctrl.SetLogger(logger)
 	setupLog := ctrl.Log.WithName("setup")
 
+	namespace = kubeenv.Namespace(namespace)
 	if namespace == "" {
-		// Not optional, and deliberately not defaulted: it scopes the cache below
-		// *and* names the namespace the DH-CHAP Secrets are created in. Left empty,
-		// the manager would start cluster-wide Secret informers that the operator's
-		// namespaced RBAC forbids — and a forbidden informer never syncs, so the
-		// operator would stall silently rather than fail (known-pitfalls.md #4).
-		// The chart always supplies POD_NAMESPACE from the downward API; --namespace
-		// covers running the binary outside a pod.
-		setupLog.Error(nil, "namespace is required; set --namespace or the POD_NAMESPACE env var")
+		// Not optional: it scopes the cache below *and* names the namespace the
+		// DH-CHAP Secrets are created in. Left empty, the manager would start
+		// cluster-wide Secret informers that the operator's namespaced RBAC forbids
+		// — and a forbidden informer never syncs, so the operator would stall
+		// silently rather than fail (known-pitfalls.md #4). Worse, DH-CHAP would
+		// degrade quietly: the empty namespace is stamped onto every NetworkExport,
+		// so the node finds no Secret and connects unauthenticated.
+		//
+		// In a pod this can only be reached if the service-account token is not
+		// mounted either, so failing here is a genuine misconfiguration, not a
+		// missing convenience default.
+		setupLog.Error(nil, "namespace is required and could not be determined; set --namespace or the POD_NAMESPACE env var")
 		os.Exit(1)
 	}
 
