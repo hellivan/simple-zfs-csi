@@ -87,6 +87,10 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --csi-address={{ .Values.csiController.socketDir }}/csi.sock
+            # Must be >= the driver's own wait (csiController.createTimeout), or the
+            # sidecar cancels and retries every provisioning wait instead of
+            # letting it finish. Upstream's default is 10s.
+            - --timeout={{ .Values.csiController.provisioner.timeout | default .Values.csiController.createTimeout }}
             - --extra-create-metadata
             {{- with .Values.csiController.provisioner.defaultFsType }}
             # Record a fsType on every filesystem PV (pv.spec.csi.fsType) so

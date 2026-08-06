@@ -280,6 +280,14 @@ csiController:
     # -- `csiDriver.fsGroupPolicy`); it is harmless for NFS (RWX) volumes, which
     # -- are never in scope for the fsGroup policy. Empty disables the default.
     defaultFsType: ext4
+    # -- How long external-provisioner waits for a single CSI call
+    # -- (CreateVolume/DeleteVolume/capacity queries) before cancelling it and
+    # -- retrying with backoff. Upstream defaults to 10s, which is shorter than
+    # -- `csiController.createTimeout`, so the sidecar would cancel every
+    # -- provisioning wait before the driver could finish it. Empty follows
+    # -- `csiController.createTimeout`, which keeps the two in step; set it only
+    # -- to make the sidecar give up sooner than the driver does.
+    timeout: ""
     # -- Extra args for external-provisioner.
     extraArgs: []
     # -- Resource requests/limits for the sidecar.

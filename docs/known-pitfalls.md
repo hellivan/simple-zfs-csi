@@ -1057,6 +1057,52 @@ and `TestAttachRequest_StaleCacheDoesNotTearDownLiveShare`.
 
 ---
 
+## 20. A sidecar operation timeout shorter than the driver's own wait
+
+**Symptom:** none that anyone notices. Provisioning works, deletion works, tests
+pass. The only trace is that slow operations take longer than they should and the
+sidecar logs a cancelled call before retrying.
+
+**Root cause:** the CSI sidecars bound how long they will wait for a single RPC,
+and that bound is *theirs*, not the driver's. `external-provisioner` defaults to
+
+```go
+operationTimeout = flag.Duration("timeout", 10*time.Second,
+    "Timeout for waiting for volume operation (creation, deletion, capacity queries)")
+```
+
+Our `CreateVolume` blocks on `waitVolumeReady` for up to `--create-timeout`
+(chart default `2m`). The chart never set `--timeout`, so the sidecar cancelled
+every wait at 10s and retried with backoff. The driver's 2m knob was unreachable:
+it described an intent the deployment could not honour.
+
+Nothing fails, which is precisely why it survives. The retry path is idempotent,
+so the operation still completes — just via cancel-and-retry cycles instead of the
+single wait the driver was written for.
+
+**Guard:** whenever a driver RPC blocks, the sidecar's timeout must be at least
+the driver's own wait, and the two must be *derived from one value* rather than
+configured twice. The chart now renders
+
+```yaml
+- --timeout={{ .Values.csiController.provisioner.timeout | default .Values.csiController.createTimeout }}
+```
+
+so raising `createTimeout` moves both, and an explicit
+`csiController.provisioner.timeout` is available for the rare case where the
+sidecar should give up *sooner* than the driver.
+
+**The general shape:** two independently-configured numbers that only behave when
+one is larger than the other, with no error when they are not. Grep a chart for
+timeouts, retries and intervals that cross a component boundary and check each
+pair. The CSI spec makes this the CO's prerogative — *"The CO MAY choose the
+maximum time it is willing to wait for a call [...] these values are not
+negotiated between plugin and CO"* — so the driver cannot detect the mismatch at
+runtime; it has to be right in the deployment.
+
+**Where the guard lives:** `charts/simple-zfs-csi/templates/csi-controller-deployment.yaml`
+and the `csiController.provisioner.timeout` value. **Status: fixed 2026-08-06.**
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing
