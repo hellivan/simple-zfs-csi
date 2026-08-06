@@ -312,13 +312,6 @@ csiController:
     extraArgs: []
     # -- Resource requests/limits for the sidecar.
     resources: {}
-    # -- Fallback ZfsSnapshot mode (docs/snapshot-lifecycle-redesign.md) when a
-    # -- VolumeSnapshotClass carries no "mode" parameter: "standalone"
-    # -- (Ceph-style, via zfs promote — snapshots survive their source volume's
-    # -- deletion, no blocking) or "integrated" (today's original,
-    # -- plain-snapshot-only behaviour — cheaper, but DeleteVolume blocks while a
-    # -- dependent snapshot in this mode still exists).
-    defaultMode: standalone
   # external-attacher sidecar (attach-stage access control). Mandatory: the share
   # lifecycle lives at the attach stage (ADR-0010), so a volume is exported only
   # to nodes that hold an attach request. It is always deployed (like the

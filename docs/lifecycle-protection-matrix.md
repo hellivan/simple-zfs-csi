@@ -476,6 +476,19 @@ why layer 3 exists at all. See [§6.3](#63-out-of-band-deletion-of-our-own-crds)
 
 ### 6.1 A PVC with a completed integrated-mode snapshot
 
+> **RESOLVED (2026-08-06): this gap no longer exists.** It existed only because
+> `integrated` mode existed, and that mode was removed — ADR-0027, implemented.
+> Every snapshot is now backed by its own clone, which puts the driver in the CSI
+> spec's "supports deleting a volume without affecting its existing snapshots"
+> branch, where no refusal is required at all. `checkSnapshotDependents` keeps
+> only its "snapshot not yet Ready" clause.
+>
+> The section is kept because the *reasoning* still matters: it is the worked
+> example of a storage backend whose snapshots are not independent of their
+> source, and of what upstream does and does not protect in that case. The
+> §6.2 deviation below is likewise now unreachable in practice, but remains a
+> real spec deviation worth fixing.
+
 **The gap:** `isPVCBeingUsed` returns false once the snapshot is ready (§5.2), so
 Kubernetes will happily delete the PVC → PV → call `DeleteVolume`. In integrated
 mode the `ZfsSnapshot` *is* a raw snapshot hanging off the live dataset. A

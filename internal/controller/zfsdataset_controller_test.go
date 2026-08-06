@@ -919,7 +919,7 @@ func TestZfsDatasetReconcile_DeleteBlocksOnPendingSnapshot(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "csi-snap-x",
-			SourceVolume: "pvc-1", Mode: storagev1alpha1.SnapshotModeStandalone,
+			SourceVolume: "pvc-1",
 		},
 		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhasePending},
 	}
@@ -959,7 +959,7 @@ func TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "csi-snap-x",
-			SourceVolume: "pvc-1", Mode: storagev1alpha1.SnapshotModeStandalone,
+			SourceVolume: "pvc-1",
 		},
 		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhasePending},
 	}
@@ -987,41 +987,6 @@ func TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader(t *testing.T) {
 	}
 }
 
-// TestZfsDatasetReconcile_DeleteBlocksOnIntegratedModeSnapshot verifies §3.2:
-// an integrated-mode dependent has no promote mechanism, so DeleteVolume must
-// keep blocking (requeuing) until it's gone, exactly like before this redesign.
-func TestZfsDatasetReconcile_DeleteBlocksOnIntegratedModeSnapshot(t *testing.T) {
-	scheme := newTestScheme(t)
-	now := metav1.Now()
-	vol := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
-		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
-	}
-	snap := &storagev1alpha1.ZfsSnapshot{
-		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
-		Spec: storagev1alpha1.ZfsSnapshotSpec{
-			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "snap-1",
-			SourceVolume: "pvc-1", Mode: storagev1alpha1.SnapshotModeIntegrated,
-		},
-		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
-	}
-	c := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(onlinePool(), vol, snap).
-		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsSnapshot{}).
-		Build()
-
-	z := newFakeZFS("tank/k8s/pvc-1")
-	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}})
-	if err == nil {
-		t.Fatal("expected reconcile to block/error while a live integrated-mode snapshot exists")
-	}
-	if len(z.destroyed) != 0 {
-		t.Fatalf("volume should not be destroyed while an integrated-mode dependent exists, got %v", z.destroyed)
-	}
-}
-
 // TestZfsDatasetReconcile_DeletePromotesStandaloneBackingCloneAndSucceeds
 // verifies D0/D3/D11: a Ready standalone-mode dependent's backing clone is
 // promoted away (never blocked on), after which the source volume's own
@@ -1037,7 +1002,7 @@ func TestZfsDatasetReconcile_DeletePromotesStandaloneBackingCloneAndSucceeds(t *
 		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "csi-snap-x",
-			SourceVolume: "pvc-1", Mode: storagev1alpha1.SnapshotModeStandalone,
+			SourceVolume: "pvc-1",
 		},
 		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 	}
@@ -1145,7 +1110,7 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 		},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
-			SourceVolume: "pvc-src", Mode: storagev1alpha1.SnapshotModeStandalone,
+			SourceVolume: "pvc-src",
 		},
 	}
 	r1 := &storagev1alpha1.ZfsDataset{

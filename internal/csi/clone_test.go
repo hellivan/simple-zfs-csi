@@ -31,7 +31,15 @@ func volumeSource(id string) *csi.VolumeContentSource {
 }
 
 func TestCreateVolume_RestoreFromSnapshot(t *testing.T) {
-	cl := newTestClient(t, sourceDataset("pvc-src"), snapshotObj("snap-1", "999", "k8s/pvc-src", "pvc-src"))
+	// Every snapshot owns a backing clone, and restores clone that clone's
+	// "@restore-source" self-snapshot rather than the raw snapshot (§11).
+	backing := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/snap-1", Type: storagev1alpha1.DatasetTypeFilesystem,
+		},
+	}
+	cl := newTestClient(t, sourceDataset("pvc-src"), snapshotObj("snap-1", "999", "k8s/pvc-src", "pvc-src"), backing)
 	cs := newController(cl)
 	markReadyAsync(cl, "pvc-restore")
 
@@ -53,8 +61,8 @@ func TestCreateVolume_RestoreFromSnapshot(t *testing.T) {
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-restore"}, vol); err != nil {
 		t.Fatalf("get ZfsDataset: %v", err)
 	}
-	if vol.Spec.Source == nil || vol.Spec.Source.Snapshot != "k8s/pvc-src@snap-1" {
-		t.Errorf("clone source = %+v, want snapshot k8s/pvc-src@snap-1", vol.Spec.Source)
+	if vol.Spec.Source == nil || vol.Spec.Source.Snapshot != "k8s/snap-1@restore-source" {
+		t.Errorf("clone source = %+v, want snapshot k8s/snap-1@restore-source", vol.Spec.Source)
 	}
 }
 
@@ -272,7 +280,6 @@ func TestCreateVolume_RestoreFromStandaloneSnapshot(t *testing.T) {
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
 			SourceVolume: "pvc-src", SourceType: storagev1alpha1.DatasetTypeFilesystem,
-			Mode: storagev1alpha1.SnapshotModeStandalone,
 		},
 	}
 	backing := &storagev1alpha1.ZfsDataset{
@@ -329,7 +336,6 @@ func TestCreateVolume_RestoreCrossPrefixRejected(t *testing.T) {
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
 			SourceVolume: "pvc-src", SourceType: storagev1alpha1.DatasetTypeFilesystem,
-			Mode: storagev1alpha1.SnapshotModeStandalone,
 		},
 	}
 	backing := &storagev1alpha1.ZfsDataset{
@@ -350,35 +356,6 @@ func TestCreateVolume_RestoreCrossPrefixRejected(t *testing.T) {
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument for cross-prefix restore, got %v", err)
-	}
-}
-
-// TestCreateVolume_IntegratedRestoreCrossPrefixRejected verifies F5: D6 says
-// the cross-prefix rejection "applies identically to both modes", but the
-// integrated-mode branch used to return before the check ever ran. The raw
-// snapshot lives on the source volume, so the `zfs send -R` locality problem is
-// identical.
-func TestCreateVolume_IntegratedRestoreCrossPrefixRejected(t *testing.T) {
-	snap := &storagev1alpha1.ZfsSnapshot{
-		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
-		Spec: storagev1alpha1.ZfsSnapshotSpec{
-			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
-			SourceVolume: "pvc-src", SourceType: storagev1alpha1.DatasetTypeFilesystem,
-			Mode: storagev1alpha1.SnapshotModeIntegrated,
-		},
-	}
-	cl := newTestClient(t, snap)
-	cs := newController(cl)
-
-	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
-		Name:                "pvc-restore",
-		VolumeCapabilities:  mountCaps(),
-		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
-		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nfs", "datasetPrefix": "other-prefix"},
-		VolumeContentSource: snapshotSource("snap-1"),
-	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("expected InvalidArgument for cross-prefix integrated restore, got %v", err)
 	}
 }
 
@@ -419,7 +396,6 @@ func TestCreateVolume_RestoreChecksCapturedSourceFSType(t *testing.T) {
 			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
 			// SourceVolume names a ZfsDataset that no longer exists.
 			SourceVolume: "pvc-src", SourceType: storagev1alpha1.DatasetTypeVolume,
-			Mode:               storagev1alpha1.SnapshotModeStandalone,
 			SourceFSType:       "ext4",
 			SourceVolblocksize: "16k",
 		},

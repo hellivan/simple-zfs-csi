@@ -70,16 +70,6 @@ const maxDetachRounds = 100
 // live ZfsSnapshot still claims.
 var driverSnapshotSuffix = regexp.MustCompile(`^(restore-source|clone-[0-9a-f]{16}|csi-snap-.+)$`)
 
-// effectiveSnapshotMode returns snap's resolved Mode, treating an empty value
-// (snapshots created before Mode existed) as Integrated — today's original,
-// pre-redesign behaviour — for backward compatibility (D8).
-func effectiveSnapshotMode(snap *storagev1alpha1.ZfsSnapshot) storagev1alpha1.ZfsSnapshotMode {
-	if snap.Spec.Mode == "" {
-		return storagev1alpha1.SnapshotModeIntegrated
-	}
-	return snap.Spec.Mode
-}
-
 // splitSnapshot splits a full ZFS snapshot name into its dataset and short
 // name, e.g. "tank/k8s/vol@restore-source" -> ("tank/k8s/vol", "restore-source").
 // The suffix is empty when full is not a snapshot.
@@ -132,15 +122,20 @@ func (r *ZfsDatasetReconciler) beforeDestroy(ctx context.Context, vol *storagev1
 	return detachAndCleanSnapshots(ctx, r.gateReader(), r.ZFS, vol.Spec.PoolGUID, poolName, full)
 }
 
-// checkSnapshotDependents implements D3/§3.2: the two situations where a
-// volume's deletion must block rather than proceed, because there is nothing
-// safe to promote yet.
+// checkSnapshotDependents implements D3/§3.2: a volume's deletion must block
+// while one of its snapshots is still being taken.
 //
-//   - A dependent ZfsSnapshot that is not Ready is still being taken, so its
-//     backing clone may not exist yet.
-//   - A live integrated-mode snapshot has no backing clone at all, and so no
-//     promote mechanism to fall back on — destroying the volume would take the
-//     user's snapshot with it.
+// A dependent ZfsSnapshot that is not Ready may not have its backing clone yet,
+// so there is nothing to promote away and destroying the volume now would take
+// the snapshot's only copy of the data with it. Once every dependent is Ready,
+// each owns a backing clone and detachAndCleanSnapshots can promote them all
+// away, so deletion proceeds.
+//
+// This used to have a second clause refusing outright while a live
+// integrated-mode snapshot existed. That mode was removed (§11): every snapshot
+// is now backed by its own clone, which puts us in the CSI spec's "supports
+// deleting a volume without affecting its existing snapshots" branch, so there
+// is no longer any case where a volume delete must be refused permanently.
 func (r *ZfsDatasetReconciler) checkSnapshotDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
 	var snaps storagev1alpha1.ZfsSnapshotList
 	if err := r.gateReader().List(ctx, &snaps); err != nil {
@@ -153,9 +148,6 @@ func (r *ZfsDatasetReconciler) checkSnapshotDependents(ctx context.Context, vol 
 		}
 		if snap.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
 			return fmt.Errorf("volume %q has snapshot %q still in phase %q; requeue", vol.Name, snap.Name, snap.Status.Phase)
-		}
-		if effectiveSnapshotMode(snap) != storagev1alpha1.SnapshotModeStandalone {
-			return fmt.Errorf("volume %q has a live integrated-mode snapshot %q; delete it before deleting the volume", vol.Name, snap.Name)
 		}
 	}
 	return nil

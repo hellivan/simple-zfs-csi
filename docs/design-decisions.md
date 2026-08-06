@@ -11,6 +11,94 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0027 — `integrated` snapshot mode is removed; every snapshot is backed by its own clone
+
+**Status:** Accepted (2026-08-06) · **Scope:** `api/v1alpha1/zfssnapshot_types.go`, `internal/csi/{snapshot,clone,controller}.go`, `internal/controller/{promote,zfssnapshot_controller}.go`, `cmd/csi-controller/main.go`, chart · **Related:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §11, [lifecycle-protection-matrix.md](lifecycle-protection-matrix.md) §6.1, supersedes D8.
+
+### Context
+
+Two snapshot mechanisms existed for historical reasons. `integrated` (a plain
+`zfs snapshot` on the live dataset) came first. `standalone` (raw snapshot plus
+an owned backing-clone `ZfsDataset`) was added because it complies with the CSI
+spec and is more usable. `integrated` was kept under an explicit condition: only
+for as long as it caused no problems. D8 made the mode selectable per
+`VolumeSnapshotClass`.
+
+Investigation on 2026-08-06, partly by executing scenarios against the
+pool-verified ZFS fake rather than reasoning about them, established that the
+condition no longer holds:
+
+1. **It is the sole reason a volume delete can be refused.** The second clause of
+   `checkSnapshotDependents` fires only for `integrated`. CSI v1.11.0 requires a
+   plugin that cannot delete a volume without affecting its snapshots to return
+   `FAILED_PRECONDITION`; `standalone` puts the driver in the compliant branch,
+   `integrated` was the only thing keeping it out.
+2. **Its restores do not survive `zfs promote`.** An `integrated` restore clones
+   the raw snapshot on the live source volume. A promote relocates that snapshot
+   — along with every snapshot older than it — onto the promoted clone, after
+   which the recorded path no longer holds it and the restore fails. A
+   `standalone` restore clones `<backing>@restore-source`; a promote re-parents
+   that backing clone rather than invalidating it.
+3. **Mixing modes on one volume was constructible and unreported.** Nothing bound
+   a volume to a single mode, so one PVC could carry snapshots with different
+   deletion and restore semantics, and `DeleteVolume` reports none of it.
+4. **Empty `Mode` meant `integrated`,** so legacy objects defaulted to the
+   fragile mechanism.
+
+Executed evidence for the promote interaction: with an older `integrated`
+snapshot and a newer `standalone` one on the same volume, deleting the volume is
+refused while the integrated snapshot is live, and — if it is merely terminating
+— proceeds and pulls `csi-snap-i` onto the standalone backing clone while its
+`ZfsSnapshot` still records the original dataset.
+
+### Options weighed
+
+- **Keep both, document the hazards.** Rejected: the hazards are silent, and the
+  mixing case has no guard that could be added cheaply — a volume would need to
+  be pinned to one mode, which is a new constraint invented to protect a legacy
+  mechanism.
+- **Keep `integrated`, forbid mixing.** Rejected for the same reason, and it
+  leaves the CSI non-compliance and the promote fragility untouched.
+- **Remove `integrated`.** Accepted.
+
+### Decision
+
+Remove the mode concept entirely. `ZfsSnapshotMode`, its two constants, and
+`ZfsSnapshotSpec.Mode` are deleted; so are the `--default-snapshot-mode` flag and
+the chart's `csiController.snapshotter.defaultMode`. Every snapshot now takes the
+former `standalone` path.
+
+A `VolumeSnapshotClass` still carrying `mode: integrated` (or any unrecognised
+value) is **rejected** with `InvalidArgument` rather than silently given the
+surviving behaviour — changing a class's meaning without telling anyone is
+precisely the failure this ADR is about. `mode: standalone` is accepted as a
+no-op so classes that named the surviving behaviour keep working.
+
+### Consequences
+
+- `checkSnapshotDependents` keeps only its "snapshot not yet Ready" clause. There
+  is no longer any case in which a volume delete must be refused permanently,
+  which closes §6.1 of the protection matrix and removes the only trigger for the
+  `DeleteVolume` spec deviation recorded in §10.10.
+- Restores are unconditionally promote-safe.
+- Six mode branches, one API enum, one CEL immutability rule, one flag and one
+  chart value are gone; the delete-path test matrix halves.
+- **Migration: none required.** D8 records that `standalone` was made the default
+  because the target cluster had no existing snapshots, and that cluster still has
+  no `snapshot.storage.k8s.io` CRDs, so no `ZfsSnapshot` can have been created
+  through the CSI path. Any pre-existing object would simply lose a pruned field
+  and be treated as `standalone`.
+- **Accepted cost:** one `csi-snap-*` sibling dataset per live snapshot, which is
+  more `zfs list` noise and more surface inside a `zfs send -R` subtree than
+  `integrated` produced. §2.5's flat-sibling placement keeps `send -R` correct and
+  a clone consumes no space until it diverges, so this is presentation rather than
+  cost — but it is a real difference for an admin reading the pool.
+- Does **not** address §12 (a promote can relocate a snapshot while its
+  `ZfsSnapshot` keeps the old address), which affects the surviving path too and
+  needs its own decision.
+
+---
+
 ## ADR-0026 — A `ZfsDataset` spec is a standing declaration: a dataset that disappears is recreated
 
 **Status:** Accepted (2026-08-05) · **Scope:** `internal/controller/zfsdataset_controller.go` — **no code change**; this records existing behaviour as intentional · **Related:** [runbooks.md](runbooks.md), [known-pitfalls.md](known-pitfalls.md) #18.

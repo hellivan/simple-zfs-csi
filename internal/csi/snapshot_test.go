@@ -96,75 +96,36 @@ func TestCreateSnapshot_MissingSourceVolume(t *testing.T) {
 	}
 }
 
-// TestCreateSnapshot_DefaultModeIsStandalone verifies D8: with no
-// VolumeSnapshotClass "mode" parameter and no chart-configured default, a new
-// snapshot resolves to standalone (the new default).
-func TestCreateSnapshot_DefaultModeIsStandalone(t *testing.T) {
-	cl := newTestClient(t, sourceDataset("pvc-1"))
-	cs := newController(cl)
-	markSnapshotReadyAsync(cl, "snap-1")
-	if _, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-1", SourceVolumeId: "pvc-1"}); err != nil {
-		t.Fatalf("CreateSnapshot: %v", err)
-	}
-	got := &storagev1alpha1.ZfsSnapshot{}
-	if err := cl.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, got); err != nil {
-		t.Fatalf("get ZfsSnapshot: %v", err)
-	}
-	if got.Spec.Mode != storagev1alpha1.SnapshotModeStandalone {
-		t.Errorf("mode = %q, want standalone", got.Spec.Mode)
+// TestCreateSnapshot_RemovedModeParameterRejected verifies §11: snapshot modes
+// were removed, and a VolumeSnapshotClass still carrying `mode: integrated` is
+// rejected rather than silently getting the surviving behaviour. Changing a
+// class's meaning without telling anyone is the failure this guards against.
+func TestCreateSnapshot_RemovedModeParameterRejected(t *testing.T) {
+	for _, mode := range []string{"integrated", "bogus"} {
+		t.Run(mode, func(t *testing.T) {
+			cl := newTestClient(t, sourceDataset("pvc-1"))
+			cs := newController(cl)
+			_, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
+				Name: "snap-1", SourceVolumeId: "pvc-1", Parameters: map[string]string{"mode": mode},
+			})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("expected InvalidArgument for mode=%q, got %v", mode, err)
+			}
+		})
 	}
 }
 
-// TestCreateSnapshot_ModeParameterOverridesDefault verifies the
-// VolumeSnapshotClass "mode" parameter takes precedence over the chart default.
-func TestCreateSnapshot_ModeParameterOverridesDefault(t *testing.T) {
+// TestCreateSnapshot_StandaloneModeParameterAccepted verifies a class that
+// explicitly named the surviving behaviour keeps working as a no-op, so
+// removing the mode does not force every existing VolumeSnapshotClass to change.
+func TestCreateSnapshot_StandaloneModeParameterAccepted(t *testing.T) {
 	cl := newTestClient(t, sourceDataset("pvc-1"))
 	cs := newController(cl)
 	markSnapshotReadyAsync(cl, "snap-1")
 	if _, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
-		Name: "snap-1", SourceVolumeId: "pvc-1", Parameters: map[string]string{"mode": "integrated"},
+		Name: "snap-1", SourceVolumeId: "pvc-1", Parameters: map[string]string{"mode": "standalone"},
 	}); err != nil {
-		t.Fatalf("CreateSnapshot: %v", err)
-	}
-	got := &storagev1alpha1.ZfsSnapshot{}
-	if err := cl.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, got); err != nil {
-		t.Fatalf("get ZfsSnapshot: %v", err)
-	}
-	if got.Spec.Mode != storagev1alpha1.SnapshotModeIntegrated {
-		t.Errorf("mode = %q, want integrated", got.Spec.Mode)
-	}
-}
-
-// TestCreateSnapshot_ChartDefaultModeUsedWhenNoParameter verifies
-// ControllerServer.DefaultSnapshotMode is used as the fallback when the
-// VolumeSnapshotClass carries no "mode" parameter.
-func TestCreateSnapshot_ChartDefaultModeUsedWhenNoParameter(t *testing.T) {
-	cl := newTestClient(t, sourceDataset("pvc-1"))
-	cs := newController(cl)
-	cs.DefaultSnapshotMode = storagev1alpha1.SnapshotModeIntegrated
-	markSnapshotReadyAsync(cl, "snap-1")
-	if _, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{Name: "snap-1", SourceVolumeId: "pvc-1"}); err != nil {
-		t.Fatalf("CreateSnapshot: %v", err)
-	}
-	got := &storagev1alpha1.ZfsSnapshot{}
-	if err := cl.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, got); err != nil {
-		t.Fatalf("get ZfsSnapshot: %v", err)
-	}
-	if got.Spec.Mode != storagev1alpha1.SnapshotModeIntegrated {
-		t.Errorf("mode = %q, want integrated (chart default)", got.Spec.Mode)
-	}
-}
-
-// TestCreateSnapshot_InvalidModeRejected verifies an unrecognised "mode" value
-// is rejected outright rather than silently defaulted or stored.
-func TestCreateSnapshot_InvalidModeRejected(t *testing.T) {
-	cl := newTestClient(t, sourceDataset("pvc-1"))
-	cs := newController(cl)
-	_, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
-		Name: "snap-1", SourceVolumeId: "pvc-1", Parameters: map[string]string{"mode": "bogus"},
-	})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("expected InvalidArgument for invalid mode, got %v", err)
+		t.Fatalf("CreateSnapshot with mode=standalone: %v", err)
 	}
 }
 

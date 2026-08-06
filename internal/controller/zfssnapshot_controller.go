@@ -152,17 +152,9 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("created ZFS snapshot", "snapshot", full)
 	}
 
-	if effectiveSnapshotMode(&snap) != storagev1alpha1.SnapshotModeStandalone {
-		// integrated mode: unchanged, status derived straight from the raw snapshot.
-		creation := snapshotCreationTime(ctx, r.ZFS, full)
-		restore := snapshotRestoreSize(ctx, r.ZFS, full)
-		return ctrl.Result{}, r.setSnapshotStatus(ctx, &snap, storagev1alpha1.SnapshotPhaseReady, true, creation, restore,
-			"Ready", fmt.Sprintf("snapshot %s ready on %s", full, r.NodeName))
-	}
-
-	// standalone mode (D15): provision/await the owned backing-clone ZfsDataset,
-	// then take its "@restore-source" self-snapshot (D5) — restores always clone
-	// from that, never from the raw snapshot above directly (D0/§3.1).
+	// Provision/await the owned backing-clone ZfsDataset, then take its
+	// "@restore-source" self-snapshot (D5) — restores always clone from that,
+	// never from the raw snapshot above directly (D0/§3.1).
 	return r.reconcileStandaloneCreate(ctx, &snap, &pool, datasetPath, full)
 }
 
@@ -218,15 +210,14 @@ func (r *ZfsSnapshotReconciler) sourceDatasetPath(ctx context.Context, reader cl
 }
 
 // reconcileDelete tears down a ZfsSnapshot on the node hosting its pool.
-// Integrated mode is unchanged: destroy the raw snapshot directly (ZFS's own
-// "has dependent clones" protection naturally blocks/retries if something
-// unexpected depends on it — nothing should, since only standalone mode ever
-// creates a restorable backing clone). Standalone mode (D15) delegates all
-// promote/dependent-chaining complexity to ZfsDatasetReconciler: delete the
-// owned backing-clone ZfsDataset and wait for it to be fully gone, *then*
-// perform the required (not best-effort) raw-origin-snapshot cleanup — in that
-// order, since the backing clone is itself a dependent clone of the raw
-// snapshot and can't coexist with destroying it first (D11).
+//
+// All promote/dependent-chaining complexity is delegated to
+// ZfsDatasetReconciler: delete the owned backing-clone ZfsDataset, wait for it
+// to be fully gone, then perform the required (not best-effort)
+// raw-origin-snapshot cleanup. The order matters because the backing clone is
+// itself a dependent clone of the raw snapshot, so the raw snapshot cannot be
+// destroyed while it exists (D11) — though D19's detachSnapshotClones below
+// also handles a dependent that appeared some other way.
 func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -239,25 +230,23 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 		return ctrl.Result{}, err
 	}
 
-	if effectiveSnapshotMode(snap) == storagev1alpha1.SnapshotModeStandalone {
-		backing := &storagev1alpha1.ZfsDataset{}
-		getErr := r.gateReader().Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing)
-		switch {
-		case apierrors.IsNotFound(getErr):
-			// Backing clone is fully gone; fall through to the raw-origin cleanup.
-		case getErr != nil:
-			return ctrl.Result{}, getErr
-		default:
-			if backing.DeletionTimestamp.IsZero() {
-				if err := r.Delete(ctx, backing); err != nil && !apierrors.IsNotFound(err) {
-					return ctrl.Result{}, err
-				}
+	backing := &storagev1alpha1.ZfsDataset{}
+	getErr := r.gateReader().Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing)
+	switch {
+	case apierrors.IsNotFound(getErr):
+		// Backing clone is fully gone; fall through to the raw-origin cleanup.
+	case getErr != nil:
+		return ctrl.Result{}, getErr
+	default:
+		if backing.DeletionTimestamp.IsZero() {
+			if err := r.Delete(ctx, backing); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
 			}
-			// ZfsDatasetReconciler owns all promote/dependent-chaining complexity
-			// for the backing clone (D3/D7/D9/D12/D13); poll until it's confirmed
-			// gone rather than adding a second watch/queueing path here.
-			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
+		// ZfsDatasetReconciler owns all promote/dependent-chaining complexity
+		// for the backing clone (D3/D7/D9/D12/D13); poll until it's confirmed
+		// gone rather than adding a second watch/queueing path here.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	// Required, not best-effort (D11): a no-op (Destroy is NotExist-tolerant)

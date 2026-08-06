@@ -632,3 +632,65 @@ A: Three items, all marked `[?]` in the documents and none affecting a decision 
 today: exact version boundaries for the newer external-provisioner finalizers;
 cross-namespace data sources (`AnyVolumeDataSource` / `ReferenceGrant`); and whether both
 snapshot-as-source finalizers are simultaneously active in the sidecar versions we deploy.
+
+---
+
+## 2026-08-06 — should `integrated` mode be dropped?
+
+> Context: integrated (native) mode came first; standalone was added for CSI compliance and
+> usability. Integrated was kept on the condition that it causes no problems. Full analysis
+> in [§11](snapshot-lifecycle-redesign.md); the separate defect it uncovered is §12.
+
+**Q: We have two snapshot modes. Would it be simpler to support only standalone? And if
+someone used two VolumeSnapshotClasses with different modes on the same volume, would that
+break everything?**
+
+A: Mixing is constructible — `mode` is a per-`VolumeSnapshotClass` parameter and nothing
+binds a volume to one mode — but it does **not** corrupt anything. What it produces is
+incoherent semantics on a single volume: some snapshots make the volume undeletable
+(`checkSnapshotDependents` refuses while a live integrated snapshot exists), others do not;
+some restores survive a `zfs promote`, others break. And because `DeleteVolume` is
+fire-and-forget (§10.10), the user is told none of it.
+
+The stronger argument against integrated mode is not mixing, though — it is that
+**integrated mode is the only reason we are on the non-compliant side of the CSI spec.**
+CSI v1.11.0 requires a plugin that cannot delete a volume without affecting its snapshots
+to return `FAILED_PRECONDITION`; standalone mode makes that clause inapplicable. Dropping
+integrated makes `checkSnapshotDependents`' second clause dead code and closes the only gap
+in the protection matrix that is genuinely ours.
+
+**Recommendation: drop it.** It fails the condition under which it was kept, and D8 already
+records that there is nothing to migrate.
+
+**Q: Was the "mixing corrupts data" theory right?**
+
+A: No — and it is worth recording that it was tested rather than argued. The hypothesis was
+that an integrated snapshot could be silently destroyed by a promote triggered elsewhere. A
+probe against the pool-verified fake showed the opposite: `assertDriverSnapshot` matches on
+the snapshot **suffix** regardless of which dataset now holds it, so a live `ZfsSnapshot`
+still blocks the destroy. No data loss.
+
+The probe did, however, surface a real defect that the hypothesis had not predicted, and it
+affects **standalone too** — see the next question. Had this been reasoned about instead of
+executed, the wrong problem would have been fixed.
+
+**Q: What is the defect the probe found?**
+
+A: `ZfsSnapshot.Spec.Dataset` records where the raw snapshot was taken, but a promote can
+relocate that snapshot to another dataset and nothing updates the record. The delete path
+then computes a stale address, `Destroy` is `NotExist`-tolerant, so it no-ops, the finalizer
+is released, and the object disappears while the real ZFS snapshot survives — holding space
+with nothing referencing it.
+
+It is bounded, not unbounded: the orphan is destroyed when whichever dataset currently holds
+it is eventually deleted, since no live `ZfsSnapshot` claims that suffix any more. So the
+cost is retained space and a confusing `zfs list`, not data loss or a permanent leak.
+Tracked as §12, needing its own decision independent of the mode question.
+
+**Q: Is there anything integrated mode does better?**
+
+A: One thing, and it is cosmetic: it creates no extra datasets. Standalone carries one
+`csi-snap-*` sibling per live snapshot, which is more `zfs list` noise and more surface
+inside a `zfs send -R` subtree. §2.5 established the flat-sibling placement keeps `send -R`
+correct, and a clone consumes no space until it diverges, so this is presentation rather
+than cost — but it is the one honest argument in integrated mode's favour.

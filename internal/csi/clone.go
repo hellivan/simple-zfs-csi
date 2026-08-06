@@ -40,11 +40,10 @@ func normalizedDatasetPrefix(prefix string) string {
 // subtree, silently breaking `zfs send -R <prefix>` backup replication (§2.5).
 // Reject it outright rather than letting the footgun exist.
 //
-// D6 says this "applies identically to both modes", and it applies to direct
-// PVC-to-PVC clones too — the clone's origin snapshot lives under the source's
-// prefix there as well. sourceDataset is whichever dataset physically holds the
-// origin: the backing clone in standalone mode, the source volume itself in
-// integrated mode and for volume clones.
+// D6 says this applies to direct PVC-to-PVC clones too — the clone's origin
+// snapshot lives under the source's prefix there as well. sourceDataset is
+// whichever dataset physically holds the origin: the snapshot's backing clone
+// for a restore, the source volume itself for a volume clone.
 func checkSamePrefix(rp *ResolvedParams, sourceDataset, kind, id string) error {
 	srcPrefix := path.Dir(strings.Trim(sourceDataset, "/"))
 	if want := normalizedDatasetPrefix(rp.DatasetPrefix); srcPrefix != want {
@@ -89,23 +88,12 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 			return nil, err
 		}
 
-		if effectiveMode(snap.Spec) != storagev1alpha1.SnapshotModeStandalone {
-			// integrated mode: clone directly from the raw snapshot, which lives on
-			// the source volume itself — so D6 compares against that dataset. The
-			// path comes from the source ZfsDataset while it exists, not from the
-			// copy recorded on the snapshot, which a later rename would strand
-			// (ADR-0025).
-			datasetPath := c.snapshotDatasetPath(ctx, snap)
-			if err := checkSamePrefix(rp, datasetPath, "restore", id); err != nil {
-				return nil, err
-			}
-			return &storagev1alpha1.DatasetSource{Snapshot: datasetPath + "@" + snap.Spec.SnapshotName}, nil
-		}
-
-		// standalone mode (D0/D15): restores always clone from the backing
-		// clone's own "@restore-source" self-snapshot, never from the raw
-		// snapshot directly, so restoring keeps working whether the source
-		// volume is still alive, deleted-but-not-yet-promoted, or promoted away.
+		// Restores always clone from the backing clone's own "@restore-source"
+		// self-snapshot (D0/D15), never from the raw snapshot directly, so
+		// restoring keeps working whether the source volume is still alive,
+		// deleted-but-not-yet-promoted, or already promoted away — and, unlike a
+		// reference to the raw snapshot, it survives a promote relocating that
+		// snapshot onto another dataset (§11.1).
 		backing := &storagev1alpha1.ZfsDataset{}
 		if err := c.Client.Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing); err != nil {
 			return nil, status.Errorf(codes.Internal, "get backing clone %q for snapshot %q: %v", snap.Spec.SnapshotName, id, err)
@@ -176,23 +164,6 @@ func (c *ControllerServer) sourceDatasetType(ctx context.Context, name string) s
 		return ""
 	}
 	return ds.Spec.Type
-}
-
-// snapshotDatasetPath returns the dataset path a snapshot's raw ZFS snapshot
-// lives on: the source ZfsDataset's current Spec.Dataset while that object
-// exists, otherwise the copy recorded on the snapshot at creation time. A
-// dataset renamed after the snapshot was taken therefore still restores
-// (ADR-0025) — the ZFS snapshot moves with its dataset, but the recorded copy
-// cannot follow.
-func (c *ControllerServer) snapshotDatasetPath(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot) string {
-	if snap.Spec.SourceVolume == "" {
-		return snap.Spec.Dataset
-	}
-	ds := &storagev1alpha1.ZfsDataset{}
-	if err := c.Client.Get(ctx, client.ObjectKey{Name: snap.Spec.SourceVolume}, ds); err != nil {
-		return snap.Spec.Dataset
-	}
-	return ds.Spec.Dataset
 }
 
 // requestedFsType returns the fsType carried by the first Mount capability, or

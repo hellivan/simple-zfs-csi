@@ -17,29 +17,15 @@ const (
 	SnapshotPhaseError ZfsSnapshotPhase = "Error"
 )
 
-// ZfsSnapshotMode selects the ZFS-level mechanism CreateSnapshot uses to take
-// (and, later, tear down) a snapshot. See docs/snapshot-lifecycle-redesign.md,
-// D8/D14.
-// +kubebuilder:validation:Enum=standalone;integrated
-type ZfsSnapshotMode string
-
-const (
-	// SnapshotModeStandalone takes a raw ZFS snapshot and immediately provisions
-	// an owned backing-clone ZfsDataset from it (D15), so the snapshot is fully
-	// independent of its source volume: DeleteVolume promotes it away (zfs
-	// promote, D0) instead of blocking. This is the Ceph-style, new default.
-	SnapshotModeStandalone ZfsSnapshotMode = "standalone"
-	// SnapshotModeIntegrated takes a plain ZFS snapshot only — today's original,
-	// pre-redesign behaviour. Cheaper (no extra clone dataset), but DeleteVolume
-	// blocks (requeues) while any dependent snapshot in this mode still exists,
-	// since there is no promote mechanism to fall back on.
-	SnapshotModeIntegrated ZfsSnapshotMode = "integrated"
-)
-
 // ZfsSnapshotSpec is the desired point-in-time snapshot of a source dataset/zvol
 // on the pool identified by PoolGUID. It is a separate lifecycle from ZfsDataset
 // (derive-from-source, read-only, restore/clone) — see design-decisions ADR-0006.
 // The agent on the node currently hosting the pool takes `<dataset>@<snapshotName>`.
+//
+// Every snapshot is taken the same way (ADR-0026): a raw ZFS snapshot plus an
+// owned backing-clone ZfsDataset, which makes the snapshot independent of its
+// source volume. The former `mode` field, which could select a plain-snapshot
+// variant instead, was removed — see snapshot-lifecycle-redesign.md §11.
 type ZfsSnapshotSpec struct {
 	// PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name without
 	// the "zpool-" prefix) that hosts the source dataset. The agent derives the
@@ -63,8 +49,8 @@ type ZfsSnapshotSpec struct {
 	//
 	// Nothing in the driver rewrites it after creation, but like the other
 	// location fields it is deliberately left mutable so it can be repointed by
-	// hand during a recovery. Contrast Mode and SourceType below, which select
-	// behaviour and are CEL-immutable. See api-conventions.md §5.
+	// hand during a recovery. Contrast SourceType below, which records what the
+	// source *was* and is CEL-immutable. See api-conventions.md §5.
 	// +kubebuilder:validation:MinLength=1
 	SnapshotName string `json:"snapshotName"`
 
@@ -90,9 +76,10 @@ type ZfsSnapshotSpec struct {
 	// SourceFSType is the filesystem the source volume was formatted with at
 	// snapshot creation time, copied from its Status.FSType. Like SourceType it
 	// exists so a restore can still be checked for compatibility (D10/D25) once
-	// the source ZfsDataset is gone — which, for standalone-mode snapshots, is
-	// the headline scenario rather than an edge case. Empty means the source had
-	// never been formatted (or predates this field), which imposes no constraint.
+	// the source ZfsDataset is gone — which, since a snapshot outlives its
+	// source volume by design, is the headline scenario rather than an edge
+	// case. Empty means the source had never been formatted (or predates this
+	// field), which imposes no constraint.
 	// +optional
 	SourceFSType string `json:"sourceFSType,omitempty"`
 
@@ -110,22 +97,6 @@ type ZfsSnapshotSpec struct {
 	// is no longer available.
 	// +optional
 	SourceProperties map[string]string `json:"sourceProperties,omitempty"`
-
-	// Mode selects standalone (Ceph-style, via zfs promote; new default) or
-	// integrated (today's original, plain-snapshot-only behaviour). Resolved at
-	// CreateSnapshot time from the VolumeSnapshotClass "mode" parameter with a
-	// chart-configured default (D8). Empty is treated as Integrated for
-	// backward compatibility with snapshots created before this field existed.
-	//
-	// Immutable once set (D24): Mode selects a teardown *mechanism*, so flipping
-	// it on a live object switches between the promote path and the blocking
-	// path against ZFS state built for the other one — orphaning the backing
-	// clone, its @restore-source, and anything restored from it. No repair
-	// scenario needs it. Contrast the location fields above, which are
-	// deliberately left mutable (api-conventions.md §5).
-	// +optional
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="mode is immutable"
-	Mode ZfsSnapshotMode `json:"mode,omitempty"`
 }
 
 // ZfsSnapshotStatus reports the observed snapshot state on the node.

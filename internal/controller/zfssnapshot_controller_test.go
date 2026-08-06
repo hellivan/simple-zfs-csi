@@ -44,37 +44,59 @@ func TestSnapshotFullName(t *testing.T) {
 	}
 }
 
+// TestZfsSnapshotReconcile_CreatesSnapshotAndSetsReady covers the create path's
+// bookkeeping — finalizer, raw snapshot, and the reported creation time and
+// restore size. The structural assertions about the backing clone itself live
+// in TestZfsSnapshotReconcile_StandaloneCreatesBackingCloneAndSelfSnapshot.
 func TestZfsSnapshotReconcile_CreatesSnapshotAndSetsReady(t *testing.T) {
 	scheme := newTestScheme(t)
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem,
+		},
+	}
 	snap := &storagev1alpha1.ZfsSnapshot{
 		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID:     "999",
 			Dataset:      "k8s/pvc-1",
-			SnapshotName: "snap-1",
+			SnapshotName: "csi-snap-1",
 			SourceVolume: "pvc-1",
+			SourceType:   storagev1alpha1.DatasetTypeFilesystem,
 		},
 	}
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(onlinePool(), snap).
-		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}).
+		WithObjects(onlinePool(), src, snap).
+		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS()
 	r := &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	dsR := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
+	backingReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-1"}}
 
-	// First pass installs the finalizer; second pass snapshots and reports Ready.
+	// Finalizer, then raw snapshot + backing-clone create.
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("reconcile 1: %v", err)
 	}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
+	// Drive the backing clone to Ready, then let the snapshot finish.
+	for i := 0; i < 2; i++ {
+		if _, err := dsR.Reconcile(context.Background(), backingReq); err != nil {
+			t.Fatalf("backing reconcile %d: %v", i+1, err)
+		}
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile 3: %v", err)
+	}
 
-	if len(z.createdDS) != 1 || z.createdDS[0] != "tank/k8s/pvc-1@snap-1" {
-		t.Fatalf("expected snapshot tank/k8s/pvc-1@snap-1, got %v", z.createdDS)
+	if len(z.createdDS) == 0 || z.createdDS[0] != "tank/k8s/pvc-1@csi-snap-1" {
+		t.Fatalf("expected raw snapshot tank/k8s/pvc-1@csi-snap-1 first, got %v", z.createdDS)
 	}
 
 	var got storagev1alpha1.ZfsSnapshot
@@ -216,7 +238,6 @@ func TestZfsSnapshotReconcile_StandaloneCreatesBackingCloneAndSelfSnapshot(t *te
 			SnapshotName: "csi-snap-abc",
 			SourceVolume: "pvc-src",
 			SourceType:   storagev1alpha1.DatasetTypeFilesystem,
-			Mode:         storagev1alpha1.SnapshotModeStandalone,
 		},
 	}
 	c := fake.NewClientBuilder().
@@ -314,7 +335,6 @@ func TestZfsSnapshotReconcile_StandaloneDeleteDelegatesToBackingClone(t *testing
 			Dataset:      "k8s/pvc-src",
 			SnapshotName: "csi-snap-abc",
 			SourceVolume: "pvc-src",
-			Mode:         storagev1alpha1.SnapshotModeStandalone,
 		},
 	}
 	backing := &storagev1alpha1.ZfsDataset{
@@ -406,7 +426,7 @@ func TestZfsSnapshotReconcile_StandaloneDeleteWithLiveRestore(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "snap-1", Finalizers: []string{zfsSnapshotFinalizer}, DeletionTimestamp: &now},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
 			PoolGUID: "999", Dataset: "k8s/pvc-a", SnapshotName: "csi-snap-x",
-			SourceVolume: "pvc-a", Mode: storagev1alpha1.SnapshotModeStandalone,
+			SourceVolume: "pvc-a",
 		},
 	}
 	backing := &storagev1alpha1.ZfsDataset{
@@ -508,7 +528,7 @@ func TestZfsSnapshotReconcile_ChainedBackingClonesRemainDeletable(t *testing.T) 
 			ObjectMeta: metav1.ObjectMeta{Name: "snap-" + n, Finalizers: []string{zfsSnapshotFinalizer}},
 			Spec: storagev1alpha1.ZfsSnapshotSpec{
 				PoolGUID: "999", Dataset: "k8s/vol1", SnapshotName: "csi-snap-" + n,
-				SourceVolume: "vol1", Mode: storagev1alpha1.SnapshotModeStandalone,
+				SourceVolume: "vol1",
 			},
 			Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 		}

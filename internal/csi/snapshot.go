@@ -41,8 +41,7 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		return nil, status.Errorf(codes.Internal, "get source ZfsDataset %q: %v", sourceID, err)
 	}
 
-	mode, err := c.resolveSnapshotMode(req.GetParameters())
-	if err != nil {
+	if err := rejectRemovedModeParam(req.GetParameters()); err != nil {
 		return nil, err
 	}
 
@@ -56,11 +55,11 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 		SnapshotName: "csi-snap-" + uuid.New().String(),
 		SourceVolume: sourceID,
 		SourceType:   src.Spec.Type,
-		Mode:         mode,
 	}
 	// D25: capture the source's structural properties now, so a later restore can
 	// still be checked for compatibility (D10) once the source volume is gone —
-	// which for standalone-mode snapshots is the whole point of the mode.
+	// which, since every snapshot is backed by its own clone, is the headline
+	// scenario rather than an edge case.
 	desired.SourceFSType = src.Status.FSType
 	if src.Spec.Volume != nil {
 		desired.SourceVolblocksize = src.Spec.Volume.Volblocksize
@@ -179,47 +178,34 @@ func (c *ControllerServer) ensureSnapshot(ctx context.Context, name string, desi
 		if existing.Spec.PoolGUID != desired.PoolGUID ||
 			existing.Spec.Dataset != desired.Dataset ||
 			existing.Spec.SourceVolume != desired.SourceVolume ||
-			existing.Spec.SourceType != desired.SourceType ||
-			effectiveMode(existing.Spec) != effectiveMode(desired) {
+			existing.Spec.SourceType != desired.SourceType {
 			return storagev1alpha1.ZfsSnapshotSpec{}, status.Errorf(codes.AlreadyExists, "snapshot %q already exists for a different source", name)
 		}
 		return existing.Spec, nil
 	}
 }
 
-// snapshotModeParam is the VolumeSnapshotClass parameter selecting
-// ZfsSnapshotSpec.Mode (D8, snapshot-lifecycle-redesign.md).
+// snapshotModeParam was the VolumeSnapshotClass parameter that used to select
+// between the "standalone" and "integrated" snapshot mechanisms.
 const snapshotModeParam = "mode"
 
-// resolveSnapshotMode resolves the effective Mode for a new snapshot: the
-// VolumeSnapshotClass "mode" parameter if set, else the chart-configured
-// DefaultSnapshotMode, else SnapshotModeStandalone.
-func (c *ControllerServer) resolveSnapshotMode(params map[string]string) (storagev1alpha1.ZfsSnapshotMode, error) {
+// rejectRemovedModeParam fails a CreateSnapshot whose VolumeSnapshotClass still
+// carries the removed `mode` parameter with anything but the surviving value.
+//
+// Only one mechanism exists now (snapshot-lifecycle-redesign.md §11): every
+// snapshot gets a backing clone. Silently ignoring a leftover `mode: integrated`
+// would change a class's meaning without telling anyone, so it is rejected with
+// an actionable message instead. `mode: standalone` is accepted as a no-op so
+// existing classes that named the surviving behaviour keep working.
+func rejectRemovedModeParam(params map[string]string) error {
 	raw := strings.TrimSpace(params[snapshotModeParam])
-	if raw == "" {
-		raw = string(c.DefaultSnapshotMode)
+	if raw == "" || raw == "standalone" {
+		return nil
 	}
-	if raw == "" {
-		raw = string(storagev1alpha1.SnapshotModeStandalone)
-	}
-	mode := storagev1alpha1.ZfsSnapshotMode(raw)
-	switch mode {
-	case storagev1alpha1.SnapshotModeStandalone, storagev1alpha1.SnapshotModeIntegrated:
-		return mode, nil
-	default:
-		return "", status.Errorf(codes.InvalidArgument, "parameter %q must be %q or %q, got %q",
-			snapshotModeParam, storagev1alpha1.SnapshotModeStandalone, storagev1alpha1.SnapshotModeIntegrated, raw)
-	}
-}
-
-// effectiveMode normalises an empty Mode (snapshots created before Mode
-// existed) to Integrated for comparison purposes — today's original,
-// pre-redesign behaviour.
-func effectiveMode(spec storagev1alpha1.ZfsSnapshotSpec) storagev1alpha1.ZfsSnapshotMode {
-	if spec.Mode == "" {
-		return storagev1alpha1.SnapshotModeIntegrated
-	}
-	return spec.Mode
+	return status.Errorf(codes.InvalidArgument,
+		"VolumeSnapshotClass parameter %q=%q is no longer supported: snapshot modes were removed and every "+
+			"snapshot is now backed by its own clone; drop the parameter from the VolumeSnapshotClass",
+		snapshotModeParam, raw)
 }
 
 // checkBackingCloneUsable rejects a restore whose standalone-mode backing clone

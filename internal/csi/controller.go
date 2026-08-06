@@ -52,12 +52,7 @@ type ControllerServer struct {
 	CreateTimeout time.Duration
 	// PollInterval is how often the readiness wait re-reads the ZfsDataset.
 	PollInterval time.Duration
-	// DefaultSnapshotMode is CreateSnapshot's fallback ZfsSnapshotSpec.Mode
-	// (docs/snapshot-lifecycle-redesign.md, D8) when the VolumeSnapshotClass
-	// carries no "mode" parameter. Empty defaults to
-	// storagev1alpha1.SnapshotModeStandalone.
-	DefaultSnapshotMode storagev1alpha1.ZfsSnapshotMode
-	Log                 logr.Logger
+	Log          logr.Logger
 }
 
 // CreateVolume provisions a ZfsDataset (the export stays lazy until attach) and

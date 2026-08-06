@@ -34,14 +34,13 @@ func init() {
 
 func main() {
 	var (
-		endpoint            string
-		driverName          string
-		namespace           string
-		defaultsConfigMap   string
-		annotationPrefix    string
-		createTimeout       time.Duration
-		pollInterval        time.Duration
-		defaultSnapshotMode string
+		endpoint          string
+		driverName        string
+		namespace         string
+		defaultsConfigMap string
+		annotationPrefix  string
+		createTimeout     time.Duration
+		pollInterval      time.Duration
 	)
 	flag.StringVar(&endpoint, "endpoint", "unix:///csi/csi.sock", "CSI gRPC endpoint the plugin listens on.")
 	flag.StringVar(&driverName, "driver-name", "simple-zfs-csi.io", "CSI driver name; must match the CSIDriver object and StorageClass provisioner.")
@@ -50,7 +49,6 @@ func main() {
 	flag.StringVar(&annotationPrefix, "pvc-annotation-prefix", "param.simple-zfs-csi.io/", "PVC annotation prefix whose keys override parameters (empty disables the PVC layer).")
 	flag.DurationVar(&createTimeout, "create-timeout", 2*time.Minute, "How long CreateVolume waits for a ZfsDataset to become Ready.")
 	flag.DurationVar(&pollInterval, "poll-interval", 2*time.Second, "How often CreateVolume re-reads a ZfsDataset while waiting for Ready.")
-	flag.StringVar(&defaultSnapshotMode, "default-snapshot-mode", "standalone", "Fallback ZfsSnapshot mode (\"standalone\" or \"integrated\") when a VolumeSnapshotClass carries no \"mode\" parameter; see docs/snapshot-lifecycle-redesign.md.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -86,14 +84,13 @@ func main() {
 		},
 	}
 	cs := &zfscsi.ControllerServer{
-		Client:              cl,
-		DefaultsConfigMap:   defaultsConfigMap,
-		DefaultsNamespace:   namespace,
-		AnnotationPrefix:    annotationPrefix,
-		CreateTimeout:       createTimeout,
-		PollInterval:        pollInterval,
-		DefaultSnapshotMode: storagev1alpha1.ZfsSnapshotMode(defaultSnapshotMode),
-		Log:                 ctrl.Log.WithName("controller"),
+		Client:            cl,
+		DefaultsConfigMap: defaultsConfigMap,
+		DefaultsNamespace: namespace,
+		AnnotationPrefix:  annotationPrefix,
+		CreateTimeout:     createTimeout,
+		PollInterval:      pollInterval,
+		Log:               ctrl.Log.WithName("controller"),
 	}
 
 	setupLog.Info("starting CSI controller", "driver", driverName, "endpoint", endpoint, "version", version)
