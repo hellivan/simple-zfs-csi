@@ -17,7 +17,7 @@ import (
 
 // restoreSourceSnapshotName mirrors internal/controller's constant of the same
 // name (D5, snapshot-lifecycle-redesign.md): the fixed, CSI-invisible
-// self-snapshot every standalone-mode backing-clone ZfsDataset carries.
+// self-snapshot every backing-clone ZfsDataset carries.
 // Restores always clone from this, never from the raw origin snapshot.
 const restoreSourceSnapshotName = "restore-source"
 
@@ -242,14 +242,14 @@ func checkCloneCompatibility(rp *ResolvedParams, src *storagev1alpha1.ZfsDataset
 // volume and falls back to the structural properties captured on the
 // ZfsSnapshot at creation time (D25) when it is gone.
 //
-// That fallback is the important half: for a standalone-mode snapshot the
+// That fallback is the important half: for a snapshot the
 // source outliving the snapshot is the exception, not the rule, so looking the
 // source up live and returning "compatible" when absent left D10's checks dead
 // exactly where they matter. A mismatched fsType then surfaced much later as a
 // NodeStageVolume failure, and a mismatched volblocksize was ignored entirely
 // and silently (clone() never passes it, so ZFS raises nothing either).
 //
-// Deliberately does not use the standalone-mode backing clone as the comparison
+// Deliberately does not use the backing clone as the comparison
 // source: a backing clone is never mounted (canmount=off/volmode=none), so its
 // own Status.FSType would always be empty regardless of what the real source
 // was formatted as.

@@ -208,7 +208,7 @@ func rejectRemovedModeParam(params map[string]string) error {
 		snapshotModeParam, raw)
 }
 
-// checkBackingCloneUsable rejects a restore whose standalone-mode backing clone
+// checkBackingCloneUsable rejects a restore whose backing clone
 // is already being torn down.
 //
 // This previously also registered a "restored-by.<pvcName>" finalizer on that

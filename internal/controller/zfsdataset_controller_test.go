@@ -987,11 +987,11 @@ func TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader(t *testing.T) {
 	}
 }
 
-// TestZfsDatasetReconcile_DeletePromotesStandaloneBackingCloneAndSucceeds
-// verifies D0/D3/D11: a Ready standalone-mode dependent's backing clone is
+// TestZfsDatasetReconcile_DeletePromotesBackingCloneAndSucceeds
+// verifies D0/D3/D11: a Ready dependent's backing clone is
 // promoted away (never blocked on), after which the source volume's own
 // (non-recursive) destroy succeeds.
-func TestZfsDatasetReconcile_DeletePromotesStandaloneBackingCloneAndSucceeds(t *testing.T) {
+func TestZfsDatasetReconcile_DeletePromotesBackingCloneAndSucceeds(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
 	vol := &storagev1alpha1.ZfsDataset{
@@ -1074,7 +1074,7 @@ func TestZfsDatasetReconcile_DeletePromotesDirectCloneDependents(t *testing.T) {
 }
 
 // TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents verifies
-// D17 for the §2.9 case: deleting a standalone-mode backing clone with two
+// D17 for the §2.9 case: deleting a backing clone with two
 // simultaneous restored-PVC dependents succeeds. Promoting *one* of them
 // detaches the snapshot from both, because ZFS re-parents the sibling onto the
 // promoted clone in the same operation — so a single promote is enough, and

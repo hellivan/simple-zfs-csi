@@ -39,7 +39,7 @@ import (
 // derived bookkeeping.
 
 // restoreSourceSnapshotName is the fixed, CSI-invisible self-snapshot name (D5)
-// taken on every standalone-mode backing-clone ZfsDataset (D15) immediately
+// taken on every backing-clone ZfsDataset (D15) immediately
 // after it is created. Restores always clone from
 // "<backing-clone-dataset>@restore-source", never from the raw origin snapshot
 // directly, so restores keep working whether the true source volume is still
@@ -56,7 +56,7 @@ const maxDetachRounds = 100
 // driverSnapshotSuffix matches the snapshot short names (the part after "@")
 // this driver creates, and only those:
 //
-//   - "restore-source" — a standalone backing clone's self-snapshot (D5);
+//   - "restore-source" — a backing clone's self-snapshot (D5);
 //   - "clone-<16 hex>" — the ephemeral intermediate snapshot ADR-0009's direct
 //     PVC-to-PVC clone path takes (see cloneSnapshotSuffix);
 //   - "csi-snap-<uuid>" — a CSI-visible raw snapshot
@@ -87,7 +87,7 @@ func datasetPathOf(poolName, full string) string {
 }
 
 // sourceDependsOn reports whether dep's clone source lives on the dataset at
-// datasetPath — either a snapshot of it (restore, or a standalone backing
+// datasetPath — either a snapshot of it (a restore, or a snapshot's backing
 // clone) or the dataset itself (direct PVC-to-PVC clone, ADR-0009).
 func sourceDependsOn(dep *storagev1alpha1.ZfsDataset, datasetPath string) bool {
 	src := dep.Spec.Source
@@ -153,7 +153,7 @@ func (r *ZfsDatasetReconciler) checkSnapshotDependents(ctx context.Context, vol 
 	return nil
 }
 
-// checkOwningSnapshotLive refuses to destroy a standalone-mode backing clone
+// checkOwningSnapshotLive refuses to destroy a backing clone
 // while the ZfsSnapshot that owns it is still live (F7).
 //
 // The only sanctioned ways a backing clone is deleted are garbage collection

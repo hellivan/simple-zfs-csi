@@ -47,7 +47,7 @@ func TestSnapshotFullName(t *testing.T) {
 // TestZfsSnapshotReconcile_CreatesSnapshotAndSetsReady covers the create path's
 // bookkeeping — finalizer, raw snapshot, and the reported creation time and
 // restore size. The structural assertions about the backing clone itself live
-// in TestZfsSnapshotReconcile_StandaloneCreatesBackingCloneAndSelfSnapshot.
+// in TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot.
 func TestZfsSnapshotReconcile_CreatesSnapshotAndSetsReady(t *testing.T) {
 	scheme := newTestScheme(t)
 	src := &storagev1alpha1.ZfsDataset{
@@ -215,12 +215,12 @@ func TestZfsSnapshotReconcile_FollowsRenamedSourceDataset(t *testing.T) {
 	}
 }
 
-// TestZfsSnapshotReconcile_StandaloneCreatesBackingCloneAndSelfSnapshot drives
+// TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot drives
 // both ZfsSnapshotReconciler and ZfsDatasetReconciler (as they'd run
-// concurrently in the real DaemonSet) through a full standalone-mode create
+// concurrently in the real DaemonSet) through a full create
 // (D15): raw snapshot -> owned backing-clone ZfsDataset -> that dataset
 // becomes Ready -> "@restore-source" self-snapshot -> ZfsSnapshot Ready.
-func TestZfsSnapshotReconcile_StandaloneCreatesBackingCloneAndSelfSnapshot(t *testing.T) {
+func TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot(t *testing.T) {
 	scheme := newTestScheme(t)
 	src := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src"},
@@ -316,12 +316,12 @@ func TestZfsSnapshotReconcile_StandaloneCreatesBackingCloneAndSelfSnapshot(t *te
 	}
 }
 
-// TestZfsSnapshotReconcile_StandaloneDeleteDelegatesToBackingClone verifies
-// D15's delete path: deleting a standalone-mode ZfsSnapshot deletes its owned
+// TestZfsSnapshotReconcile_DeleteDelegatesToBackingClone verifies
+// D15's delete path: deleting a ZfsSnapshot deletes its owned
 // backing-clone ZfsDataset and waits (polling) for ZfsDatasetReconciler to
 // fully remove it before doing the required raw-origin-snapshot cleanup and
 // releasing its own finalizer.
-func TestZfsSnapshotReconcile_StandaloneDeleteDelegatesToBackingClone(t *testing.T) {
+func TestZfsSnapshotReconcile_DeleteDelegatesToBackingClone(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
 	snap := &storagev1alpha1.ZfsSnapshot{
@@ -402,7 +402,7 @@ func TestZfsSnapshotReconcile_StandaloneDeleteDelegatesToBackingClone(t *testing
 	}
 }
 
-// TestZfsSnapshotReconcile_StandaloneDeleteWithLiveRestore is the F2b
+// TestZfsSnapshotReconcile_DeleteWithLiveRestore is the F2b
 // regression. Deleting a snapshot that a live restored PVC was created from
 // promotes that PVC while the backing clone is torn down, which leaves it a
 // clone of the *raw* origin snapshot on the still-live source volume. ZFS then
@@ -413,7 +413,7 @@ func TestZfsSnapshotReconcile_StandaloneDeleteDelegatesToBackingClone(t *testing
 //
 // D19 promotes the raw snapshot's remaining clones away first, which relocates
 // it onto the dependent and turns the destroy into a NotExist no-op.
-func TestZfsSnapshotReconcile_StandaloneDeleteWithLiveRestore(t *testing.T) {
+func TestZfsSnapshotReconcile_DeleteWithLiveRestore(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
 	ctx := context.Background()
@@ -508,7 +508,7 @@ func TestZfsSnapshotReconcile_StandaloneDeleteWithLiveRestore(t *testing.T) {
 
 // TestZfsSnapshotReconcile_ChainedBackingClonesRemainDeletable is the F2d
 // regression, the case this project's own live-pool run documented without
-// noticing. After DeleteVolume on a source with several standalone snapshots,
+// noticing. After DeleteVolume on a source with several snapshots,
 // the backing clones end up chained to one another — each owning a real
 // snapshot that the next one clones — and none of it was ever tracked. Deleting
 // the first snapshot then failed on "snapshot has dependent clones" forever.

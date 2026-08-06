@@ -108,8 +108,9 @@ unnoticed: D15 gave `ZfsSnapshotReconciler` a new job (authoring backing-clone
 `ZfsDataset` objects, ADR-0020/D26), the discovery ClusterRole was never given
 `create`/`delete` to match, and because the reconciler also carried no
 `zfsdatasets` marker at all, regenerating manifests would not have surfaced the
-gap either. The result was that `standalone` — the default snapshot mode — could
-neither create nor delete a snapshot on a fresh install.
+gap either. The result was that the backing-clone snapshot mechanism — then the
+default `standalone` mode, now the only one (ADR-0027) — could neither create nor
+delete a snapshot on a fresh install.
 
 **Candidate approach, cheapest first:**
 - A test that renders the chart and asserts each reconciler's declared marker

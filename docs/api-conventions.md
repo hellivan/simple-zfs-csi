@@ -117,10 +117,10 @@ family.
 
 Mark a field immutable (`+kubebuilder:validation:XValidation:rule="self == oldSelf"`)
 only when changing it would silently reinterpret state that already exists on
-disk. Fields that *select a mechanism* qualify: `ZfsSnapshot.spec.mode` switches
-teardown semantics between the promote path and the blocking path, so flipping it
-on a live object orphans a backing clone and everything cloned from it. So does
-`spec.sourceType`. Neither has a repair use.
+disk. Fields that *describe what something already is* qualify:
+`ZfsSnapshot.spec.sourceType` records the source's type at snapshot time, so
+changing it could only ever make a restore-compatibility check lie. It has no
+repair use.
 
 Fields that *name a location* are deliberately left **mutable**, even where a
 doc comment calls them immutable: `ZfsDataset.spec.dataset`,
@@ -136,6 +136,14 @@ The general test is therefore *not* "does anything write this after creation?"
 pointer someone may legitimately need to re-aim?"** Freeze the first, leave the
 second open. See
 [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) D24.
+
+> **Historical note.** This section's original worked example was
+> `ZfsSnapshot.spec.mode`, a field that *selected a mechanism* — it switched
+> teardown semantics between the promote path and a blocking path, so flipping it
+> on a live object orphaned a backing clone and everything cloned from it. That
+> field was removed with the mode concept itself (ADR-0027), which leaves
+> `sourceType` as the only immutable spec field. The "selects a mechanism"
+> category is still the right test; there is simply no instance of it today.
 
 ## Current CRD shapes
 

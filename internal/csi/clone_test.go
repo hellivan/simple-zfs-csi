@@ -68,9 +68,8 @@ func TestCreateVolume_RestoreFromSnapshot(t *testing.T) {
 
 // TestCreateVolume_RestorePropertyMismatchRejected verifies D10 on the
 // restore-from-snapshot path: the source volume is looked up live via
-// ZfsSnapshot.Spec.SourceVolume (works for both standalone and integrated
-// mode, since a standalone-mode backing clone is never mounted and so never
-// has a useful Status.FSType of its own).
+// ZfsSnapshot.Spec.SourceVolume rather than through the backing clone, which is
+// never mounted and so never has a useful Status.FSType of its own.
 func TestCreateVolume_RestorePropertyMismatchRejected(t *testing.T) {
 	src := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src"},
@@ -270,11 +269,11 @@ func TestCreateVolume_RestoreTypeMismatchRejectedAfterSourceDeleted(t *testing.T
 	}
 }
 
-// TestCreateVolume_RestoreFromStandaloneSnapshot verifies D0/D15: a
-// standalone-mode snapshot's restore clones from its backing clone's
+// TestCreateVolume_RestoreClonesFromBackingClone verifies D0/D15: a
+// snapshot's restore clones from its backing clone's
 // "@restore-source" self-snapshot, never the raw origin snapshot, and records
 // no dependency bookkeeping on that backing clone (D17).
-func TestCreateVolume_RestoreFromStandaloneSnapshot(t *testing.T) {
+func TestCreateVolume_RestoreClonesFromBackingClone(t *testing.T) {
 	snap := &storagev1alpha1.ZfsSnapshot{
 		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
@@ -328,7 +327,7 @@ func TestCreateVolume_RestoreFromStandaloneSnapshot(t *testing.T) {
 }
 
 // TestCreateVolume_RestoreCrossPrefixRejected verifies D6: restoring into a
-// different datasetPrefix than the standalone-mode backing clone's own prefix
+// different datasetPrefix than the backing clone's own prefix
 // is rejected outright (would break zfs send -R backup replication, §2.5).
 func TestCreateVolume_RestoreCrossPrefixRejected(t *testing.T) {
 	snap := &storagev1alpha1.ZfsSnapshot{
@@ -386,7 +385,7 @@ func TestCreateVolume_CloneCrossPrefixRejected(t *testing.T) {
 }
 
 // TestCreateVolume_RestoreChecksCapturedSourceFSType verifies D25/F12: with the
-// source volume deleted — the headline scenario for a standalone snapshot — the
+// source volume deleted — the headline scenario for a snapshot — the
 // D10 fsType check must still fire, using what CreateSnapshot captured on the
 // ZfsSnapshot rather than a live lookup that returns nothing.
 func TestCreateVolume_RestoreChecksCapturedSourceFSType(t *testing.T) {

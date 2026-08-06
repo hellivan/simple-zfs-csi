@@ -83,11 +83,12 @@ no-op so classes that named the surviving behaviour keep working.
 - Restores are unconditionally promote-safe.
 - Six mode branches, one API enum, one CEL immutability rule, one flag and one
   chart value are gone; the delete-path test matrix halves.
-- **Migration: none required.** D8 records that `standalone` was made the default
-  because the target cluster had no existing snapshots, and that cluster still has
-  no `snapshot.storage.k8s.io` CRDs, so no `ZfsSnapshot` can have been created
-  through the CSI path. Any pre-existing object would simply lose a pruned field
-  and be treated as `standalone`.
+- **Migration: none required, verified.** `kubectl get zfssnapshots -A` on the
+  target cluster returns `No resources found`, and `volumesnapshotclasses` is not
+  a known resource type there at all — so no `ZfsSnapshot` exists and none could
+  have been created through the CSI path. This confirms rather than assumes D8's
+  reasoning. Any pre-existing object would in any case simply lose `spec.mode` to
+  CRD pruning and be reconciled as before.
 - **Accepted cost:** one `csi-snap-*` sibling dataset per live snapshot, which is
   more `zfs list` noise and more surface inside a `zfs send -R` subtree than
   `integrated` produced. §2.5's flat-sibling placement keeps `send -R` correct and

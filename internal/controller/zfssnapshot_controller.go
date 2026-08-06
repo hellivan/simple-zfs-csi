@@ -69,11 +69,11 @@ func (r *ZfsSnapshotReconciler) gateReader() client.Reader {
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots/status,verbs=get;update;patch
-// Standalone mode (D15) provisions the backing clone as a real, owned child
-// ZfsDataset object, so this reconciler — unlike ZfsDatasetReconciler, which
-// only ever fulfils objects the csi-controller authored — creates and deletes
-// ZfsDataset objects itself (D26). The finalizers rule covers the backing
-// clone's ownerReference, which sets blockOwnerDeletion: true.
+// Every snapshot is backed by a real, owned child ZfsDataset (D15), so this
+// reconciler — unlike ZfsDatasetReconciler, which only ever fulfils objects the
+// csi-controller authored — creates and deletes ZfsDataset objects itself (D26).
+// The finalizers rule covers the backing clone's ownerReference, which sets
+// blockOwnerDeletion: true.
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots/finalizers,verbs=update
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools,verbs=get;list;watch
@@ -155,7 +155,7 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Provision/await the owned backing-clone ZfsDataset, then take its
 	// "@restore-source" self-snapshot (D5) — restores always clone from that,
 	// never from the raw snapshot above directly (D0/§3.1).
-	return r.reconcileStandaloneCreate(ctx, &snap, &pool, datasetPath, full)
+	return r.reconcileBackingClone(ctx, &snap, &pool, datasetPath, full)
 }
 
 // releaseSnapshotFinalizer removes the agent finalizer, allowing deletion. It
@@ -191,9 +191,9 @@ func (r *ZfsSnapshotReconciler) releaseSnapshotFinalizer(ctx context.Context, sn
 // Trusting the copy is the same mistake as trusting the CSI volume_context
 // (ADR-0022), one layer down.
 //
-// Standalone snapshots deliberately outlive their source (D15), so the recorded
-// copy remains the fallback for when SourceVolume is unset (snapshots predating
-// that field) or the source object is already gone.
+// Snapshots deliberately outlive their source (D15), so the recorded copy
+// remains the fallback for when SourceVolume is unset (snapshots predating that
+// field) or the source object is already gone.
 func (r *ZfsSnapshotReconciler) sourceDatasetPath(ctx context.Context, reader client.Reader, snap *storagev1alpha1.ZfsSnapshot) (string, error) {
 	if snap.Spec.SourceVolume == "" {
 		return snap.Spec.Dataset, nil
@@ -272,15 +272,15 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	return ctrl.Result{}, r.releaseSnapshotFinalizer(ctx, snap)
 }
 
-// reconcileStandaloneCreate provisions (D15) the owned backing-clone ZfsDataset
-// for a standalone-mode snapshot — a flat sibling of the source dataset named
+// reconcileBackingClone provisions (D15) the owned backing-clone ZfsDataset
+// for a snapshot — a flat sibling of the source dataset named
 // after Spec.SnapshotName (already an independent, opaque identifier per
 // independent-resource-naming-redesign.md, so it needs no extra prefixing here,
 // D1/D1a) — waits for it to become Ready, then takes its fixed-name
 // "@restore-source" self-snapshot (D5). Restores always clone from that, never
 // from the raw snapshot directly (D0/§3.1), so they keep working regardless of
 // what later happens to the true source volume.
-func (r *ZfsSnapshotReconciler) reconcileStandaloneCreate(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool, datasetPath, rawFull string) (ctrl.Result, error) {
+func (r *ZfsSnapshotReconciler) reconcileBackingClone(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool, datasetPath, rawFull string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	backingName := snap.Spec.SnapshotName
@@ -345,11 +345,11 @@ func (r *ZfsSnapshotReconciler) reconcileStandaloneCreate(ctx context.Context, s
 	creation := snapshotCreationTime(ctx, r.ZFS, restoreSourceFull)
 	restore := snapshotRestoreSize(ctx, r.ZFS, restoreSourceFull)
 	return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseReady, true, creation, restore,
-		"Ready", fmt.Sprintf("snapshot %s ready on %s (standalone, backing clone %s)", rawFull, r.NodeName, backingFull))
+		"Ready", fmt.Sprintf("snapshot %s ready on %s (backing clone %s)", rawFull, r.NodeName, backingFull))
 }
 
 // backingCloneProperties suppresses auto-mounting/block-device exposure for a
-// standalone-mode backing clone (§2.8): it's never CSI-visible/mountable, so
+// backing clone (§2.8): it's never CSI-visible/mountable, so
 // there's no reason for the agent to mount it (filesystem) or expose a device
 // node for it (zvol).
 func backingCloneProperties(t storagev1alpha1.DatasetType) map[string]string {

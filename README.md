@@ -96,7 +96,7 @@ Status writes are exempt: every component reports `status` on the objects it
 acts on. The rule is about `spec`/lifecycle authorship.
 
 > **One exception exists today and is being removed.** `ZfsSnapshotReconciler`
-> (node tier) authors the backing-clone `ZfsDataset` for `standalone` snapshots.
+> (node tier) authors the backing-clone `ZfsDataset` that every snapshot owns.
 > That is a layering violation, it is what forced `create`/`delete` on
 > `zfsdatasets` into the discovery role, and it directly produced a blocker-level
 > RBAC defect. It moves to the operator — see D27 in

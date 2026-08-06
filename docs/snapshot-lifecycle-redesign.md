@@ -26,6 +26,15 @@ loud on misconfiguration" precedent. Fixed to fail loudly instead — see §2.7 
 > since been removed. §4's decision log (D17–D26) and §9 are authoritative for current
 > behaviour.
 >
+> ### ⚠️ Also superseded — there is only one snapshot mechanism now
+>
+> Everything below that presents `standalone` and `integrated` as a *choice* (D8, D14,
+> §3.1/§3.2, the `mode` parameter) is historical. **`integrated` was removed on
+> 2026-08-06** — see §11 and [ADR-0027](design-decisions.md). Every snapshot now takes
+> what §3.1 calls the standalone path: a raw snapshot plus an owned backing clone. Read
+> any "in standalone mode…" below as simply "…", and any "in integrated mode…" as a
+> description of code that no longer exists.
+>
 > The delete path is verified against a real pool:
 > [delete-path-verification-2026-08-03.md](delete-path-verification-2026-08-03.md).
 
