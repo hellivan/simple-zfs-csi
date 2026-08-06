@@ -282,6 +282,41 @@ func (f *fakeZFS) ListSnapshots(_ context.Context, dataset string) ([]string, er
 	return out, nil
 }
 
+// FindSnapshot locates a snapshot by short name anywhere in the fake pool,
+// mirroring `zfs list -t snapshot -r <pool>` filtered on the part after "@".
+// It walks the same snapshots map the promote model rewrites, so a relocated
+// snapshot is found at its new home exactly as it would be on a real pool.
+func (f *fakeZFS) FindSnapshot(_ context.Context, pool, suffix string) (string, error) {
+	if pool == "" {
+		return "", fmt.Errorf("pool name is empty")
+	}
+	if suffix == "" {
+		return "", fmt.Errorf("snapshot name is empty")
+	}
+	var found []string
+	for dataset, snaps := range f.snapshots {
+		if dataset != pool && !strings.HasPrefix(dataset, pool+"/") {
+			continue
+		}
+		for _, s := range snaps {
+			if s == suffix {
+				found = append(found, dataset+"@"+s)
+			}
+		}
+	}
+	if len(found) == 0 {
+		return "", nil
+	}
+	// Driver snapshot names are UUIDs and a promote moves rather than copies, so
+	// more than one hit means the model itself is wrong — fail loudly instead of
+	// picking one and hiding it.
+	if len(found) > 1 {
+		sort.Strings(found)
+		return "", fmt.Errorf("fakeZFS: snapshot %q exists in %d places: %v", suffix, len(found), found)
+	}
+	return found[0], nil
+}
+
 // Clones returns the datasets that currently clone snapshot, mirroring the ZFS
 // `clones` property. Sorted so the delete path's "promote the first one" choice
 // is deterministic in tests.

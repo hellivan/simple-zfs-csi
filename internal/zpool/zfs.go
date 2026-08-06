@@ -78,6 +78,19 @@ type ZFS interface {
 	// the delete path treats as the single source of truth for what depends on
 	// what (D17) rather than replaying bookkeeping held in Kubernetes.
 	Clones(ctx context.Context, snapshot string) ([]string, error)
+	// FindSnapshot returns the full ZFS name of the snapshot anywhere on pool
+	// whose short name (the part after "@") equals suffix, or "" when no such
+	// snapshot exists.
+	//
+	// It exists because `zfs promote` relocates snapshots between datasets, so
+	// the address a ZfsSnapshot recorded when it was taken is not necessarily
+	// where the snapshot lives when it is deleted. Asking ZFS where it actually
+	// is completes ADR-0020's rule for the one address the driver still mirrored.
+	//
+	// The answer is unambiguous because driver snapshot short names are
+	// `csi-snap-<uuid>` (independent-resource-naming-redesign.md) and a promote
+	// *moves* a snapshot rather than copying it, so at most one match can exist.
+	FindSnapshot(ctx context.Context, pool, suffix string) (string, error)
 	// Get returns a single ZFS property value. It wraps ErrNotExist when the
 	// object does not exist.
 	Get(ctx context.Context, name, property string) (string, error)
@@ -266,6 +279,50 @@ func (z *CLI) ListSnapshots(ctx context.Context, dataset string) ([]string, erro
 		}
 	}
 	return snaps, nil
+}
+
+// FindSnapshot locates a snapshot by its short name anywhere on pool, returning
+// the full ZFS name or "" when it does not exist.
+//
+// `zfs promote` relocates the origin snapshot — and every snapshot older than it
+// — onto the promoted clone, so the address recorded on a ZfsSnapshot when the
+// snapshot was taken is not necessarily where it lives when it is deleted.
+// Deriving the location from ZFS instead of trusting that record is ADR-0020's
+// rule applied to the last address the driver still mirrored.
+//
+// At most one snapshot can match: driver short names are `csi-snap-<uuid>` and a
+// promote moves a snapshot rather than copying it. Matching is on the part after
+// "@", so a backing clone's own `<...>/csi-snap-<uuid>@restore-source` is
+// correctly not mistaken for the raw snapshot `csi-snap-<uuid>`.
+//
+// Possible optimisation, deliberately not taken yet: a relocated snapshot can
+// only land on a dataset in its own clone lineage, and cross-prefix restores are
+// rejected (D6), so `-r <pool>/<prefix>` would be provably sufficient and would
+// bound the listing to the driver's own subtree. Kept pool-wide because that is
+// unconditionally correct and runs once per snapshot deletion rather than in a
+// loop; narrow it if it ever shows up in profiling on a pool with a large
+// snapshot history.
+func (z *CLI) FindSnapshot(ctx context.Context, pool, suffix string) (string, error) {
+	if pool == "" {
+		return "", fmt.Errorf("pool name is empty")
+	}
+	if suffix == "" {
+		return "", fmt.Errorf("snapshot name is empty")
+	}
+	out, err := z.run(ctx, "list", "-H", "-o", "name", "-t", "snapshot", "-r", pool)
+	if err != nil {
+		if isNotExist(err) {
+			return "", nil // pool itself is gone; nothing to find
+		}
+		return "", err
+	}
+	want := "@" + suffix
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line = strings.TrimSpace(line); strings.HasSuffix(line, want) {
+			return line, nil
+		}
+	}
+	return "", nil
 }
 
 // Clones returns the direct clones of snapshot via the ZFS `clones` property,

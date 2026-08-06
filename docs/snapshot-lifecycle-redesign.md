@@ -1673,42 +1673,103 @@ and `mode` parameter, treat empty `Mode` as `standalone`, delete the second clau
 `checkSnapshotDependents`, collapse the branches in `reconcile`/`reconcileDelete`/
 `resolveContentSource`, and drop `defaultSnapshotMode` from the chart.
 
-## 12. New finding (2026-08-06) — promote relocation orphans `ZfsSnapshot` bookkeeping
+## 12. RESOLVED (2026-08-06) — a promote can move a snapshot out from under its `ZfsSnapshot`
 
-**This is independent of §11 and affects `standalone` too.** It was found while testing
-§11.1's second point, and the same executed scenario demonstrates it in both modes.
+> **Fixed by [ADR-0028](design-decisions.md).** `reconcileDelete` no longer trusts the
+> address recorded on the object: it asks ZFS where the snapshot actually is
+> (`ZFS.FindSnapshot`, a pool-wide search matched on the part after `@`) and destroys it
+> there. Because driver snapshot short names are `csi-snap-<uuid>` and a promote *moves*
+> rather than copies, at most one match can exist, so the answer is unambiguous.
+> Regression test: `TestZfsSnapshotReconcile_DestroysRelocatedRawSnapshot`, confirmed to
+> fail without the fix.
+>
+> The analysis below is kept as the record of how the defect was measured and why the
+> other two options were rejected.
 
-`ZfsSnapshot.Spec.Dataset` records where the raw snapshot was taken. A promote can move
-that snapshot to a different dataset, and nothing updates the record. Concretely, after
-the relocation shown above:
+**Status:** re-verified against the current, mode-free code on 2026-08-06 (after
+ADR-0027). Independent of §11: removing `integrated` did not fix it, and could not
+have, because it is not about modes.
+
+### 12.1 What it is
+
+`ZfsSnapshot.Spec.Dataset` + `.SnapshotName` together form a **recorded address**
+for the raw ZFS snapshot: `<dataset>@<snapshotName>`. `zfs promote` moves snapshots
+between datasets. The record does not follow.
+
+This is the same anti-pattern [ADR-0020](design-decisions.md) was written to
+eliminate, and the same class as [known-pitfalls.md](known-pitfalls.md) #17 —
+mirroring ZFS state in Kubernetes — surviving in the one place nobody looked: not
+the clone *graph*, which ADR-0020 fixed, but the snapshot's *address*.
+
+`reconcileDelete` computes `rawFull` from the record, and `Destroy` is
+deliberately `NotExist`-tolerant (D11, so an already-relocated snapshot is not an
+error). Those two correct-in-isolation behaviours combine into a silent no-op.
+
+### 12.2 Measured behaviour
+
+Executed against the pool-verified fake, current code. `vol1` has `csi-snap-a`
+(older) and `csi-snap-b`, each with its own backing clone; a PVC is restored from
+`snap-b`; then `snap-b` is deleted:
 
 ```
-delete snap-a  →  reconcileDelete computes rawFull = tank/k8s/vol1@csi-snap-a
-                  Destroy is NotExist-tolerant → no-op → finalizer released → object gone
-                  but the real snapshot is still at tank/k8s/pvc-restored@csi-snap-a
+BEFORE csi-snap-a lives at [tank/k8s/vol1@csi-snap-a]
+AFTER  deleting snap-b:   promoted=[tank/k8s/pvc-restored ×2]
+       csi-snap-a lives at [tank/k8s/pvc-restored@csi-snap-a]
+       backing clone csi-snap-a exists = true, its @restore-source = true
 ```
 
-The `ZfsSnapshot` disappears while the ZFS snapshot it represented survives, holding space
-with nothing left to reference it. Verified in both modes.
+**What is *not* broken — each verified, not assumed:**
 
-It is **not permanent**: the orphan is destroyed later, when whichever dataset currently
-holds it is itself deleted (`detachAndCleanSnapshots` → `assertDriverSnapshot` passes,
-because no live `ZfsSnapshot` claims that suffix any more). In the executed run, deleting
-the restored PVC promoted the snapshot back onto `vol1`, where it sits until `vol1` is
-deleted. So the impact is retained space and a confusing `zfs list`, not unbounded growth
-or data loss.
+- **No data loss.** The snapshot's data is in its backing clone, which is intact.
+- **Restores from `snap-a` still work.** The promote *re-parented* the backing
+  clone rather than invalidating it, and restores resolve through
+  `csi-snap-a@restore-source`, never through the raw snapshot. This is exactly the
+  property that made the mode removal safe.
+- **Nothing is blocked.** Deleting `pvc-restored` while `snap-a` is still live
+  succeeds: the backing clone still clones the relocated snapshot, so
+  `detachAndCleanSnapshots` promotes rather than refuses, and the snapshot lands
+  back on `tank/k8s/csi-snap-a` — its own backing clone.
 
-**Why the existing guards do not catch it:** `assertDriverSnapshot` deliberately refuses to
-destroy a snapshot that a *live* `ZfsSnapshot` claims (D18) — but here the `ZfsSnapshot` is
-the object being deleted, so nothing objects. The delete path is correct; the *address* it
-computes is stale.
+**What is broken:** in one specific ordering, an orphan is left behind.
 
-**Possible directions (none chosen, none analysed in depth):**
+```
+delete snap-a (while its raw snapshot sits on a live foreign dataset)
+  → rawFull = tank/k8s/vol1@csi-snap-a  (stale)
+  → Destroy → NotExist → no-op → finalizer released → object gone
+  → tank/k8s/pvc-restored@csi-snap-a remains, claimed by nothing
+```
 
-- Locate the snapshot by suffix across the pool at delete time instead of trusting
-  `Spec.Dataset` — consistent with ADR-0020's "ask ZFS, don't mirror it".
-- Refuse to release the finalizer while a snapshot with that suffix still exists anywhere
-  on the pool.
-- Accept it and document the reclaim behaviour.
+The reverse order is clean: delete `pvc-restored` first and the promote returns the
+snapshot to `csi-snap-a`, after which deleting `snap-a` frees it correctly
+(verified: `raw csi-snap-a still at []`).
 
-**Not implemented. Needs its own decision, separate from §11.**
+### 12.3 Severity
+
+**Bounded and self-healing, but real.** The orphan holds space until the dataset
+currently carrying it is destroyed, at which point `detachAndCleanSnapshots` reaches
+it as a leftover artifact and `assertDriverSnapshot` permits the destroy, because no
+live `ZfsSnapshot` claims that suffix any more. So: retained space and a confusing
+`zfs list`, not unbounded growth, not data loss, not a stuck object.
+
+**Why no guard catches it:** `assertDriverSnapshot` refuses to destroy a snapshot a
+*live* `ZfsSnapshot` claims (D18) — but here the claimant is the very object being
+deleted, so nothing objects.
+
+### 12.4 Directions (none chosen)
+
+1. **Ask ZFS where the snapshot is** — search the pool for `*@<SnapshotName>` at
+   delete time instead of computing an address from the record. Directly applies
+   ADR-0020's principle; costs one `zfs list -t snapshot` over the pool per delete.
+2. **Hold the finalizer** while any snapshot with that suffix exists anywhere on the
+   pool. Cheaper to state, but re-introduces a "wait for something to disappear" loop
+   and does not say *who* should destroy it.
+3. **Accept and document.** Defensible given the measured severity — the space is
+   reclaimed at teardown — provided the reclaim behaviour is written into
+   [runbooks.md](runbooks.md) so an operator who sees a stray `csi-snap-*` snapshot
+   knows it is expected and when it will go away.
+
+Option 1 is the only one that removes the mirror rather than compensating for it.
+
+**Chosen: option 1.** Implemented as ADR-0028 on 2026-08-06, with the pool-wide search
+taken first and the prefix narrowing recorded in `FindSnapshot`'s doc comment as an
+available optimisation rather than applied speculatively.

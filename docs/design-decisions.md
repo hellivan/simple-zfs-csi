@@ -11,6 +11,88 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0028 — The raw snapshot is located by asking ZFS, not by trusting the address recorded on the `ZfsSnapshot`
+
+**Status:** Accepted (2026-08-06) · **Scope:** `internal/zpool/zfs.go`, `internal/controller/zfssnapshot_controller.go` · **Related:** completes [ADR-0020](#adr-0020--the-zfs-clone-graph-is-the-source-of-truth), [known-pitfalls.md](known-pitfalls.md) #17, [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §12.
+
+### Context
+
+`ZfsSnapshot.Spec.Dataset` + `.SnapshotName` form a recorded address for the raw
+ZFS snapshot, `<dataset>@<snapshotName>`, written once when the snapshot is taken.
+`reconcileDelete` recomputed that address and destroyed it.
+
+`zfs promote` relocates the origin snapshot — and every snapshot older than it —
+onto the promoted clone. The recorded address does not follow. Two behaviours that
+are each correct in isolation then combine badly: the address is stale, and
+`Destroy` is deliberately `NotExist`-tolerant (D11, so an already-relocated
+snapshot is not an error). The result is a silent no-op followed by finalizer
+release — the `ZfsSnapshot` disappears while the real snapshot survives on
+whatever dataset now holds it, referenced by nothing.
+
+Measured on the pool-verified fake: with `csi-snap-a` (older) and `csi-snap-b` on
+one volume and a PVC restored from `snap-b`, deleting `snap-b` promotes the
+restored PVC and drags the untouched `csi-snap-a` onto it. Deleting `snap-a` then
+left `tank/k8s/pvc-restored@csi-snap-a` orphaned.
+
+Severity was bounded — no data loss, restores unaffected (they resolve through the
+backing clone, which a promote re-parents rather than invalidates), nothing
+blocked, and the orphan reclaimed once the dataset carrying it was destroyed — but
+it is retained space and a confusing `zfs list` in the meantime.
+
+This is [ADR-0020](design-decisions.md)'s anti-pattern surviving in the one place
+that review did not reach. ADR-0020 stopped mirroring the clone *graph*; this was
+the snapshot's *address*.
+
+### Options weighed
+
+- **Hold the finalizer** while a snapshot with that short name exists anywhere on
+  the pool. Rejected: re-introduces a "wait for something to disappear" loop and
+  never says *who* is supposed to destroy it.
+- **Accept and document** the reclaim behaviour in a runbook. Defensible on the
+  measured severity, but leaves a mirror in place and asks operators to recognise
+  expected garbage.
+- **Ask ZFS where the snapshot is.** Accepted — the only option that removes the
+  mirror rather than compensating for it.
+
+### Decision
+
+Add `ZFS.FindSnapshot(ctx, pool, suffix)`, a pool-wide
+`zfs list -H -o name -t snapshot -r <pool>` matched on the part after `@`, and use
+its result in `reconcileDelete` in preference to the recorded address. When it
+finds nothing, the recorded address is kept and the destroy correctly no-ops,
+because "not found" then genuinely means gone.
+
+**The answer is unambiguous**, which is what makes "destroy it wherever it is"
+safe rather than merely convenient: driver snapshot short names are
+`csi-snap-<uuid>` ([independent-resource-naming-redesign.md](independent-resource-naming-redesign.md)),
+`ensureSnapshot` reuses the persisted name on retry, and a promote *moves* a
+snapshot rather than copying it — so at most one match can ever exist. The fake
+fails loudly if it ever sees more than one, so a modelling error cannot hide here.
+
+Matching keys on the part after `@` only. That is load-bearing: a backing clone is
+itself named `csi-snap-<uuid>`, so its self-snapshot renders as
+`.../csi-snap-<uuid>@restore-source`; a substring match would find the wrong
+object. Covered by a dedicated test.
+
+### Consequences
+
+- The lookup runs once per snapshot deletion, after the backing-clone wait, so it
+  is not paid on every requeue.
+- **Accepted cost:** the listing is pool-wide, so it scales with the pool's total
+  snapshot count. Recorded optimisation, deliberately not taken: a relocated
+  snapshot can only land on a dataset in its own clone lineage and cross-prefix
+  restores are rejected (D6), so `-r <pool>/<prefix>` would be provably
+  sufficient. Pool-wide was chosen because it is unconditionally correct and does
+  not depend on that invariant holding; the narrowing is a one-line change if
+  profiling ever justifies it.
+- `Spec.Dataset` remains what it always was — a record of where the snapshot was
+  taken, and the fallback when nothing is found. It is no longer trusted as the
+  *current* location.
+- Regression test `TestZfsSnapshotReconcile_DestroysRelocatedRawSnapshot` replays
+  the measured scenario and was confirmed to fail without the fix.
+
+---
+
 ## ADR-0027 — `integrated` snapshot mode is removed; every snapshot is backed by its own clone
 
 **Status:** Accepted (2026-08-06) · **Scope:** `api/v1alpha1/zfssnapshot_types.go`, `internal/csi/{snapshot,clone,controller}.go`, `internal/controller/{promote,zfssnapshot_controller}.go`, `cmd/csi-controller/main.go`, chart · **Related:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §11, [lifecycle-protection-matrix.md](lifecycle-protection-matrix.md) §6.1, supersedes D8.

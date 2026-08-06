@@ -249,13 +249,29 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
+	// Where the raw snapshot *actually* is, which need not be where this object
+	// recorded it: `zfs promote` relocates the origin snapshot and everything
+	// older than it onto the promoted clone, and nothing rewrites Spec.Dataset
+	// when that happens. Trusting the record here used to leave the snapshot
+	// behind — Destroy is NotExist-tolerant, so a stale address silently no-ops
+	// and the finalizer is released anyway, orphaning the real snapshot on
+	// whatever dataset now holds it (ADR-0028).
+	//
+	// Deliberately done after the backing-clone wait above, so the pool-wide
+	// listing is paid once at the end rather than on every requeue.
+	if found, findErr := r.ZFS.FindSnapshot(ctx, pool.Status.PoolName, snap.Spec.SnapshotName); findErr != nil {
+		return ctrl.Result{}, findErr
+	} else if found != "" && found != rawFull {
+		logger.Info("raw snapshot was relocated by an earlier promote; destroying it where it actually is",
+			"recorded", rawFull, "actual", found)
+		rawFull = found
+	}
+
 	// Required, not best-effort (D11): a no-op (Destroy is NotExist-tolerant)
-	// when this snapshot was already relocated elsewhere by an earlier promote
-	// (e.g. the source volume was deleted first) — real work only in the common
-	// case (a snapshot created and later deleted without the source having been
-	// deleted first). This is the invariant that makes it safe for DeleteVolume
-	// to assume zero live ZfsSnapshots referencing a volume means zero raw
-	// snapshots remain on it either.
+	// when the snapshot is genuinely gone already — real work in the common case
+	// (a snapshot created and later deleted). This is the invariant that makes it
+	// safe for DeleteVolume to assume zero live ZfsSnapshots referencing a volume
+	// means zero raw snapshots remain on it either.
 	//
 	// D19: a restored PVC that was promoted while the backing clone above was
 	// being torn down is now a clone of this raw snapshot, and ZFS refuses to

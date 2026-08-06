@@ -907,6 +907,15 @@ Corollaries worth applying beyond this one case:
   2026-07-31 run confirmed the promote batch converges, but deliberately executed
   no `zfs destroy` — which is where all four defects live. Its own final-state
   listing in fact documents one of them.
+- **An address is state too, and it is the easiest kind to overlook.** Removing
+  the clone-graph mirror in 2026-08-03 left one behind: `ZfsSnapshot.Spec.Dataset`
+  recorded *where the raw snapshot lived*, and `zfs promote` moves snapshots
+  between datasets. The delete path recomputed the recorded address, ZFS reported
+  it absent, and `Destroy`'s deliberate `NotExist` tolerance turned that into a
+  silent success — releasing the finalizer while the real snapshot survived
+  elsewhere. Found 2026-08-06, fixed by ADR-0028 (ask ZFS for the location).
+  **When auditing for this pitfall, look for recorded *identifiers and paths*,
+  not just recorded *relationships*.
 
 **Where the guard lives:** `internal/controller/promote.go` and the delete paths
 in `internal/controller/zfsdataset_controller.go` /
