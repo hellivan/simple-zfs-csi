@@ -1329,73 +1329,71 @@ whether this proposal is accepted — worth correcting either way.
 **Delete source volume** — unchanged. `detachAndCleanSnapshots` finds the backing clone
 through the `clones` property and promotes it away, exactly as verified on the live pool.
 
-### 10.5 In-use protection (replaces D21)
+### 10.5 In-use protection — WITHDRAWN (2026-08-06)
 
-D21 currently guards the window where a restore's `ZfsDataset` exists but its `zfs clone`
-has not run, by **scanning** all `ZfsDataset`s for a matching `Spec.Source`. Two objections,
-both accepted:
+> **This section previously proposed a `storage.simple-zfs-csi.io/in-use-by.<dependent>`
+> lease finalizer to replace D21. That proposal is withdrawn.** It rested on the premise
+> that Kubernetes does not protect the in-flight clone and restore windows. Verification
+> against upstream source proved that premise false. Full evidence, with quotes, is in
+> [lifecycle-protection-matrix.md](lifecycle-protection-matrix.md); the summary is below.
 
-- It is a "know all your callers" design. `Spec.Source` is the only declaration mechanism
-  *today* (verified: `DatasetSource` has two fields, three construction sites, all in
-  `resolveContentSource`), but a fourth reference type added later is silently missed.
-- **It is incomplete by construction.** A scan can only see objects that already exist; the
-  window opens when `resolveContentSource` decides to restore, before the object is created.
+The lease was designed to cover the window between "a dependent object has been created"
+and "its `zfs clone` exists". Both entry points into that window are already gated by the
+CO, one layer up, before any of our code runs:
 
-Replace it with a short-lived **lease finalizer**, the Kubernetes idiom for this
-(`kubernetes.io/pvc-protection`, `kubernetes.io/pv-protection`, and
-`snapshot.storage.kubernetes.io/volumesnapshot-in-use-protection` — the last being this
-exact problem one layer up).
+| Window | Upstream guard | Where |
+|---|---|---|
+| PVC-to-PVC clone in flight | `provisioner.storage.kubernetes.io/cloning-protection` on the source PVC | external-provisioner, `pkg/controller/clone_controller.go` |
+| Restore from snapshot in flight | `snapshot.storage.kubernetes.io/volumesnapshot-as-source-protection` on the `VolumeSnapshot`, plus external-provisioner's newer `provisioner.storage.kubernetes.io/volumesnapshot-as-source-protection` | external-snapshotter, `pkg/common-controller/snapshot_controller.go` |
 
-`storage.simple-zfs-csi.io/in-use-by.<dependentName>`, taken on the object being cloned
-from: the `ZfsSnapshot` for a restore, the source `ZfsDataset` for a direct PVC-to-PVC
-clone.
+Both key on exactly the condition the lease would have keyed on — a dependent PVC sitting in
+`Pending` — and both block the *source* object's deletion until it clears. Because a blocked
+PVC or `VolumeSnapshot` never reaches `DeleteVolume`/`DeleteSnapshot`, the protection
+propagates all the way down to our CRs without us doing anything.
 
-**Held only across the critical section**, by the referencer, entirely inside `CreateVolume`
-— which already blocks until Ready (`waitVolumeReady`):
+For the restore path the guarantee is total, not merely likely: the
+`snapshot.storage.k8s.io` CRDs and the snapshot-controller install as one unit, so in any
+cluster where no `VolumeSnapshot` can exist, our snapshot code cannot execute either.
+Whenever the restore path can run, the protection is necessarily present.
 
-```
-1. resolveContentSource     → source resolved
-2. add    in-use-by.<pvc>       ← before anything exists
-3. ensureVolume             → create the ZfsDataset
-4. waitVolumeReady          → blocks until the zfs clone exists
-5. remove in-use-by.<pvc>       ← ZFS truth covers it from here on
-```
+Two further reasons not to build it, both discovered during verification:
 
-Every step is idempotent — `AddFinalizer`/`RemoveFinalizer` are no-ops when already
-present/absent, `ensureVolume` tolerates `AlreadyExists`, `waitVolumeReady` re-polls — so a
-retried `CreateVolume` resumes wherever it died, and `external-provisioner` retries until
-success.
+- **The finalizer names are mid-migration.** Snapshot-as-source protection is moving from
+  the snapshot-controller to the external-provisioner; upstream's own comment says the
+  snapshot-controller copy "will be deprecated and removed in a future release". A
+  parallel mechanism of ours would drift against a moving target.
+- **This class of finalizer leaks, and upstream needed a reaper for it.** The
+  external-provisioner ships `--snapshot-orphan-sweep-interval` (default 5m) because these
+  finalizers "can become stuck if the provisioner crashes during snapshot-based
+  provisioning". Our lease would have inherited the same failure mode; the §10.5 draft
+  above handled it with a single opportunistic release in `DeleteVolume`, which is weaker
+  than a sweeper.
 
-**Rules that keep this from becoming `restored-by.*`:**
+(The withdrawn draft also cited a finalizer named
+`snapshot.storage.kubernetes.io/volumesnapshot-in-use-protection`. No such finalizer
+exists — the real name is `...-as-source-protection`. Recorded here as a reminder that the
+whole design was argued from remembered API surface rather than from source.)
 
-1. **It gates object deletion only; it never informs a ZFS decision.** That is precisely
-   what `restored-by.*` got wrong. The live ZFS clone graph remains the sole authority for
-   promote/destroy (ADR-0020/D17).
-2. **The referencer takes it and the referencer releases it.** The protected object never
-   manages finalizers placed on it by others.
-3. **Added in one place** — `resolveContentSource`, the single funnel every content source
-   already passes through.
-4. **The delete paths must consult their own finalizers.** Extra finalizers do *not* gate
-   our ZFS work — `beforeDestroy` and `reconcileDelete` run on `deletionTimestamp`
-   regardless of which finalizers remain — so each must explicitly refuse while any
-   `in-use-by.*` is present, or the protection is cosmetic. (This is a check of an explicit
-   list, not a scan.)
+**Consequence for D21:** `checkPendingCloneDependents` **stays**, unchanged, and is *not*
+replaced. Its justification narrows: it no longer defends the CO-driven restore/clone
+flows, which are covered above. What remains is the case Kubernetes genuinely cannot see —
+someone running `kubectl delete zfsdataset <name>` directly, and the crash window in which
+an upstream finalizer has leaked. Both are real; neither is served by a lease.
 
-**Residual case, and why it is not new:** if `CreateVolume` never completes and is never
-retried (PVC deleted while pending), the lease persists. But in that same scenario the
-`ZfsDataset` created at step 3 also leaks — no PV was created, so `DeleteVolume` is never
-called — which is a pre-existing condition. The lease is *correct* in that state: an
-unprovisioned dependent really does exist. Cheap safety net: have `DeleteVolume` also
-release any lease its volume holds.
+The two objections raised against D21 are acknowledged and accepted as *limitations*, not
+as grounds for replacement: a scan cannot see an object that does not exist yet, and a new
+reference type would be missed. Given that the CO covers the pre-creation window, what D21
+scans for — an object that exists but has no ZFS dataset — is exactly the right and only
+remaining question.
 
 ### 10.6 Code impact
 
 | Area | Change |
 |---|---|
 | `zfssnapshot_controller.go` | `reconcileStandaloneCreate`: object create + Ready-poll → `zfs clone` + `zfs snapshot`. `reconcileDelete`: `Delete` + poll loop → `detachAndCleanSnapshots` + `zfs destroy` |
-| `csi/clone.go` | derive the backing path; precondition becomes the `ZfsSnapshot`'s own `deletionTimestamp`; take the lease |
-| `csi/controller.go` | release the lease after `waitVolumeReady`; release on `DeleteVolume` |
-| `promote.go` | `assertKnownDatasets` must also treat a dataset as known when its leaf name equals a live `ZfsSnapshot`'s `snapshotName` — **required, not optional**: without it, deleting any volume that has a standalone snapshot sees the backing clone as a foreign clone and refuses. `checkPendingCloneDependents` (D21) deleted; `checkOwningSnapshotLive` (F7) deleted |
+| `csi/clone.go` | derive the backing path; precondition becomes the `ZfsSnapshot`'s own `deletionTimestamp` |
+| `csi/controller.go` | no change (the lease proposed in the withdrawn §10.5 is not built) |
+| `promote.go` | `assertKnownDatasets` must also treat a dataset as known when its leaf name equals a live `ZfsSnapshot`'s `snapshotName` — **required, not optional**: without it, deleting any volume that has a standalone snapshot sees the backing clone as a foreign clone and refuses. `checkOwningSnapshotLive` (F7) deleted, since with no backing-clone object there is no owner to check. `checkPendingCloneDependents` (D21) **kept unchanged** — see §10.5 |
 | chart RBAC | discovery loses `create`/`delete` on `zfsdatasets` and the `zfssnapshots/finalizers` rule |
 | README | the "one exception exists today" note is removed |
 
@@ -1414,7 +1412,12 @@ the `ZfsPool` watch mapper, which simply stops seeing them.
   still claims this" check carries the remaining weight.
 - **It reverses D15**, which must be recorded as such rather than quietly dropped.
 
-### 10.8 Open questions — resolved 2026-08-05
+### 10.8 Open questions — resolved 2026-08-05, **partially refuted 2026-08-06**
+
+> **Correction (2026-08-06).** Questions 1 and 2 below were answered from remembered API
+> surface, not from source. Verification against upstream code refuted both. The original
+> text is kept verbatim — the reasoning error is the point — with the refutation inline.
+> Evidence: [lifecycle-protection-matrix.md](lifecycle-protection-matrix.md).
 
 **1. Can the lease lean on the CO's own protection? No — it must stand alone.**
 Checked against the live cluster: there are **no `snapshot.storage.k8s.io` CRDs and no
@@ -1425,6 +1428,16 @@ More generally the snapshot-controller is an **optional, admin-installed** clust
 component that a CSI driver cannot assume is present, so §10.5's lease is the primary
 protection, not a redundant second layer.
 
+> **REFUTED.** The observation is correct; the conclusion does not follow. The snapshot
+> CRDs and the snapshot-controller are a single installable unit, and external-provisioner
+> resolves a snapshot data source through `p.snapshotClient.SnapshotV1().VolumeSnapshots(...).Get(...)`
+> (`pkg/controller/controller.go`, `getSnapshotSource`). With no CRDs that Get fails, so
+> no `CreateVolume` with a snapshot source is ever issued — which is exactly why the
+> `VolumeSnapshot` path is unusable on this cluster. **Absence of the protection and
+> absence of the risk are the same condition.** A driver need not assume the
+> snapshot-controller is present; it only needs to observe that when it is not, its own
+> restore path is unreachable.
+
 **2. Cover direct PVC-to-PVC clones as well? Yes — and they matter more than restores.**
 The CSI spec (`spec@v1.11.0`) defines the general strategy for every driver: both
 `DeleteSnapshot` and `DeleteVolume` return `9 FAILED_PRECONDITION` for "in use by another
@@ -1433,6 +1446,15 @@ entirely to the driver. There is an asymmetry worth noting: a `VolumeSnapshot` c
 protected by the snapshot-controller when installed, but a PVC used as a *clone dataSource*
 has no in-tree equivalent — `kubernetes.io/pvc-protection` only guards deletion while
 mounted by a pod. So for volume clones our lease is the only protection that exists.
+
+> **REFUTED on the factual claim.** The statement about `kubernetes.io/pvc-protection`'s
+> scope is correct, but "no in-tree equivalent" is wrong because the protection is not
+> in-tree — it lives in the external-provisioner sidecar:
+> `pvcCloneFinalizer = "provisioner.storage.kubernetes.io/cloning-protection"`
+> (`pkg/controller/controller.go`), applied to the source PVC during `ProvisionExt` and
+> released by a dedicated worker pool sized by `--cloning-protection-threads`. The search
+> stopped at the in-tree controllers and never reached the sidecar. **Clone sources are
+> protected; the lease is not the only protection, and is not needed.**
 
 Two incidental findings from the same spec text:
 
@@ -1444,9 +1466,52 @@ Two incidental findings from the same spec text:
   doing that:** it contradicts D4's "always succeeds, never blocks", and the lease window
   is sub-second. Recorded so the option isn't rediscovered as a novelty.
 
+> **Both incidental findings stand**, and re-reading the same section turned up a third
+> that neither of us had: `DeleteVolume` in `spec.md` carries a **MUST**, not a SHOULD,
+> for the integrated-mode case. See §10.10.
+
 **3. Does anything outside the repo consume the backing-clone object? Not today; possibly
 later.** If it ever does, the cheap answer is to expose the backing dataset path on
 `ZfsSnapshot.status` — derived, read-only — rather than reintroducing an object.
+
+### 10.10 New finding (2026-08-06) — `DeleteVolume` must *refuse*, and today it does not
+
+Verbatim from `spec@v1.11.0/spec.md`, `DeleteVolume`:
+
+> CSI plugins SHOULD treat volumes independent from their snapshots.
+>
+> If the Controller Plugin supports deleting a volume without affecting its existing
+> snapshots, then these snapshots MUST still be fully operational and acceptable as sources
+> for new volumes as well as appear on `ListSnapshot` calls once the volume has been deleted.
+>
+> **When a Controller Plugin does not support deleting a volume without affecting its
+> existing snapshots, then the volume MUST NOT be altered in any way by the request and the
+> operation must return the `FAILED_PRECONDITION` error code** and MAY include meaningful
+> human-readable information in the `status.message` field.
+
+This maps one-to-one onto D8's two modes: `standalone` is the first branch, `integrated`
+is the second. So `checkSnapshotDependents` (D3) is not merely a local safety choice — it
+is the spec-mandated behaviour, which is a stronger justification than the one recorded
+for it.
+
+**But our plumbing does not deliver it.** `DeleteVolume`
+([internal/csi/controller.go](internal/csi/controller.go)) issues `Delete` on the
+`ZfsDataset` and returns `OK` immediately; it never reads back the outcome, so the refusal
+raised by `checkSnapshotDependents` in the reconciler cannot reach the CO. Consequences,
+in order of severity:
+
+1. **No data is lost** — the finalizer holds and the ZFS dataset survives. The guard works.
+2. The PV is released and deleted, so the volume vanishes from the user's view while the
+   `ZfsDataset` remains, blocked, indefinitely. Nothing retries, because `OK` was returned.
+3. We do alter the volume ("MUST NOT be altered in any way"): a `deletionTimestamp` is set
+   and cannot be undone.
+4. The user gets no diagnostic. The reason lives only in reconciler logs.
+
+This is a genuine spec deviation with a real operational cost, and it is **independent of
+whether §10 is accepted** — it is a defect in the current code. Fixing it means
+`DeleteVolume` must synchronously determine whether the delete is refusable and return
+`codes.FailedPrecondition` instead of `OK`, which the CO then retries with backoff exactly
+as the spec intends. Not yet implemented; no approach chosen.
 
 
 ### 10.9 If accepted, this supersedes

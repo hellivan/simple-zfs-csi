@@ -483,3 +483,152 @@ protection, not a redundant second layer. (The chart is safe either way: the
 `VolumeSnapshotClass` template is gated behind `range .Values.volumeSnapshotClasses` and
 the sidecar behind `csiController.snapshotter.enabled`, so a missing CRD does not break
 `helm install`. The prerequisite is documented in the README's host/cluster requirements.)
+
+---
+
+**Q: I dug into the Kubernetes specs. (1) Finalizers are meant for cleanup on deletion,
+so they're the wrong tool for blocking deletion. (2) Kubernetes already protects PVCs when
+you snapshot or clone from them, so we don't need to do this at all. Verify — don't
+assume.**
+
+A: Verified against primary sources. **(1) is contradicted. (2) is confirmed for the case
+that matters, and it removes the need for our own protection on the restore path.**
+
+**(1) Finalizers do block deletion, and Kubernetes uses them for exactly that.** The
+official finalizers page states it directly:
+
+> Finalizers are namespaced keys that tell Kubernetes to **wait until specific conditions
+> are met before it fully deletes** resources that are marked for deletion.
+
+> **You can also use finalizers to prevent deletion of unmanaged resources.**
+
+> A common example of a finalizer is `kubernetes.io/pv-protection`, which **prevents
+> accidental deletion** of `PersistentVolume` objects. […] If you try to delete the
+> `PersistentVolume`, it enters a `Terminating` status, **but the controller can't delete
+> it because the finalizer exists.**
+
+Cleanup is the common use, not the definition. In-use protection is the *named canonical
+example*.
+
+**(2) Confirmed — and it closes the restore case entirely.** Ground truth from
+external-snapshotter `pkg/utils/util.go`:
+
+```go
+// Name of finalizer on VolumeSnapshot that is used as a source to create a PVC
+VolumeSnapshotAsSourceFinalizer = "snapshot.storage.kubernetes.io/volumesnapshot-as-source-protection"
+
+// Name of finalizer on PVCs that is being used as a source to create VolumeSnapshots
+PVCFinalizer = "snapshot.storage.kubernetes.io/pvc-as-source-protection"
+```
+
+```go
+func NeedToAddSnapshotAsSourceFinalizer(snapshot *crdv1.VolumeSnapshot) bool {
+	return snapshot.ObjectMeta.DeletionTimestamp == nil &&
+		!slices.Contains(snapshot.ObjectMeta.Finalizers, VolumeSnapshotAsSourceFinalizer)
+}
+```
+
+The snapshot-controller holds a finalizer on a `VolumeSnapshot` **while a PVC is being
+created from it** — precisely the window §10.5's lease was designed to cover. The
+Kubernetes docs describe the mirror-image protection for the other direction ("Persistent
+Volume Claim as Snapshot Source Protection": deleting a PVC in active use as a snapshot
+source is "postponed until the snapshot is readyToUse or aborted").
+
+**Why the earlier caveat ("but this cluster has no snapshot-controller") does not apply.**
+The snapshot CRDs and the snapshot-controller are installed together as one unit. Without
+them no `VolumeSnapshot` object can exist, so `CreateSnapshot`/`DeleteSnapshot` are never
+called and the driver's snapshot code never runs. **Whenever our restore path can execute
+at all, the protection is necessarily present.** That is structural, not an assumption
+about cluster conformance.
+
+**Consequence:** the in-use lease and D21's scan are both unnecessary for
+restore-from-snapshot. The CO closes that window before the CSI layer ever sees it.
+
+**Still unverified: the direct PVC-to-PVC clone case.** `pvc-as-source-protection` covers
+*snapshot* creation, not cloning — cloning is external-provisioner's territory, which was
+not checked. The CSI Volume Cloning docs say only that the source "must be bound and
+available (not in use)", and that afterwards the source "may also be modified or deleted
+without affecting the newly created clone" — a statement about the completed clone, not
+the in-flight window. Open question, tracked in §10.8.
+
+> **Resolved 2026-08-06 — see the next section.** The answer is yes: clone sources *are*
+> protected, by `provisioner.storage.kubernetes.io/cloning-protection`.
+
+---
+
+## 2026-08-06 — the full upstream verification pass
+
+> Outcome: [lifecycle-protection-matrix.md](lifecycle-protection-matrix.md) (our flows,
+> our verdicts) and [kubernetes-volume-lifecycle-facts.md](kubernetes-volume-lifecycle-facts.md)
+> (upstream fact sheet). §10.5 withdrawn; §10.8 partially refuted; §10.10 added.
+
+**Q: The previous entry left "does anything protect a PVC used as a clone source?" open.
+What is the answer?**
+
+A: **Yes, and the earlier "no" was wrong.** The protection is
+`provisioner.storage.kubernetes.io/cloning-protection`, added to the source PVC by
+external-provisioner during `ProvisionExt` and released by a worker pool sized by
+`--cloning-protection-threads`.
+
+The way the earlier answer was wrong is the useful part: the search stopped at in-tree
+controllers. `kubernetes.io/pvc-protection` genuinely does only cover Pod mounts, so "no
+protection exists" followed *correctly from an incomplete search*. **For CSI, "does
+Kubernetes protect this?" is never answerable from `kubernetes/kubernetes` alone** — half
+the lifecycle logic lives in sidecars, under `provisioner.storage.kubernetes.io/` and
+`snapshot.storage.kubernetes.io/` prefixes that never appear in the main tree.
+
+**Q: How much of the §10.5 lease design survived?**
+
+A: None of it. Both windows it was built to cover are gated upstream before our code runs
+— `cloning-protection` for clones, `volumesnapshot-as-source-protection` for restores.
+§10.5 is withdrawn. D21's `checkPendingCloneDependents` stays *unchanged*, with its
+justification narrowed to what Kubernetes genuinely cannot see: direct
+`kubectl delete zfsdataset`, and the crash window where an upstream finalizer has leaked.
+
+**Q: The lease was also justified by "the snapshot-controller is optional, so we can't
+rely on it". Isn't that still true?**
+
+A: True, and irrelevant — which is a distinction worth keeping. The snapshot CRDs and the
+controller install as one unit, and external-provisioner resolves a snapshot data source by
+fetching the object (`getSnapshotSource`). With no CRDs that fetch fails, so our
+restore path is never invoked. **Absence of the protection and absence of the risk are the
+same condition.** We do not need to assume the controller is present; we only need to
+notice that when it is not, there is nothing to protect.
+
+**Q: Did this turn up anything we did not already know?**
+
+A: Three things, one of them a live defect.
+
+1. **`checkSnapshotDependents` (D3) is spec-mandated, not merely prudent.** CSI v1.11.0
+   `DeleteVolume`: a plugin that cannot delete a volume without affecting its snapshots
+   "MUST NOT" alter the volume and "must return the `FAILED_PRECONDITION` error code".
+   That is integrated mode exactly. Stronger justification than the one recorded for D3.
+
+2. **We violate that clause today.** `DeleteVolume` is fire-and-forget — it issues the
+   `Delete` and returns `OK` without reading back the outcome. The finalizer still
+   protects the data, but the PV is deleted while the `ZfsDataset` blocks indefinitely,
+   nothing retries (the CO was told it succeeded), and the user gets no diagnostic. Filed
+   as §10.10 and §6.2 of the matrix. **Unfixed, and independent of whether §10 is
+   accepted** — it is a defect in current code, not a design question.
+
+3. **Upstream's own finalizers leak, and they shipped a reaper for it**
+   (`--snapshot-orphan-sweep-interval`, default 5m, because these finalizers "can become
+   stuck if the provisioner crashes"). Direct evidence that "just add a finalizer" is a
+   partial solution — and our draft had only a single opportunistic release as its safety
+   net. Also the first thing to check when a PVC or VolumeSnapshot hangs in `Terminating`.
+
+**Q: Why two documents instead of one?**
+
+A: They answer different questions and rot at different rates.
+`kubernetes-volume-lifecycle-facts.md` is upstream-only and driver-agnostic — it stays
+true regardless of what we build, and it is what to re-verify when bumping sidecar
+versions. `lifecycle-protection-matrix.md` is the analysis: our flows, our gaps, our
+verdicts, changing whenever our design does. Merged, we would have to re-audit upstream
+facts every time our own code moved.
+
+**Q: What is still unverified?**
+
+A: Three items, all marked `[?]` in the documents and none affecting a decision taken
+today: exact version boundaries for the newer external-provisioner finalizers;
+cross-namespace data sources (`AnyVolumeDataSource` / `ReferenceGrant`); and whether both
+snapshot-as-source finalizers are simultaneously active in the sidecar versions we deploy.
