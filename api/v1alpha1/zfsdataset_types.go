@@ -30,6 +30,17 @@ const (
 	DatasetPhaseError ZfsDatasetPhase = "Error"
 )
 
+// DeleteBlockedReason is the Status condition reason the node agent records on a
+// terminating ZfsDataset whose destroy it refused, with the refusal in
+// Status.Message.
+//
+// Some refusals are permanent until a human intervenes — a snapshot the driver
+// did not create, or a clone with no ZfsDataset behind it — so the CSI controller
+// reads this back and returns FAILED_PRECONDITION from DeleteVolume instead of
+// reporting a success that never happened (ADR-0029). It is shared here rather
+// than duplicated as a literal in both components.
+const DeleteBlockedReason = "DeleteBlocked"
+
 // FilesystemConfig holds the options that apply only to a filesystem dataset
 // (type=filesystem). It is a discriminated-union arm of ZfsDatasetSpec: it must
 // be set when (and only when) type is filesystem.

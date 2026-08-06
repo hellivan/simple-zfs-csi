@@ -155,8 +155,87 @@ func (c *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 		return nil, status.Errorf(codes.Internal, "delete ZfsDataset %q: %v", id, err)
 	}
 
+	// Report success only once the dataset is actually gone (ADR-0029).
+	//
+	// The node agent can refuse a destroy, and some refusals are permanent until
+	// a human intervenes: a snapshot the driver did not create (an external
+	// replication or auto-snapshot tool), or a clone with no ZfsDataset behind
+	// it. Returning OK regardless made external-provisioner delete the PV while
+	// the ZfsDataset stayed Terminating forever, with nothing retrying and the
+	// reason visible only in node-agent logs.
+	if err := c.waitVolumeGone(ctx, id); err != nil {
+		return nil, err
+	}
+
 	c.Log.Info("deprovisioned volume", "name", id)
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// waitVolumeGone polls until the ZfsDataset has been removed, the agent reports
+// that it refused the destroy, or the deadline elapses.
+//
+// It is the deletion counterpart of waitVolumeReady, and returns errors the CO
+// is expected to retry: FailedPrecondition carries a recorded refusal through to
+// the user (the CSI spec allows status.message to be surfaced to end users),
+// DeadlineExceeded covers a destroy that is simply still in progress. Either way
+// the PV survives and external-provisioner retries with backoff, which is what
+// the spec prescribes for "volume in use".
+func (c *ControllerServer) waitVolumeGone(ctx context.Context, name string) error {
+	interval := c.PollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	waitCtx := ctx
+	if c.CreateTimeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, c.CreateTimeout)
+		defer cancel()
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		vol := &storagev1alpha1.ZfsDataset{}
+		err := c.Client.Get(waitCtx, client.ObjectKey{Name: name}, vol)
+		switch {
+		case apierrors.IsNotFound(err):
+			return nil
+		case err != nil && waitCtx.Err() == nil:
+			return status.Errorf(codes.Internal, "get ZfsDataset %q: %v", name, err)
+		case err == nil:
+			if reason, msg, blocked := deleteRefusal(vol); blocked {
+				return status.Errorf(codes.FailedPrecondition,
+					"volume %q cannot be deleted (%s): %s", name, reason, msg)
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			return status.Errorf(codes.DeadlineExceeded, "timed out waiting for volume %q to be deleted", name)
+		case <-ticker.C:
+		}
+	}
+}
+
+// deleteRefusal reports whether the agent has recorded a refused destroy on a
+// terminating volume, returning the condition reason and message behind it.
+//
+// It keys on the shared DeleteBlockedReason rather than on the phase alone, so a
+// pre-existing Error left over from provisioning is not mistaken for a refusal
+// to delete.
+func deleteRefusal(vol *storagev1alpha1.ZfsDataset) (reason, message string, blocked bool) {
+	if vol.DeletionTimestamp.IsZero() {
+		return "", "", false
+	}
+	for _, cond := range vol.Status.Conditions {
+		if cond.Reason == storagev1alpha1.DeleteBlockedReason {
+			msg := cond.Message
+			if msg == "" {
+				msg = vol.Status.Message
+			}
+			return cond.Reason, msg, true
+		}
+	}
+	return "", "", false
 }
 
 // ControllerPublishVolume authorizes a node to access a volume by creating a

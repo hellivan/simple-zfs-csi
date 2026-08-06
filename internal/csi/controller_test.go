@@ -548,6 +548,84 @@ func TestDeleteVolume_IdempotentWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestDeleteVolume_ReportsRecordedRefusal is the ADR-0029 regression: when the
+// node agent refuses the destroy, DeleteVolume must surface that as
+// FailedPrecondition rather than reporting a success that never happened. The CO
+// then keeps the PV and retries with backoff, and the reason reaches the user.
+func TestDeleteVolume_ReportsRecordedRefusal(t *testing.T) {
+	const refusal = `snapshot "tank/k8s/pvc-9@auto-2026-08-06-0300" was not created by this driver`
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-9", Finalizers: []string{"storage.simple-zfs-csi.io/agent"}},
+		Status: storagev1alpha1.ZfsDatasetStatus{
+			Phase:   storagev1alpha1.DatasetPhaseError,
+			Message: refusal,
+			Conditions: []metav1.Condition{{
+				Type: "Ready", Status: metav1.ConditionFalse,
+				Reason: storagev1alpha1.DeleteBlockedReason, Message: refusal,
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	cs := newController(newTestClient(t, vol))
+
+	_, err := cs.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-9"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "auto-2026-08-06-0300") {
+		t.Errorf("refusal reason not surfaced to the CO: %v", err)
+	}
+}
+
+// TestDeleteVolume_WaitsForDestroyToComplete verifies DeleteVolume does not
+// report success while the dataset is still being torn down. A destroy that is
+// merely slow yields DeadlineExceeded, which external-provisioner retries — the
+// PV survives either way, which is the property that was missing.
+func TestDeleteVolume_WaitsForDestroyToComplete(t *testing.T) {
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-9", Finalizers: []string{"storage.simple-zfs-csi.io/agent"}},
+	}
+	cs := newController(newTestClient(t, vol))
+	cs.CreateTimeout = 150 * time.Millisecond
+
+	_, err := cs.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-9"})
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded while the destroy is still running, got %v", err)
+	}
+}
+
+// TestDeleteVolume_SucceedsOnceAgentFinishes covers the normal path: the agent
+// releases its finalizer while DeleteVolume is waiting, and the call returns OK.
+func TestDeleteVolume_SucceedsOnceAgentFinishes(t *testing.T) {
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-9", Finalizers: []string{"storage.simple-zfs-csi.io/agent"}},
+	}
+	cl := newTestClient(t, vol)
+	cs := newController(cl)
+
+	// Stand in for the node agent completing the destroy.
+	go func() {
+		for i := 0; i < 200; i++ {
+			cur := &storagev1alpha1.ZfsDataset{}
+			if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-9"}, cur); err == nil {
+				if !cur.DeletionTimestamp.IsZero() {
+					cur.Finalizers = nil
+					_ = cl.Update(context.Background(), cur)
+					return
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	if _, err := cs.DeleteVolume(context.Background(), &csi.DeleteVolumeRequest{VolumeId: "pvc-9"}); err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-9"}, &storagev1alpha1.ZfsDataset{}); !apierrors.IsNotFound(err) {
+		t.Errorf("ZfsDataset still present: %v", err)
+	}
+}
+
 // markReadyTrackingGen keeps a ZfsDataset Ready with ObservedGeneration synced to
 // its spec generation, simulating the agent across expansion (which bumps the
 // spec). Used by expansion tests where waitVolumeReady requires the generation.

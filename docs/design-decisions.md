@@ -11,6 +11,91 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0029 — `DeleteVolume` reports success only when the volume is actually gone
+
+**Status:** Accepted (2026-08-06) · **Scope:** `internal/csi/controller.go`, `internal/controller/zfsdataset_controller.go`, `api/v1alpha1/zfsdataset_types.go` · **Related:** [lifecycle-protection-matrix.md](lifecycle-protection-matrix.md) §6.2, [known-pitfalls.md](known-pitfalls.md) #20.
+
+### Context
+
+`DeleteVolume` was fire-and-forget: it issued `Delete` on the `ZfsDataset` and
+returned `OK` without reading back whether the node agent accepted it.
+
+The agent can refuse a destroy, and two of those refusals are **permanent** until
+a human intervenes. Both were reproduced by execution:
+
+| Trigger | Guard | Error |
+| --- | --- | --- |
+| A snapshot on the PVC's dataset the driver did not create | `assertDriverSnapshot` (D18) | `snapshot "tank/k8s/pvc-1@auto-2026-08-06-0300" was not created by this driver; refusing to destroy it` |
+| A clone of one of our snapshots with no `ZfsDataset` behind it | `assertKnownDatasets` (D18) | `... is cloned by "tank/k8s/hand-made-clone", which is not a known ZfsDataset on this pool` |
+
+Both refusals are correct — refusing beats destroying state the driver does not
+own. The defect was in the reporting. `OK` made external-provisioner delete the
+PV, so the volume vanished from the user's view while the `ZfsDataset` stayed
+`Terminating` indefinitely; nothing retried, because the CO had been told the
+operation succeeded; and the reason existed only in node-agent logs.
+
+The first trigger is not hypothetical for this deployment: periodic snapshots
+from a replication or auto-snapshot tool feeding the `zfs send -R` workflow
+(§2.5) land on exactly those datasets with exactly those names.
+
+Note this is **not** the CSI snapshot clause that originally motivated §6.2 —
+[ADR-0027](design-decisions.md) retired that. This is the general contract:
+`DeleteVolume` returning `OK` asserts the volume is deprovisioned.
+
+### Options weighed
+
+- **Keep fire-and-forget, surface the refusal on `status` only.** Rejected: the PV
+  is already gone by then, so there is no object left for a user to inspect.
+- **Return `OK` but requeue internally forever.** That is today's behaviour, and
+  it is what produced a silent leak.
+- **Block until the outcome is known.** Accepted.
+
+### Decision
+
+Two halves.
+
+1. **The agent records the refusal.** On a `beforeDestroy` error the delete path
+   writes `status.phase=Error` plus a `Ready=False` condition with reason
+   `DeleteBlocked` and the refusal as its message. The write is best-effort so a
+   failed status update cannot mask the refusal itself. The reason constant lives
+   in `api/v1alpha1` so the two components cannot drift on a string literal.
+2. **`DeleteVolume` waits.** `waitVolumeGone` polls until the object is gone
+   (`OK`), a `DeleteBlocked` condition appears (`FAILED_PRECONDITION`, carrying
+   the message), or the deadline elapses (`DEADLINE_EXCEEDED`). It is the
+   deletion counterpart of the existing `waitVolumeReady`.
+
+Blocking is explicitly sanctioned by the CSI spec, which places the timeout with
+the CO and asks only that the plugin be idempotent:
+
+> Any of the RPCs defined in this spec MAY timeout and MAY be retried. The CO MAY
+> choose the maximum time it is willing to wait for a call [...] Idempotency
+> requirements ensure that a retried call with the same fields continues where it
+> left off when retried.
+
+`DeleteVolume` is idempotent (`NotFound` → `OK`), and the spec's own recovery
+behaviour for `FAILED_PRECONDITION` is "retry with exponential back off" — which
+is what external-provisioner does, while keeping the PV.
+
+### Consequences
+
+- **The PV survives a refused delete**, so the volume no longer disappears from
+  the user's view while its storage is still allocated.
+- **The reason reaches the user.** The spec permits `status.message` to be
+  surfaced to end users, and external-provisioner puts it on the PVC.
+- Transient refusals (a dependent snapshot not yet `Ready`, a
+  declared-but-unprovisioned clone) resolve on the CO's next retry with no
+  special handling.
+- **`DeleteVolume` now blocks**, bounded by `CreateTimeout`. This is why the
+  sidecar's `--timeout` had to be aligned first (#20): with upstream's 10s default
+  the sidecar would cancel the wait before the driver could finish it.
+- Deliberately keyed on the `DeleteBlocked` reason rather than on
+  `phase == Error` alone, so a leftover provisioning error is not misread as a
+  refusal to delete.
+- Both halves have regression tests, each confirmed to fail when its half is
+  disabled.
+
+---
+
 ## ADR-0028 — The raw snapshot is located by asking ZFS, not by trusting the address recorded on the `ZfsSnapshot`
 
 **Status:** Accepted (2026-08-06) · **Scope:** `internal/zpool/zfs.go`, `internal/controller/zfssnapshot_controller.go` · **Related:** completes [ADR-0020](#adr-0020--the-zfs-clone-graph-is-the-source-of-truth), [known-pitfalls.md](known-pitfalls.md) #17, [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §12.

@@ -116,6 +116,17 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			// guaranteed to have zero snapshots of its own left — which is what
 			// makes the non-recursive destroy below always safe (D11/D22).
 			if err := r.beforeDestroy(ctx, &vol, pool.Status.PoolName, full); err != nil {
+				// Publish *why* the destroy was refused. Some of these refusals are
+				// permanent until a human intervenes — a snapshot this driver did
+				// not create, or a clone with no ZfsDataset behind it — and without
+				// this the reason exists only in this agent's logs, while the CSI
+				// controller has already told the CO the deletion succeeded
+				// (ADR-0029). Best-effort: a failed status write must not mask the
+				// refusal itself.
+				if statusErr := r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, vol.Status.Path,
+					storagev1alpha1.DeleteBlockedReason, err.Error()); statusErr != nil {
+					logger.Error(statusErr, "recording delete refusal on status", "dataset", full)
+				}
 				return ctrl.Result{}, err
 			}
 			if err := r.ZFS.Destroy(ctx, full, false); err != nil {

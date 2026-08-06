@@ -538,7 +538,7 @@ taken, whose backing clone may not exist yet.
 
 **Verdict: required, implemented — but not correctly surfaced. See §6.2.**
 
-### 6.2 DEVIATION: `DeleteVolume` reports success for a delete that was refused
+### 6.2 RESOLVED: `DeleteVolume` reported success for a delete that was refused
 
 **Re-assessed 2026-08-06 after ADR-0027.** Removing `integrated` mode retired the
 CSI *snapshot* clause that originally motivated this section (a plugin that cannot
@@ -600,22 +600,30 @@ The net effect is a silent storage leak with a manual, undocumented recovery pat
 — the operator has to know to go looking for a `Terminating` `ZfsDataset` and read
 node-agent logs.
 
-#### Direction (proposed, not implemented)
+#### Fixed by [ADR-0029](design-decisions.md) (2026-08-06)
 
-Make `DeleteVolume` symmetric with `CreateVolume`, which already blocks on
+`DeleteVolume` is now symmetric with `CreateVolume`, which already blocks on
 `waitVolumeReady`:
 
-1. The delete path records its refusal on `ZfsDataset.Status` (phase + message)
-   instead of only returning an error into the requeue loop.
-2. `DeleteVolume` polls, bounded by a timeout, for the object to disappear. If a
-   refusal is reported instead, it returns `codes.FailedPrecondition` carrying that
-   message.
+1. The delete path records its refusal on `ZfsDataset.Status` — phase `Error` plus
+   a `Ready=False` condition with reason `DeleteBlocked` and the refusal as its
+   message — instead of only returning an error into the requeue loop.
+2. `waitVolumeGone` polls until the object is gone (`OK`), a `DeleteBlocked`
+   condition appears (`FAILED_PRECONDITION`, carrying the message), or the
+   deadline elapses (`DEADLINE_EXCEEDED`).
 
-The CO then retries with exponential backoff — precisely the behaviour the spec
-prescribes — the PV is not deleted, and `kubectl describe pvc` shows the real
-reason.
+The CO retries with exponential backoff — precisely what the spec prescribes for
+`FAILED_PRECONDITION` — the PV is **not** deleted, and the reason reaches the user
+because the spec permits `status.message` to be surfaced to end users.
 
-**Status: not implemented, awaiting decision.**
+Blocking is sanctioned by the spec, which places the timeout with the CO and asks
+only for idempotency: *"Any of the RPCs defined in this spec MAY timeout and MAY be
+retried [...] Idempotency requirements ensure that a retried call with the same
+fields continues where it left off."* This is also why the sidecar's `--timeout`
+had to be aligned first — see [known-pitfalls.md](known-pitfalls.md) #20.
+
+**Status: fixed. Regression tests on both halves, each confirmed to fail when its
+half is disabled.**
 
 ### 6.3 Out-of-band deletion of our own CRDs
 
