@@ -538,10 +538,13 @@ taken, whose backing clone may not exist yet.
 
 **Verdict: required, implemented — but not correctly surfaced. See §6.2.**
 
-### 6.2 DEVIATION: `DeleteVolume` returns OK when it must return FAILED_PRECONDITION
+### 6.2 DEVIATION: `DeleteVolume` reports success for a delete that was refused
 
-The guard in §6.1 protects the data. It does not satisfy the spec clause quoted
-there, because the refusal never reaches the CO.
+**Re-assessed 2026-08-06 after ADR-0027.** Removing `integrated` mode retired the
+CSI *snapshot* clause that originally motivated this section (a plugin that cannot
+delete a volume without affecting its snapshots MUST return `FAILED_PRECONDITION`)
+— we are now in the compliant branch. **The defect itself survives, and its real
+trigger turns out to be more mundane and more likely than the one first described.**
 
 `DeleteVolume` in [internal/csi/controller.go](internal/csi/controller.go)
 **[ours]** is fire-and-forget:
@@ -556,25 +559,63 @@ c.Log.Info("deprovisioned volume", "name", id)
 return &csi.DeleteVolumeResponse{}, nil
 ```
 
-It issues the `Delete` and returns `OK` without ever reading back whether the
-reconciler accepted it. Consequences, in order of severity:
+It issues the `Delete` and returns `OK` without reading back whether the reconciler
+accepted it.
 
-1. **No data is lost.** The finalizer holds, `checkSnapshotDependents` refuses,
-   and the ZFS dataset survives. The guard does its job.
-2. `OK` causes external-provisioner to delete the PV. The volume disappears from
-   the user's view while the `ZfsDataset` remains, blocked, indefinitely. Nothing
-   retries, because the CO was told the operation succeeded.
-3. We do alter the volume, which the spec says we MUST NOT: a `deletionTimestamp`
-   is set on the `ZfsDataset` and cannot be removed.
-4. The user gets no diagnostic. The reason exists only in reconciler logs — the
-   `status.message` channel the spec offers is unused.
+#### What can still refuse, verified by execution
 
-The correct behaviour is to determine synchronously whether the delete is
-refusable and return `codes.FailedPrecondition`, which the CO then retries with
-exponential backoff exactly as the spec intends.
+Two guards still refuse **permanently** — until a human intervenes — and both are
+reachable through an ordinary `DeleteVolume`:
 
-**Status: unfixed. No approach chosen. Independent of any other in-flight
-proposal — this is a defect in current code, not a design question.**
+| Trigger | Guard | Observed error |
+| --- | --- | --- |
+| A snapshot on the PVC's dataset that the driver did not create | `assertDriverSnapshot` (D18) | `snapshot "tank/k8s/pvc-1@auto-2026-08-06-0300" was not created by this driver; refusing to destroy it — remove it manually to continue` |
+| A clone of one of our snapshots with no `ZfsDataset` behind it | `assertKnownDatasets` (D18) | `snapshot "…@csi-snap-x" is cloned by "tank/k8s/hand-made-clone", which is not a known ZfsDataset on this pool; refusing to promote a dataset the driver does not manage — resolve it manually` |
+
+**Both refusals are correct** — refusing is far better than destroying state the
+driver does not own. The problem is entirely in how the refusal is (not) reported.
+
+**The first row is not hypothetical for this deployment.** Periodic snapshots from
+a replication or auto-snapshot tool (`zfs-auto-snapshot`, TrueNAS periodic tasks,
+anything feeding the `zfs send -R` workflow of §2.5) land exactly there, named
+exactly like that. Any PVC that has been captured by such a tool will refuse to
+delete.
+
+The remaining guards are transient by nature and self-resolve:
+`checkSnapshotDependents` (a dependent snapshot not yet `Ready`) and
+`checkPendingCloneDependents` (a declared-but-unprovisioned clone).
+
+#### Consequences
+
+1. **No data is lost.** The finalizer holds and the dataset survives. The guards do
+   their job.
+2. `OK` causes external-provisioner to delete the PV. **The volume disappears from
+   the user's view while the `ZfsDataset` remains, blocked, indefinitely** — and
+   nothing retries, because the CO was told the operation succeeded.
+3. **The user gets no diagnostic.** The reason exists only in reconciler logs. The
+   `status.message` channel the CSI spec offers for exactly this is unused, and
+   `ZfsDataset.Status` is not updated on the refusal either.
+
+The net effect is a silent storage leak with a manual, undocumented recovery path
+— the operator has to know to go looking for a `Terminating` `ZfsDataset` and read
+node-agent logs.
+
+#### Direction (proposed, not implemented)
+
+Make `DeleteVolume` symmetric with `CreateVolume`, which already blocks on
+`waitVolumeReady`:
+
+1. The delete path records its refusal on `ZfsDataset.Status` (phase + message)
+   instead of only returning an error into the requeue loop.
+2. `DeleteVolume` polls, bounded by a timeout, for the object to disappear. If a
+   refusal is reported instead, it returns `codes.FailedPrecondition` carrying that
+   message.
+
+The CO then retries with exponential backoff — precisely the behaviour the spec
+prescribes — the PV is not deleted, and `kubectl describe pvc` shows the real
+reason.
+
+**Status: not implemented, awaiting decision.**
 
 ### 6.3 Out-of-band deletion of our own CRDs
 

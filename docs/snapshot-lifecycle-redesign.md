@@ -1668,10 +1668,12 @@ are: CSI-spec compliance on the `DeleteVolume`/snapshot interaction, the removal
 only code path that can wedge a volume delete, restores that survive promotes
 unconditionally, and one less dimension in every future delete-path argument.
 
-**Not implemented. Awaiting decision.** If accepted, the change is: remove the enum value
-and `mode` parameter, treat empty `Mode` as `standalone`, delete the second clause of
-`checkSnapshotDependents`, collapse the branches in `reconcile`/`reconcileDelete`/
-`resolveContentSource`, and drop `defaultSnapshotMode` from the chart.
+**Implemented 2026-08-06** ([ADR-0027](design-decisions.md), commit `4a74a8e`): the enum
+value, the `Mode` field and the `mode` parameter are gone, the second clause of
+`checkSnapshotDependents` is deleted, the branches in `reconcile`/`reconcileDelete`/
+`resolveContentSource` are collapsed, and `defaultSnapshotMode` is dropped from the chart.
+A `VolumeSnapshotClass` still carrying `mode: integrated` is rejected rather than silently
+given the surviving behaviour.
 
 ## 12. RESOLVED (2026-08-06) — a promote can move a snapshot out from under its `ZfsSnapshot`
 
