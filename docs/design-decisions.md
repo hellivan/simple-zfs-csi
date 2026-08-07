@@ -13,7 +13,7 @@ in [runbooks.md](runbooks.md).
 
 ## ADR-0031 — Node-local passthrough: bypass NVMe-oF/NFS when the workload and the pool share a node
 
-**Status:** Proposed (2026-08-07) · **Scope:** `internal/csi/{node,mount,controller}.go`, `internal/controller/{zfsshareattachrequest_controller,nfs_controller}.go`, `internal/nvmet`, chart · **Related:** [local-passthrough-redesign.md](local-passthrough-redesign.md), [known-pitfalls.md](known-pitfalls.md) class 21.
+**Status:** Proposed (2026-08-07), Phase 1 partially implemented same day · **Scope:** `internal/csi/{node,mount,controller}.go`, `internal/controller/{zfsshareattachrequest_controller,nfs_controller}.go`, `internal/nvmet`, chart · **Related:** [local-passthrough-redesign.md](local-passthrough-redesign.md), [known-pitfalls.md](known-pitfalls.md) class 21.
 
 ### Context
 
@@ -79,8 +79,10 @@ task list):
   locking semantics for native POSIX locks — expected to be equivalent or
   better, but worth documenting for any workload that depends on NFS-specific
   lock behavior.
-- **Not started.** This ADR records the decision and plan; implementation
-  status is tracked in local-passthrough-redesign.md.
+- **Partially started.** `NodePublishVolume`'s zvol local-device passthrough
+  landed 2026-08-07; the nvmet-programming skip, `NodeExpandVolume` support,
+  and all of Phase 2 (datasets/NFS) have not. Implementation status is tracked
+  in local-passthrough-redesign.md.
 
 ---
 

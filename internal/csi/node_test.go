@@ -109,6 +109,10 @@ func (f *fakeMounter) ResizeFS(device, volumePath string) error {
 	return nil
 }
 
+// onlinePool's CurrentNode ("node-a") matches newNodeServer's NodeID, i.e. it
+// models the pool being *local* to this node plugin (ADR-0031). Use
+// remotePool for tests that must exercise the NVMe-oF/NFS network path
+// regardless of locality.
 func onlinePool(guid, ip, mountPath, poolName string) *storagev1alpha1.ZfsPool {
 	return &storagev1alpha1.ZfsPool{
 		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName(guid)},
@@ -121,6 +125,14 @@ func onlinePool(guid, ip, mountPath, poolName string) *storagev1alpha1.ZfsPool {
 			Health:        storagev1alpha1.PoolHealthOnline,
 		},
 	}
+}
+
+// remotePool is identical to onlinePool but hosted on a different node than
+// the plugin under test ("node-a"), forcing the network (NVMe-oF/NFS) path.
+func remotePool(guid, ip, mountPath, poolName string) *storagev1alpha1.ZfsPool {
+	pool := onlinePool(guid, ip, mountPath, poolName)
+	pool.Status.CurrentNode = "node-b"
+	return pool
 }
 
 func newNodeServer(t *testing.T, m NodeMounter, objs ...client.Object) *NodeServer {
@@ -153,6 +165,15 @@ func dataset(name, path string, typ storagev1alpha1.DatasetType) *storagev1alpha
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: path, Type: typ},
 	}
+}
+
+// datasetWithPath is dataset plus a Status.Path, as a Ready zvol would carry
+// once the agent has reconciled it — the local-passthrough path (ADR-0031)
+// reads this field directly instead of connecting over NVMe-oF.
+func datasetWithPath(name, path string, typ storagev1alpha1.DatasetType, statusPath string) *storagev1alpha1.ZfsDataset {
+	ds := dataset(name, path, typ)
+	ds.Status.Path = statusPath
+	return ds
 }
 
 func TestNodePublish_NFS(t *testing.T) {
@@ -206,7 +227,7 @@ func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 	m := newFakeMounter()
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"}}
 	export.Status.NQN = "nqn.2025-01.io.simple-zfs-csi:pvc-2"
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export,
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"), export,
 		dataset("pvc-2", "k8s/pvc-2", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
@@ -249,7 +270,7 @@ func TestNodePublish_NVMeoF_RecordsFSTypeOnce(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"},
 		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-2", Type: storagev1alpha1.DatasetTypeVolume},
 	}
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export, vol)
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"), export, vol)
 
 	if _, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
 		VolumeId:         "pvc-2",
@@ -297,7 +318,7 @@ func TestNodePublish_NVMeoF_DHChap(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "dhchap-pvc-9", Namespace: "sys"},
 		Data:       map[string][]byte{nvmeauth.SecretKeyDHChap: []byte("DHHC-1:00:Zm9v:")},
 	}
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export, sec,
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"), export, sec,
 		dataset("pvc-9", "k8s/pvc-9", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
@@ -317,7 +338,7 @@ func TestNodePublish_NVMeoF_Block(t *testing.T) {
 	m := newFakeMounter()
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-3"}}
 	export.Status.NQN = "nqn.block"
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"), export,
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"), export,
 		dataset("pvc-3", "k8s/pvc-3", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
@@ -330,6 +351,71 @@ func TestNodePublish_NVMeoF_Block(t *testing.T) {
 	}
 	if m.blockMounts["/target/block"] != "/dev/nvme1n1" {
 		t.Errorf("block mount device = %q, want /dev/nvme1n1", m.blockMounts["/target/block"])
+	}
+}
+
+// TestNodePublish_NVMeoF_LocalFilesystem covers ADR-0031: when this node is the
+// pool's own node, the zvol is mounted straight from its local device path
+// (ZfsDataset.Status.Path) — no `nvme connect`, no NetworkExport dependency at
+// all (none is even seeded here).
+func TestNodePublish_NVMeoF_LocalFilesystem(t *testing.T) {
+	m := newFakeMounter()
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		datasetWithPath("pvc-10", "k8s/pvc-10", storagev1alpha1.DatasetTypeVolume, "/dev/zvol/tank/k8s/pvc-10"))
+
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-10",
+		TargetPath:       "/target/local-fs",
+		VolumeCapability: mountCap(),
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	if m.connectedNQN != "" {
+		t.Errorf("expected no nvme connect for a local volume, got NQN %q", m.connectedNQN)
+	}
+	if m.fsMounts["/target/local-fs"] != "/dev/zvol/tank/k8s/pvc-10" {
+		t.Errorf("fs mount device = %q, want /dev/zvol/tank/k8s/pvc-10", m.fsMounts["/target/local-fs"])
+	}
+}
+
+// TestNodePublish_NVMeoF_LocalBlock is the raw-block-mode counterpart of
+// TestNodePublish_NVMeoF_LocalFilesystem.
+func TestNodePublish_NVMeoF_LocalBlock(t *testing.T) {
+	m := newFakeMounter()
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		datasetWithPath("pvc-11", "k8s/pvc-11", storagev1alpha1.DatasetTypeVolume, "/dev/zvol/tank/k8s/pvc-11"))
+
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-11",
+		TargetPath:       "/target/local-block",
+		VolumeCapability: blockCap(),
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	if m.connectedNQN != "" {
+		t.Errorf("expected no nvme connect for a local volume, got NQN %q", m.connectedNQN)
+	}
+	if m.blockMounts["/target/local-block"] != "/dev/zvol/tank/k8s/pvc-11" {
+		t.Errorf("block mount device = %q, want /dev/zvol/tank/k8s/pvc-11", m.blockMounts["/target/local-block"])
+	}
+}
+
+// TestNodePublish_NVMeoF_LocalRequiresStatusPath ensures a not-yet-Ready local
+// zvol (no Status.Path yet) fails loudly instead of mounting a made-up path.
+func TestNodePublish_NVMeoF_LocalRequiresStatusPath(t *testing.T) {
+	m := newFakeMounter()
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		dataset("pvc-12", "k8s/pvc-12", storagev1alpha1.DatasetTypeVolume))
+
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-12",
+		TargetPath:       "/target/local-pending",
+		VolumeCapability: mountCap(),
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("err = %v, want FailedPrecondition", err)
 	}
 }
 
@@ -367,7 +453,7 @@ func TestNodePublish_BlockOnNFSRejected(t *testing.T) {
 func TestNodePublish_NVMeoFRequiresNQN(t *testing.T) {
 	m := newFakeMounter()
 	// No NetworkExport object -> no NQN available.
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"),
 		dataset("pvc-6", "k8s/pvc-6", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{

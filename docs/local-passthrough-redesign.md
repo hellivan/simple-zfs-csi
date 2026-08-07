@@ -1,6 +1,31 @@
 # Node-Local Passthrough Redesign — Research & Implementation Plan
 
-**Status: Proposed (2026-08-07), not started.** See [ADR-0031](design-decisions.md).
+**Status: Phase 1 partially implemented (2026-08-07).** See [ADR-0031](design-decisions.md).
+
+## Implementation status
+
+- **Done:** `NodePublishVolume` routes a zvol straight to its local device path
+  (`ZfsDataset.Status.Path`) when `isLocalToPool` reports this node hosts the
+  pool — no `nvme connect`, no `NetworkExport` dependency at all for that call.
+  See `publishLocalZvol`/`isLocalToPool` in
+  [internal/csi/node.go](../internal/csi/node.go) and the
+  `TestNodePublish_NVMeoF_Local*` tests in
+  [internal/csi/node_test.go](../internal/csi/node_test.go).
+- **Deliberately deferred (task 3 below):** `ControllerPublishVolume` still
+  creates a `ZfsShareAttachRequest` and `nvmeof-controller` still programs the
+  nvmet configfs export unconditionally, even for a local attach. The export
+  is simply never used by a local publish. This is safe (no functional harm,
+  some wasted target-side setup) and keeps this first slice small; skipping
+  the nvmet programming step for local-only attaches is the next increment.
+- **Known gap, not yet fixed:** `NodeExpandVolume` does not yet know about
+  local zvols. It still resolves the device purely through `NetworkExport`/
+  `NVMeDevice`, so expanding a *local* zvol's filesystem currently fails with a
+  clear `FailedPrecondition: nvme device ... is not connected` — a safe, loud
+  failure, not silent data loss, but online expansion of a local zvol does not
+  work yet. Needs a locality branch mirroring `NodePublishVolume`'s, using
+  `ZfsDataset.Status.Path` directly (no rescan needed — the block device
+  already reflects the grown zvol without any NVMe-oF hop involved).
+- **Not started:** Phase 2 (dataset/NFS passthrough).
 
 ## Motivation
 

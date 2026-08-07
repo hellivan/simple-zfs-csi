@@ -87,7 +87,7 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 	// only ever be a stale mirror of the CR (a dataset rename would be invisible
 	// to every later mount). A failed lookup fails the publish rather than
 	// falling back to a cached path nobody is reconciling any more.
-	poolGUID, dataset, protocol, err := n.resolveVolume(ctx, volumeID)
+	poolGUID, dataset, statusPath, protocol, err := n.resolveVolume(ctx, volumeID)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +120,11 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 			return nil, err
 		}
 	case storagev1alpha1.ProtocolNVMeoF:
-		if err := n.publishNVMeoF(ctx, volumeID, pool, targetPath, block, readOnly, fsType, mountFlags); err != nil {
+		if isLocalToPool(n.NodeID, pool) {
+			if err := n.publishLocalZvol(ctx, volumeID, statusPath, targetPath, block, readOnly, fsType, mountFlags); err != nil {
+				return nil, err
+			}
+		} else if err := n.publishNVMeoF(ctx, volumeID, pool, targetPath, block, readOnly, fsType, mountFlags); err != nil {
 			return nil, err
 		}
 	default:
@@ -203,22 +207,25 @@ func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 	return &csi.NodeExpandVolumeResponse{}, nil
 }
 
-// resolveVolume loads the current poolGUID, dataset path and protocol live from
-// the ZfsDataset CR (ObjectMeta.Name == volumeID, immutable —
-// independent-resource-naming-redesign.md). protocol is derived from Spec.Type
-// (filesystem<->nfs, volume<->nvmeof, the same 1:1 mapping ParseParams enforces
-// at CreateVolume time), so there is nothing protocol-specific left for
-// volume_context to carry that isn't already on the CR.
-func (n *NodeServer) resolveVolume(ctx context.Context, volumeID string) (poolGUID, dataset string, protocol storagev1alpha1.Protocol, err error) {
+// resolveVolume loads the current poolGUID, dataset path, node-local status
+// path and protocol live from the ZfsDataset CR (ObjectMeta.Name == volumeID,
+// immutable — independent-resource-naming-redesign.md). protocol is derived
+// from Spec.Type (filesystem<->nfs, volume<->nvmeof, the same 1:1 mapping
+// ParseParams enforces at CreateVolume time), so there is nothing
+// protocol-specific left for volume_context to carry that isn't already on the
+// CR. statusPath is the agent-reported Status.Path (a dataset's mountpoint, or
+// a zvol's /dev/zvol device node) — only meaningful when this node is the
+// pool's own node (ADR-0031's local-passthrough check).
+func (n *NodeServer) resolveVolume(ctx context.Context, volumeID string) (poolGUID, dataset, statusPath string, protocol storagev1alpha1.Protocol, err error) {
 	ds := &storagev1alpha1.ZfsDataset{}
 	if err := n.Client.Get(ctx, client.ObjectKey{Name: volumeID}, ds); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", "", "", status.Errorf(codes.NotFound, "ZfsDataset %q not found", volumeID)
+			return "", "", "", "", status.Errorf(codes.NotFound, "ZfsDataset %q not found", volumeID)
 		}
-		return "", "", "", status.Errorf(codes.Internal, "get ZfsDataset %q: %v", volumeID, err)
+		return "", "", "", "", status.Errorf(codes.Internal, "get ZfsDataset %q: %v", volumeID, err)
 	}
 	if ds.Spec.PoolGUID == "" || ds.Spec.Dataset == "" {
-		return "", "", "", status.Errorf(codes.Internal, "ZfsDataset %q has no poolGUID/dataset", volumeID)
+		return "", "", "", "", status.Errorf(codes.Internal, "ZfsDataset %q has no poolGUID/dataset", volumeID)
 	}
 	switch ds.Spec.Type {
 	case storagev1alpha1.DatasetTypeFilesystem:
@@ -226,9 +233,18 @@ func (n *NodeServer) resolveVolume(ctx context.Context, volumeID string) (poolGU
 	case storagev1alpha1.DatasetTypeVolume:
 		protocol = storagev1alpha1.ProtocolNVMeoF
 	default:
-		return "", "", "", status.Errorf(codes.Internal, "ZfsDataset %q has unknown type %q", volumeID, ds.Spec.Type)
+		return "", "", "", "", status.Errorf(codes.Internal, "ZfsDataset %q has unknown type %q", volumeID, ds.Spec.Type)
 	}
-	return ds.Spec.PoolGUID, ds.Spec.Dataset, protocol, nil
+	return ds.Spec.PoolGUID, ds.Spec.Dataset, ds.Status.Path, protocol, nil
+}
+
+// isLocalToPool reports whether nodeID is the node currently hosting pool. If
+// so, the node plugin can read/write the volume's local path directly instead
+// of looping back through NVMe-oF/NFS (ADR-0031) — those protocols exist to
+// reach a pool hosted elsewhere, and add nothing but overhead when the pool is
+// right here.
+func isLocalToPool(nodeID string, pool *storagev1alpha1.ZfsPool) bool {
+	return nodeID != "" && pool.Status.CurrentNode == nodeID
 }
 
 // resolvePool loads the ZfsPool for a GUID and validates it is reachable.
@@ -323,6 +339,41 @@ func (n *NodeServer) publishNVMeoF(ctx context.Context, volumeID string, pool *s
 	// clone/restore into a different fsType can be rejected instead of
 	// silently producing a bad-superblock mount failure. Never fails the
 	// publish itself — the mount already succeeded.
+	if err := n.recordFSType(ctx, volumeID, effectiveFS); err != nil {
+		n.Log.Error(err, "failed to record fsType on ZfsDataset status", "volume", volumeID, "fsType", effectiveFS)
+	}
+	return nil
+}
+
+// publishLocalZvol publishes a zvol directly from its local device path
+// (ADR-0031) when this node hosts the pool itself: no `nvme connect`, no
+// nvmet/NetworkExport dependency, no loopback network hop at all. devicePath
+// is the agent-reported ZfsDataset.Status.Path (populated once the dataset is
+// Ready), the same "/dev/zvol/<pool>/<dataset>" node NVMe-oF would otherwise
+// export.
+func (n *NodeServer) publishLocalZvol(ctx context.Context, volumeID, devicePath, targetPath string, block, readOnly bool, fsType string, flags []string) error {
+	if devicePath == "" {
+		return status.Errorf(codes.FailedPrecondition, "volume %q has no local device path yet", volumeID)
+	}
+
+	if block {
+		if err := n.Mounter.MakeFile(targetPath); err != nil {
+			return status.Errorf(codes.Internal, "create block target %q: %v", targetPath, err)
+		}
+		if err := n.Mounter.BindMountDevice(devicePath, targetPath, readOnly); err != nil {
+			return status.Errorf(codes.Internal, "bind-mount device %q: %v", devicePath, err)
+		}
+		return nil
+	}
+
+	if err := n.Mounter.MakeDir(targetPath); err != nil {
+		return status.Errorf(codes.Internal, "create target %q: %v", targetPath, err)
+	}
+	effectiveFS, err := n.Mounter.FormatAndMount(devicePath, targetPath, fsType, mountOptions(flags, readOnly))
+	if err != nil {
+		return status.Errorf(codes.Internal, "format and mount %q: %v", devicePath, err)
+	}
+	// Best-effort (D10), same as publishNVMeoF above.
 	if err := n.recordFSType(ctx, volumeID, effectiveFS); err != nil {
 		n.Log.Error(err, "failed to record fsType on ZfsDataset status", "volume", volumeID, "fsType", effectiveFS)
 	}
