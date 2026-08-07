@@ -1153,9 +1153,9 @@ currently enforced.
 **Status: open.** The runtime workaround is confirmed effective; the
 machine-config non-application (and therefore a persistent fix) is unresolved
 and needs further research. See also
-[local-passthrough-redesign.md](local-passthrough-redesign.md), which would
-reduce (not eliminate) the pressure this class describes by removing
-unnecessary loopback network traffic for co-located workloads.
+[local-passthrough-redesign.md](local-passthrough-redesign.md), which reduces
+(not eliminates) the pressure this class describes by removing unnecessary
+loopback network traffic for co-located workloads.
 
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
@@ -1206,16 +1206,17 @@ and permissions **once, right after the dataset is created** (via host
 When the CSI's storage node also runs Kubernetes workloads (the norm on a
 single-node deployment, common elsewhere), every volume attach today loops
 back through NVMe-over-TCP and/or NFS on the same machine (see ADR-0031 /
-[local-passthrough-redesign.md](local-passthrough-redesign.md) for a proposed
-fix). Every I/O crosses the network stack, ZFS's task queues, and — for NFS —
-`nfsd`/`lockd`, generating real, sustained context-switch traffic even though
-the data never leaves the box. A **load average of 15-17 on a 6-core node with
-CPU 85-90% idle** is consistent with this architecture on its own and is not,
-by itself, evidence of a fault: load average counts uninterruptible-I/O wait,
-and this stack produces a lot of very short waits. Before treating a high load
-average as a bug, check for **actual** evidence of trouble first — hung-task
-warnings, `starting error recovery` bursts, or real I/O errors in dmesg (see
-class 21) — rather than the load-average number alone.
+[local-passthrough-redesign.md](local-passthrough-redesign.md) for the
+zvol-side fix). Every I/O crosses the network stack, ZFS's task queues, and —
+for NFS — `nfsd`/`lockd`, generating real, sustained context-switch traffic
+even though the data never leaves the box. A **load average of 15-17 on a
+6-core node with CPU 85-90% idle** is consistent with this architecture on its
+own and is not, by itself, evidence of a fault: load average counts
+uninterruptible-I/O wait, and this stack produces a lot of very short waits.
+Before treating a high load average as a bug, check for **actual** evidence of
+trouble first — hung-task warnings, `starting error recovery` bursts, or real
+I/O errors in dmesg (see class 21) — rather than the load-average number
+alone.
 
 ---
 

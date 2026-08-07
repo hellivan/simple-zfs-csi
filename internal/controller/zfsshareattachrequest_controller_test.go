@@ -17,6 +17,7 @@ import (
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 	"github.com/hellivan/simple-zfs-csi/internal/nvmeauth"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 func newAttachScheme(t *testing.T) *runtime.Scheme {
@@ -37,6 +38,16 @@ func nodeWithIP(name, ip string) *corev1.Node {
 		Status: corev1.NodeStatus{
 			Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: ip}},
 		},
+	}
+}
+
+// remoteAttachPool is a ZfsPool hosted on "node-c" — none of this file's attach
+// requests ever use that node name, so a share aggregated against it always
+// takes the network-export path (ADR-0031's local-only branch never matches).
+func remoteAttachPool(guid string) *storagev1alpha1.ZfsPool {
+	return &storagev1alpha1.ZfsPool{
+		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName(guid)},
+		Status:     storagev1alpha1.ZfsPoolStatus{GUID: guid, CurrentNode: "node-c"},
 	}
 }
 
@@ -212,6 +223,7 @@ func TestAttachRequest_NVMeoFSingleNodeShare(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-3"},
 		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-3", Type: storagev1alpha1.DatasetTypeVolume},
 	}
+	pool := remoteAttachPool("999")
 	node := nodeWithIP("node-a", "10.0.0.7")
 	ar := &storagev1alpha1.ZfsShareAttachRequest{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-3-node-a"},
@@ -220,7 +232,7 @@ func TestAttachRequest_NVMeoFSingleNodeShare(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(ds, node, ar).
+		WithObjects(ds, pool, node, ar).
 		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
 		Build()
 
@@ -241,9 +253,6 @@ func TestAttachRequest_NVMeoFSingleNodeShare(t *testing.T) {
 	if share.Spec.NFS != nil {
 		t.Errorf("nfs export spec must be nil for nvmeof")
 	}
-	if share.Spec.AttachedNode != "node-a" {
-		t.Errorf("attachedNode = %q, want node-a", share.Spec.AttachedNode)
-	}
 }
 
 func TestAttachRequest_NVMeoFRaceExportsOldestNodeOnly(t *testing.T) {
@@ -253,6 +262,7 @@ func TestAttachRequest_NVMeoFRaceExportsOldestNodeOnly(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-9"},
 		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-9", Type: storagev1alpha1.DatasetTypeVolume},
 	}
+	pool := remoteAttachPool("999")
 	// node-a attached first (older); node-b is a racing newcomer.
 	older := &storagev1alpha1.ZfsShareAttachRequest{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-9-node-a", CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour))},
@@ -265,7 +275,7 @@ func TestAttachRequest_NVMeoFRaceExportsOldestNodeOnly(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(ds, older, newer).
+		WithObjects(ds, pool, older, newer).
 		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
 		Build()
 
@@ -300,6 +310,7 @@ func TestAttachRequest_NVMeoFAuthProgramsSecretAndNQN(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-4"},
 		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-4", Type: storagev1alpha1.DatasetTypeVolume},
 	}
+	pool := remoteAttachPool("999")
 	node := nodeWithIP("node-a", "10.0.0.8")
 	ar := &storagev1alpha1.ZfsShareAttachRequest{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-4-node-a"},
@@ -308,7 +319,7 @@ func TestAttachRequest_NVMeoFAuthProgramsSecretAndNQN(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(ds, node, ar).
+		WithObjects(ds, pool, node, ar).
 		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
 		Build()
 
@@ -346,5 +357,105 @@ func TestAttachRequest_NVMeoFAuthProgramsSecretAndNQN(t *testing.T) {
 	reconcileAttach(t, r, "pvc-4-node-a")
 	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "sys", Name: "dhchap-pvc-4"}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Errorf("expected DH-CHAP secret deleted after detach, got err=%v", err)
+	}
+}
+
+// TestAttachRequest_NVMeoFLocalSkipsShare covers ADR-0031: when the winning
+// node is also the pool's own current node, no ZfsShare is created at all (a
+// ZfsShare's existence should always mean "this is exported over the
+// network" — never sometimes silently a no-op), no DH-CHAP secret is wasted,
+// and the attach request is still Ready.
+func TestAttachRequest_NVMeoFLocalSkipsShare(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-10"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-10", Type: storagev1alpha1.DatasetTypeVolume},
+	}
+	pool := &storagev1alpha1.ZfsPool{
+		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName("999")},
+		Status:     storagev1alpha1.ZfsPoolStatus{GUID: "999", CurrentNode: "node-a"},
+	}
+	node := nodeWithIP("node-a", "10.0.0.9")
+	ar := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-10-node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-10", NodeName: "node-a"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, pool, node, ar).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme, Namespace: "sys", DHChapEnabled: true}
+	reconcileAttach(t, r, "pvc-10-node-a") // finalizer
+	reconcileAttach(t, r, "pvc-10-node-a") // local: no share, ready immediately
+
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-10"}, &storagev1alpha1.ZfsShare{}); err == nil {
+		t.Fatalf("expected no ZfsShare for a local attach")
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "sys", Name: "dhchap-pvc-10"}, &corev1.Secret{}); err == nil {
+		t.Errorf("expected no DH-CHAP secret for a local attach")
+	}
+
+	got := &storagev1alpha1.ZfsShareAttachRequest{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-10-node-a"}, got); err != nil {
+		t.Fatalf("get attach request: %v", err)
+	}
+	if !got.Status.Ready {
+		t.Errorf("local attach should be Ready with no ZfsShare to wait on, got %+v", got.Status)
+	}
+}
+
+// TestAttachRequest_NVMeoFPoolMovesAwayCreatesShare covers the transition: an
+// attach that started local must fall back to a real ZfsShare once the pool
+// moves off the attached node (the new ZfsPool watch, requestsForPool, is what
+// re-drives this in a live cluster; here we call Reconcile again directly to
+// simulate that watch firing).
+func TestAttachRequest_NVMeoFPoolMovesAwayCreatesShare(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-11"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-11", Type: storagev1alpha1.DatasetTypeVolume},
+	}
+	pool := &storagev1alpha1.ZfsPool{
+		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName("999")},
+		Status:     storagev1alpha1.ZfsPoolStatus{GUID: "999", CurrentNode: "node-a"},
+	}
+	node := nodeWithIP("node-a", "10.0.0.10")
+	ar := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-11-node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-11", NodeName: "node-a"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, pool, node, ar).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}, &storagev1alpha1.ZfsPool{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme}
+	reconcileAttach(t, r, "pvc-11-node-a") // finalizer
+	reconcileAttach(t, r, "pvc-11-node-a") // local: no share
+
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-11"}, &storagev1alpha1.ZfsShare{}); err == nil {
+		t.Fatalf("expected no ZfsShare while local")
+	}
+
+	var moved storagev1alpha1.ZfsPool
+	if err := c.Get(context.Background(), client.ObjectKey{Name: zpool.ResourceName("999")}, &moved); err != nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	moved.Status.CurrentNode = "node-b"
+	if err := c.Status().Update(context.Background(), &moved); err != nil {
+		t.Fatalf("update pool: %v", err)
+	}
+
+	reconcileAttach(t, r, "pvc-11-node-a")
+
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-11"}, &storagev1alpha1.ZfsShare{}); err != nil {
+		t.Fatalf("expected a ZfsShare once the pool is no longer local: %v", err)
 	}
 }

@@ -225,7 +225,6 @@ func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 		return nil, status.Errorf(codes.Internal, "resize filesystem on %q: %v", device, err)
 	}
 
-
 	n.Log.Info("expanded volume on node", "volume", volumeID, "device", device, "path", volumePath)
 	return &csi.NodeExpandVolumeResponse{}, nil
 }

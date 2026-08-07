@@ -11,78 +11,83 @@ in [runbooks.md](runbooks.md).
 
 ---
 
-## ADR-0031 — Node-local passthrough: bypass NVMe-oF/NFS when the workload and the pool share a node
+## ADR-0031 — Node-local passthrough: bypass NVMe-oF entirely when the workload and the pool share a node
 
-**Status:** Proposed (2026-08-07), Phase 1 partially implemented same day · **Scope:** `internal/csi/{node,mount,controller}.go`, `internal/controller/{zfsshareattachrequest_controller,nfs_controller}.go`, `internal/nvmet`, chart · **Related:** [local-passthrough-redesign.md](local-passthrough-redesign.md), [known-pitfalls.md](known-pitfalls.md) class 21.
+**Status:** Accepted, Phase 1 implemented (2026-08-08) · **Scope:** `internal/csi/{node,mount,controller}.go`, `internal/controller/zfsshareattachrequest_controller.go` · **Related:** [local-passthrough-redesign.md](local-passthrough-redesign.md).
 
 ### Context
 
-Every CSI-provisioned volume is attached over a network protocol — NVMe-oF for
-zvols, NFS for filesystem datasets — even when the consuming pod runs on the
-same node that hosts the ZFS pool. On a single-node deployment this is true for
-*every* attach, unconditionally; on a multi-node deployment it is still
-frequently true. This is not free: stacking NVMe-over-TCP, ZFS, and (for
-datasets) NFS on top of each other for what is physically local disk I/O
-produces real, measured overhead (class 21's "loopback stacking" note) and was
-implicated in a separate boot-time race between the NVMe-oF initiator and
-target sides observed on 2026-08-07.
+Every zvol attach today loops back through NVMe-oF even when the consuming
+pod runs on the same node that hosts the pool — on a single-node deployment
+that is true for *every* attach, unconditionally. Stacking NVMe-over-TCP and
+ZFS on top of each other for what is physically local disk I/O produces real,
+measured overhead and was implicated in a boot-time race between the NVMe-oF
+initiator and target sides observed on a live cluster.
 
 Both pieces of routing data this decision needs already exist:
 `ZfsPool.status.currentNode` (the pool's home node) and the requesting node ID
-(already threaded through `ControllerPublishVolume`/`NodeStageVolume`). No new
-CRD field is required.
-
-### Options weighed
-
-- **Status quo: always use the network path.** Simplest, and what the driver
-  does today. Pays the loopback tax unconditionally, including on the single-
-  node topology where it can never be avoided by scheduling instead.
-- **Drop the network path entirely; require colocation.** Rejected — breaks
-  true multi-node scheduling and RWX volumes, both explicitly supported today.
-- **Locality-aware dual path (accepted).** Compare the requesting node against
-  `ZfsPool.status.currentNode` on every Stage/Publish call (never cached, never
-  decided once at `CreateVolume` — consistent with ADR-0021's "resolve live"
-  precedent). When they match, bypass the network protocol: zvols use the
-  local block device directly; RWO filesystem datasets bind-mount the pool's
-  own mountpoint directly. RWX datasets always use NFS regardless of locality,
-  since multiple nodes may need concurrent access.
+(already threaded through `ControllerPublishVolume`/`NodePublishVolume`). No
+new CRD field is required — see "Rejected alternatives" for two designs that
+were tried first and backed out.
 
 ### Decision
 
-Accepted, to be implemented in two phases (see
-[local-passthrough-redesign.md](local-passthrough-redesign.md) for the full
-task list):
+**Node plugin (`internal/csi/node.go`):** `NodePublishVolume` and
+`NodeExpandVolume` compare the requesting node against
+`ZfsPool.status.currentNode` on every call (`isLocalToPool`, re-evaluated live,
+never cached — consistent with ADR-0021). When they match, the zvol is
+mounted/resized straight from `ZfsDataset.status.path` — no `nvme connect`, no
+`NetworkExport` lookup, no DH-CHAP, no network hop at all.
 
-1. **Zvol / NVMe-oF passthrough first.** Zvols are already single-node-only
-   (class 7), so this phase has no RWX interaction to reason about. The
-   existing `ZfsShareAttachRequest` zero-trust lifecycle (ADR-0010) is kept
-   unchanged; only the nvmet configfs programming step becomes
-   locality-aware, avoiding a second bookkeeping mechanism.
-2. **Dataset / NFS passthrough second**, RWO-only, after Phase 1 has proven the
-   routing/transition machinery works. This phase carries the larger open risk
-   (SELinux relabeling of a bind-mounted host path under Talos's `pod_t`
-   context) and is deliberately sequenced after the simpler zvol case.
+**Attach-request aggregator (`internal/controller/zfsshareattachrequest_controller.go`):**
+zvols are single-node (class 7), so `reconcileVolume` already resolves exactly
+one winning attach node (`oldestAttachNode`). It now also resolves that
+volume's `ZfsPool` and compares its `CurrentNode` against the winner. When
+they match, **no `ZfsShare` is created at all** (an existing one, e.g. from
+before a pool moved, is deleted, along with any per-attach DH-CHAP secret) —
+the attach request is marked `Ready` directly, with nothing to wait on. A new
+`Watches(&ZfsPool{}, ...)` (`requestsForPool`) re-triggers this decision when a
+pool migrates, so a local attach whose pool moves away correctly falls back to
+a real `ZfsShare`/`NetworkExport` on the next reconcile — no new RBAC needed,
+since the aggregator and the two other reconcilers that already read
+`ZfsPool` all run under one `operator` ClusterRole.
+
+### Rejected alternatives
+
+- **Store the winning node on a new `ZfsShareSpec.AttachedNode` field, read by
+  the `ZfsShare`→`NetworkExport` translator.** Implemented first, then
+  reverted. Two problems: (1) it needlessly duplicated a fact recoverable from
+  data already in the spec (see the next rejected alternative), and (2) more
+  importantly, it let a `ZfsShare` object exist while silently producing no
+  `NetworkExport` — breaking the invariant that a `ZfsShare`'s existence means
+  "this is exported over the network." That invariant violation, not the
+  extra field, is why this alternative was rejected outright rather than kept
+  as a cheaper variant.
+- **Keep the field-free idea, but still let the translator decide (by
+  recomputing the per-attach host NQN via `nvmeauth.HostIdentity` and checking
+  it against `NVMeoF.AllowedHosts`).** Avoided the CRD field, but kept the same
+  invariant violation as above — a `ZfsShare` could still exist and do
+  nothing. Rejected for the same reason once the invariant question was
+  raised, independent of whether a field was involved.
+- **Accepted design: the aggregator decides *before* creating anything.**
+  Mirrors a pattern the aggregator already has ("no attach requests left →
+  delete the `ZfsShare`"): "the sole attach is local → never create the
+  `ZfsShare`" is the same shape of decision, made by the same component, using
+  data it already resolves (`ZfsPool`) for exactly this purpose.
 
 ### Consequences
 
-- Two routing paths (local/network) per volume type to test and maintain,
-  instead of one.
-- The volume/pod locality relationship must be re-resolved on every
-  Stage/Publish call and cleanly transitioned in both directions (a
-  previously-local volume becoming remote, and vice versa) — the highest-risk
-  part of the change, called out explicitly in the task list.
-- For zvols, local access removes the NVMe-oF network path (and with it, its
-  DH-CHAP auth surface, ADR-0011) for the local case entirely — a smaller
-  attack surface, not a weaker one, since there is no network hop left to
-  secure.
-- For datasets, a locally bind-mounted RWO volume trades NFS `lockd` advisory
-  locking semantics for native POSIX locks — expected to be equivalent or
-  better, but worth documenting for any workload that depends on NFS-specific
-  lock behavior.
-- **Partially started.** `NodePublishVolume`'s zvol local-device passthrough
-  landed 2026-08-07; the nvmet-programming skip, `NodeExpandVolume` support,
-  and all of Phase 2 (datasets/NFS) have not. Implementation status is tracked
-  in local-passthrough-redesign.md.
+- A `ZfsShare` object's existence now reliably means "this volume is exported
+  over the network" — true unconditionally, not "true unless it happens to be
+  local," in both the CSI-driven and manually-authored `ZfsShare` workflows.
+- `nvmeof-controller` never touches `nvmet`/configfs for a fully local attach,
+  and no per-attach DH-CHAP `Secret` is created for one either (both were
+  wasted-but-harmless side effects of the earlier, rejected designs).
+- The aggregator gained a `ZfsPool` `Get` + a new `Watches` for migration
+  correctness — a small, well-precedented addition (the translator already
+  had the equivalent `sharesForPool` watch for the same reason).
+- **Not started:** Phase 2 (dataset/NFS passthrough). Implementation status is
+  tracked in [local-passthrough-redesign.md](local-passthrough-redesign.md).
 
 ---
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +23,7 @@ import (
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 	"github.com/hellivan/simple-zfs-csi/internal/nvmeauth"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 )
 
 // zfsShareAttachRequestFinalizer lets the aggregation reconciler recompute (and
@@ -82,6 +84,7 @@ func (r *ZfsShareAttachRequestReconciler) gateReader() client.Reader {
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsshareattachrequests/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsshares,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;delete
 
@@ -98,7 +101,7 @@ func (r *ZfsShareAttachRequestReconciler) Reconcile(ctx context.Context, req ctr
 	// then release the finalizer.
 	if !ar.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&ar, zfsShareAttachRequestFinalizer) {
-			if _, _, err := r.reconcileVolume(ctx, volume); err != nil {
+			if _, _, _, err := r.reconcileVolume(ctx, volume); err != nil {
 				return ctrl.Result{}, err
 			}
 			controllerutil.RemoveFinalizer(&ar, zfsShareAttachRequestFinalizer)
@@ -117,7 +120,7 @@ func (r *ZfsShareAttachRequestReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, nil
 	}
 
-	share, exported, err := r.reconcileVolume(ctx, volume)
+	share, exported, localOnly, err := r.reconcileVolume(ctx, volume)
 	if err != nil {
 		// The backing ZfsDataset may not exist yet, or a node IP is not resolvable;
 		// surface it and retry.
@@ -125,14 +128,17 @@ func (r *ZfsShareAttachRequestReconciler) Reconcile(ctx context.Context, req ctr
 	}
 
 	// This request is ready only when its own node is the exported one — for a
-	// single-node zvol a losing racer is deliberately not exported — and the export
-	// is live for the current generation.
+	// single-node zvol a losing racer is deliberately not exported — and either the
+	// attach is local (no ZfsShare needed at all, ADR-0031) or the export is live
+	// for the current generation.
 	nodeExported := slices.Contains(exported, ar.Spec.NodeName)
-	ready := nodeExported && shareReadyForGeneration(share)
+	ready := nodeExported && (localOnly || shareReadyForGeneration(share))
 	reason, msg := "Exported", fmt.Sprintf("export live on the current generation for %q", volume)
 	switch {
 	case !nodeExported:
 		reason, msg = "Waiting", fmt.Sprintf("volume %q is exported to another node; waiting for it to detach", volume)
+	case localOnly:
+		reason, msg = "Local", fmt.Sprintf("volume %q is local to its own node; no network export needed", volume)
 	case !ready:
 		reason, msg = "Exporting", "waiting for the aggregated share to be exported"
 	}
@@ -147,13 +153,21 @@ func (r *ZfsShareAttachRequestReconciler) Reconcile(ctx context.Context, req ctr
 
 // reconcileVolume ensures (or deletes) the ZfsShare for a volume from the current
 // set of active attach requests. It returns the resulting ZfsShare (nil when
-// none remain).
-func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, volume string) (*storagev1alpha1.ZfsShare, []string, error) {
+// none remain, including when the sole attach is local — see localOnly), the
+// nodes actually exported to, and whether this is a local-only NVMe-oF attach
+// (ADR-0031): the winning node is also the pool's own current node, so the node
+// plugin will read the zvol's local device path directly
+// (internal/csi/node.go's publishLocalZvol) and no ZfsShare/NetworkExport is
+// created at all. A ZfsShare's existence should always mean "this volume is
+// actually exported over the network" — never sometimes silently a no-op — so
+// the decision not to export lives here, before any ZfsShare would be written,
+// rather than downstream in the translator.
+func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, volume string) (share *storagev1alpha1.ZfsShare, exported []string, localOnly bool, err error) {
 	logger := log.FromContext(ctx)
 
 	nodes, err := r.activeNodes(ctx, r.Client, volume)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 
 	shareKey := client.ObjectKey{Name: volume}
@@ -163,7 +177,7 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 	// LIST on the teardown path only.
 	if len(nodes) == 0 {
 		if nodes, err = r.activeNodes(ctx, r.gateReader(), volume); err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 
@@ -172,28 +186,28 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 	if len(nodes) == 0 {
 		share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
 		if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if err := r.deleteDHChapSecret(ctx, volume); err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 
 	var ds storagev1alpha1.ZfsDataset
 	if err := r.Get(ctx, shareKey, &ds); err != nil {
-		return nil, nil, fmt.Errorf("get ZfsDataset %q: %w", volume, err)
+		return nil, nil, false, fmt.Errorf("get ZfsDataset %q: %w", volume, err)
 	}
 	protocol, err := protocolForDatasetType(ds.Spec.Type)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 
 	// exported is the set of nodes the share is actually exported to. For NFS
 	// (RWX) that is every requesting node; for a zvol (NVMe-oF, single-node) it is
 	// exactly one node so the block device is never attached read-write to two
 	// nodes at once, even if a rare attach race leaves several attach requests.
-	exported := nodes
+	exported = nodes
 
 	var nfsClients []storagev1alpha1.NFSClient
 	var nvmeSpec *storagev1alpha1.NVMeoFExportSpec
@@ -201,7 +215,7 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 	case storagev1alpha1.ProtocolNFS:
 		nfsClients, err = r.nfsClientsForNodes(ctx, nodes)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	case storagev1alpha1.ProtocolNVMeoF:
 		// Single-node safety (defense in depth; the CSI controller already rejects a
@@ -211,53 +225,67 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 		// ControllerPublish times out and retries until it either wins or gives up.
 		node, err := r.oldestAttachNode(ctx, volume)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if len(nodes) > 1 {
 			logger.Info("zvol has attach requests from multiple nodes; exporting only to the oldest",
 				"volume", volume, "nodes", nodes, "chosen", node)
 		}
 		exported = []string{node}
+
+		var pool storagev1alpha1.ZfsPool
+		if err := r.Get(ctx, client.ObjectKey{Name: zpool.ResourceName(ds.Spec.PoolGUID)}, &pool); err != nil {
+			return nil, nil, false, fmt.Errorf("get ZfsPool %q: %w", ds.Spec.PoolGUID, err)
+		}
+		if pool.Status.CurrentNode != "" && pool.Status.CurrentNode == node {
+			share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
+			if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
+				return nil, nil, false, err
+			}
+			if err := r.deleteDHChapSecret(ctx, volume); err != nil {
+				return nil, nil, false, err
+			}
+			return nil, exported, true, nil
+		}
+
 		nvmeSpec, err = r.nvmeExportSpec(ctx, volume, exported)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 
-	share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
-	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, share, func() error {
-		share.Spec.PoolGUID = ds.Spec.PoolGUID
-		share.Spec.Dataset = ds.Spec.Dataset
-		share.Spec.Protocol = protocol
+	shareObj := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, shareObj, func() error {
+		shareObj.Spec.PoolGUID = ds.Spec.PoolGUID
+		shareObj.Spec.Dataset = ds.Spec.Dataset
+		shareObj.Spec.Protocol = protocol
 		switch protocol {
 		case storagev1alpha1.ProtocolNFS:
-			share.Spec.NFS = &storagev1alpha1.NFSExportSpec{Clients: nfsClients}
-			share.Spec.NVMeoF = nil
-			share.Spec.AttachedNode = ""
+			shareObj.Spec.NFS = &storagev1alpha1.NFSExportSpec{Clients: nfsClients}
+			shareObj.Spec.NVMeoF = nil
 		case storagev1alpha1.ProtocolNVMeoF:
 			// NVMe-oF is single-node (ADR-0010): default-deny by the attached node's
 			// derived host NQN, plus optional per-attach DH-CHAP (ADR-0011).
-			share.Spec.NVMeoF = nvmeSpec
-			share.Spec.NFS = nil
-			share.Spec.AttachedNode = exported[0]
+			shareObj.Spec.NVMeoF = nvmeSpec
+			shareObj.Spec.NFS = nil
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	if op != controllerutil.OperationResultNone {
 		logger.Info("aggregated ZfsShare", "op", op, "volume", volume, "nodes", exported)
 	}
 
-	// `share` is what the API server returned from the create/update above, so its
+	// `shareObj` is what the API server returned from the create/update above, so its
 	// Generation and Status are authoritative. Re-reading it through the manager's
 	// cache here would be a read-your-own-write: an informer still holding the
 	// pre-update copy reports the *old* Generation alongside the *old*
 	// ObservedGeneration, which match, so shareReadyForGeneration would report the
 	// attach ready before the node has applied the new allow-list
 	// (known-pitfalls.md #19).
-	return share, exported, nil
+	return shareObj, exported, false, nil
 }
 
 // oldestAttachNode returns the node whose non-terminating attach request for the
@@ -465,6 +493,49 @@ func (r *ZfsShareAttachRequestReconciler) requestsForShare(ctx context.Context, 
 	return reqs
 }
 
+// requestsForPool maps a ZfsPool event to reconcile requests for every attach
+// request whose volume lives on that pool, so a pool takeover (import onto a
+// different node) re-evaluates whether each NVMe-oF attach is still local
+// (ADR-0031). A local-only attach has no ZfsShare of its own for the usual
+// Owns/Watches(ZfsShare) path to drive through, so this direct ZfsPool watch is
+// the only way it learns the pool moved.
+func (r *ZfsShareAttachRequestReconciler) requestsForPool(ctx context.Context, obj client.Object) []reconcile.Request {
+	pool, ok := obj.(*storagev1alpha1.ZfsPool)
+	if !ok {
+		return nil
+	}
+	guid := pool.Status.GUID
+	if guid == "" {
+		guid = strings.TrimPrefix(pool.Name, "zpool-")
+	}
+
+	var dsList storagev1alpha1.ZfsDatasetList
+	if err := r.List(ctx, &dsList); err != nil {
+		return nil
+	}
+	volumes := make(map[string]bool, len(dsList.Items))
+	for i := range dsList.Items {
+		if dsList.Items[i].Spec.PoolGUID == guid {
+			volumes[dsList.Items[i].Name] = true
+		}
+	}
+	if len(volumes) == 0 {
+		return nil
+	}
+
+	var arList storagev1alpha1.ZfsShareAttachRequestList
+	if err := r.List(ctx, &arList); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range arList.Items {
+		if volumes[arList.Items[i].Spec.VolumeName] {
+			reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&arList.Items[i])})
+		}
+	}
+	return reqs
+}
+
 // SetupWithManager wires the reconciler into the manager.
 //
 // MaxConcurrentReconciles is 1 to avoid write conflicts on the shared per-volume
@@ -480,6 +551,7 @@ func (r *ZfsShareAttachRequestReconciler) SetupWithManager(mgr ctrl.Manager) err
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsShareAttachRequest{}).
 		Watches(&storagev1alpha1.ZfsShare{}, handler.EnqueueRequestsFromMapFunc(r.requestsForShare)).
+		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPool)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("zfsshareattachrequest").
 		Complete(r)

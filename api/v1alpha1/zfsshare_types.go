@@ -54,13 +54,6 @@ type ZfsShareSpec struct {
 	// NVMeoF holds NVMe-oF specific configuration. Required when protocol is nvmeof.
 	// +optional
 	NVMeoF *NVMeoFExportSpec `json:"nvmeof,omitempty"`
-
-	// AttachedNode is the single node currently attached, for a single-node
-	// (NVMe-oF) share; empty for NFS. The translator compares it against the
-	// pool's own current node to detect a fully node-local attach (ADR-0031),
-	// in which case no NetworkExport is rendered at all.
-	// +optional
-	AttachedNode string `json:"attachedNode,omitempty"`
 }
 
 // ZfsShareStatus reports the resolution result and the rendered child export.

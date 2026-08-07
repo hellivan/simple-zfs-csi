@@ -25,7 +25,7 @@ is everyone involved, in the order you'll meet them:
 | **`external-attacher`** | Standard CSI sidecar (not our code) | In the `csi-controller` pod | Watches `VolumeAttachment` objects, calls `ControllerPublishVolume` |
 | **`csi-controller`** | This project's CSI Controller service | Deployment, one or few replicas, unprivileged | Turns CSI calls into `ZfsDataset` / `ZfsShareAttachRequest` objects |
 | **`zpool-discovery`** ("the agent") | This project's per-node reconciler | DaemonSet, one pod per storage node | Discovers ZFS pools (`ZfsPool`), and does the actual `zfs create -V ...` for a `ZfsDataset` |
-| **`operator`** | This project's cluster-wide reconciler | Deployment, leader-elected | Aggregates attach requests into one `ZfsShare`, translates it into a node-pinned `NetworkExport` |
+| **`operator`** | This project's cluster-wide reconciler | Deployment, leader-elected | Aggregates attach requests, decides whether a network export is even needed (ADR-0031), translates a `ZfsShare` into a node-pinned `NetworkExport` |
 | **`nvmeof-controller`** | This project's NVMe-oF target reconciler | DaemonSet, one pod per storage node | Turns a `NetworkExport` into real kernel NVMe target (`nvmet`) configuration |
 | **`csi-node`** | This project's CSI Node service | DaemonSet, one pod on **every** node | Does the actual mount kubelet asked for: `NodePublishVolume` etc. |
 | **kubelet** | Standard Kubernetes node agent (not our code) | Every node | Calls `csi-node` right before starting the pod's containers |
@@ -38,7 +38,7 @@ And the Kubernetes objects (CRDs) that carry the request between them:
 | `ZfsDataset` | `csi-controller` | `zpool-discovery`, `csi-node` | "This zvol/dataset should exist, this big, on this pool" |
 | `ZfsPool` | `zpool-discovery` | everyone | "This pool exists, lives on node X, at IP Y, health Z" |
 | `ZfsShareAttachRequest` | `csi-controller` | `operator` | "Node X wants access to volume V" (one object per volume+node pair) |
-| `ZfsShare` | `operator` (aggregator) | `operator` (translator) | "Volume V should be exported to nodes {X, Y, ...}" (ref-counted) |
+| `ZfsShare` | `operator` (aggregator) — **only created when the attach actually needs the network** | `operator` (translator) | "Volume V should be exported to nodes {X, Y, ...}" (ref-counted) |
 | `NetworkExport` | `operator` (translator) | `nvmeof-controller` / `nfs-controller`, `csi-node` | "Export volume V's data from pool-node P, over protocol Q" |
 
 ---
@@ -62,12 +62,13 @@ flowchart TB
     subgraph Attach["Attach (when a pod is scheduled)"]
         EA[external-attacher] -->|ControllerPublishVolume| CC2[csi-controller]
         CC2 -->|writes| ZSAR[ZfsShareAttachRequest]
-        ZSAR --> OP1[operator: aggregator]
-        OP1 -->|writes| ZS[ZfsShare]
+        ZSAR --> OP1{operator: aggregator\nis the winning node\nalso the pool's node?}
+        OP1 -->|remote: yes, need network| ZS[ZfsShare]
         ZS --> OP2[operator: translator]
         OP2 -->|writes, pinned to pool node| NE[NetworkExport]
         NE --> NVC[nvmeof-controller]
         NVC -->|configfs| NVMET[(kernel nvmet target)]
+        OP1 -->|local: no ZfsShare at all| SkipShare[attach request marked Ready\ndirectly, nothing else created]
     end
 
     subgraph Mount["Mount (kubelet starts the pod)"]
@@ -88,10 +89,12 @@ Three phases, three different triggers:
 1. **Provisioning** happens once, when the PVC is created — it just makes the
    zvol *exist*. Nothing is attached to anything yet.
 2. **Attach** happens when a pod that uses the PVC is scheduled to a node —
-   it's Kubernetes/CSI asking "is node X allowed to touch this volume?"
+   it's Kubernetes/CSI asking "is node X allowed to touch this volume?", and
+   (new since ADR-0031) it's also where "does this even need a network
+   export?" gets decided, *before* anything network-shaped is created.
 3. **Mount** happens right before the pod's containers start — it's the actual
    "make the bytes appear inside the pod" step, and it's where the **local vs.
-   remote** fork in the road happens.
+   remote** fork in the road happens on the node-plugin side.
 
 ---
 
@@ -126,7 +129,7 @@ driver with `protocol: nvmeof`.
 
 ---
 
-## 4. Phase 2 — Attach: "is this node allowed in?"
+## 4. Phase 2 — Attach: "is this node allowed in, and does it even need the network?"
 
 **Trigger:** a pod that uses the PVC gets scheduled to a node (call it node
 **X**).
@@ -143,31 +146,42 @@ listener, no export, nothing to attack.
      (it's always single-node/RWO — attaching it twice would corrupt it).
    - Writes a **`ZfsShareAttachRequest`** object: "node X wants volume V".
    - Waits for it to become `Ready`.
-3. The **`operator`** (running once, cluster-wide, leader-elected) has two
-   reconcilers chained together:
-   - The **aggregator** watches `ZfsShareAttachRequest` objects. For each
-     volume, it counts up *every* node that currently holds a request for it,
-     and maintains one **`ZfsShare`** object listing that whole set. (If your
-     volume is single-node/RWO, that set is just `{X}`.)
-   - The **translator** watches `ZfsShare` objects, looks up which node
-     currently hosts the pool (`ZfsPool.status.currentNode`), and writes a
-     **`NetworkExport`** — the concrete instruction "export this data, from
-     this node, over this protocol, to this allow-list".
-4. On the storage node, **`nvmeof-controller`** is watching for
-   `NetworkExport` objects with `protocol: nvmeof`. When it sees the new one,
-   it talks to the Linux kernel's NVMe target subsystem (`nvmet`) through
-   `configfs`:
+3. The **`operator`**'s aggregator (running once, cluster-wide, leader-elected)
+   watches `ZfsShareAttachRequest` objects. For a zvol it resolves the single
+   winning node (if more than one node raced to attach, the oldest request
+   wins), then asks one more question: **is that winning node also the node
+   that hosts the pool itself (`ZfsPool.status.currentNode`)?**
+   - **If yes (local):** nothing further is created at all. No `ZfsShare`, no
+     `NetworkExport`, no `nvmet` configuration, no per-attach authentication
+     secret. The attach request is marked `Ready` immediately — there is
+     nothing to wait for. A `ZfsShare`'s existence is meant to always mean
+     "this is exported over the network," so when it isn't needed, it's
+     simply never created (ADR-0031).
+   - **If no (remote):** the aggregator creates one **`ZfsShare`** object
+     listing the winning node as its consumer.
+4. (Remote case only) The operator's **translator** watches `ZfsShare`
+   objects, looks up which node currently hosts the pool
+   (`ZfsPool.status.currentNode`), and writes a **`NetworkExport`** — the
+   concrete instruction "export this data, from this node, over this
+   protocol, to this allow-list".
+5. (Remote case only) On the storage node, **`nvmeof-controller`** is
+   watching for `NetworkExport` objects with `protocol: nvmeof`. When it sees
+   the new one, it talks to the Linux kernel's NVMe target subsystem
+   (`nvmet`) through `configfs`:
    - Creates an NVMe subsystem for this volume (if not already there).
    - Adds the zvol as a namespace inside it.
    - Enables the TCP listener port.
    - Generates the subsystem's NQN (its NVMe-oF address) and writes it back
      to `NetworkExport.status.nqn`.
-5. Once `nvmeof-controller` confirms the export is live, the
-   `ZfsShareAttachRequest` becomes `Ready`, and `ControllerPublishVolume`
+6. (Remote case only) Once `nvmeof-controller` confirms the export is live,
+   the `ZfsShareAttachRequest` becomes `Ready`, and `ControllerPublishVolume`
    finally returns success.
 
-At the end of Phase 2: the zvol is now reachable **over the network** by any
-node in the allow-list — but still nothing is mounted inside the pod yet.
+At the end of Phase 2: for a remote attach, the zvol is now reachable **over
+the network** by the winning node — but still nothing is mounted inside the
+pod yet. For a local attach, absolutely nothing network-shaped exists at all;
+the only thing that's happened is a Kubernetes object (`ZfsShareAttachRequest`)
+recording "node X is allowed to use this volume."
 
 ---
 
@@ -176,7 +190,9 @@ node in the allow-list — but still nothing is mounted inside the pod yet.
 **Trigger:** kubelet is about to start the pod's containers and calls the CSI
 Node service on node X.
 
-This is where the two variants diverge. Both start identically:
+This is where the two variants diverge on the node-plugin side (independently
+of, but consistently with, the decision already made in Phase 2). Both start
+identically:
 
 ```mermaid
 flowchart LR
@@ -192,7 +208,9 @@ the live `ZfsDataset` (for the pool GUID, dataset path, protocol) and the live
 `ZfsPool` (for health and current node/IP) on **every single mount call**.
 That's deliberate: a pool can move, a dataset can be renamed, and a stale
 answer baked into the PV object at creation time would silently go wrong
-later (ADR-0021/ADR-0022).
+later (ADR-0021/ADR-0022). It's also the same comparison the aggregator
+already made in Phase 2 — computed independently here, live, rather than
+trusted from that earlier decision.
 
 ### Variant A — Remote (pod's node ≠ the pool's node)
 
@@ -220,7 +238,8 @@ cluster, at the cost of a real network hop.
 ### Variant B — Local (pod's node == the pool's node) — ADR-0031
 
 This is the shortcut: if the pod landed on the very machine that has the
-disk, none of the network machinery in step 1-3 above is needed at all.
+disk, none of the network machinery in step 1-3 above is needed at all — and,
+per Phase 2, it was never even created in the first place.
 
 1. `csi-node` already knows (from Phase 1) that the agent recorded the zvol's
    real device path in `ZfsDataset.status.path` — for a zvol this is always
@@ -231,14 +250,9 @@ disk, none of the network machinery in step 1-3 above is needed at all.
 3. It formats (first time only) and mounts that device at the pod's target
    path, exactly like step 4 above — the mount/format code is identical
    either way, only the device path's origin differs.
-4. The pod starts and sees its volume — this time, every read/write goes
-   straight to the kernel's ZFS/zvol driver, no network stack involved at all.
-
-> **Note:** today, the `nvmet` export from Phase 2 is still created even for a
-> local attach — `nvmeof-controller` doesn't yet know to skip it. It's just
-> unused in this case (harmless, a little wasted setup) — see
-> [local-passthrough-redesign.md](local-passthrough-redesign.md) for that
-> follow-up.
+4. The pod starts and sees its volume — every read/write goes straight to the
+   kernel's ZFS/zvol driver, no network stack involved at all, and (per Phase
+   2) nothing was ever configured in `nvmet` to begin with.
 
 ---
 
@@ -247,15 +261,18 @@ disk, none of the network machinery in step 1-3 above is needed at all.
 The teardown mirrors provisioning/attach, just in the opposite order:
 
 1. Pod is deleted → kubelet calls **`NodeUnpublishVolume`**: `csi-node`
-   unmounts the target path, and (remote case only) runs `nvme disconnect`.
+   unmounts the target path, and (remote case only) runs `nvme disconnect`
+   (a harmless no-op if nothing was ever connected).
 2. `VolumeAttachment` is deleted → `external-attacher` calls
    **`ControllerUnpublishVolume`**: `csi-controller` deletes the
    `ZfsShareAttachRequest` for that node.
 3. The operator's aggregator notices one fewer request. If it was the last
-   one for that volume, it deletes the `ZfsShare`, which cascades to deleting
-   the `NetworkExport`, which `nvmeof-controller` reconciles by tearing down
-   the `nvmet` subsystem/namespace. The zvol itself is untouched — only the
-   *export* goes away.
+   one for that volume **and** a `ZfsShare` existed (i.e. it was a remote
+   attach), it deletes the `ZfsShare`, which cascades to deleting the
+   `NetworkExport`, which `nvmeof-controller` reconciles by tearing down the
+   `nvmet` subsystem/namespace. For a local attach there was never a
+   `ZfsShare` to delete. The zvol itself is untouched either way — only the
+   *export* (if any) goes away.
 4. If the PVC itself is deleted → `external-provisioner` calls
    **`DeleteVolume`**: `csi-controller` deletes the `ZfsDataset`, and
    `zpool-discovery`'s finalizer runs `zfs destroy` before letting the object
@@ -269,14 +286,14 @@ The teardown mirrors provisioning/attach, just in the opposite order:
 |---|---|---|---|
 | `CreateVolume` | external-provisioner | PVC created | Writes `ZfsDataset`, waits for `Ready`, returns the volume id |
 | `DeleteVolume` | external-provisioner | PVC deleted | Deletes `ZfsDataset`; agent's finalizer runs `zfs destroy` first |
-| `ControllerPublishVolume` | external-attacher | Pod scheduled to a node | Writes `ZfsShareAttachRequest{volume,node}`, waits for the export chain (Phase 2) to go `Ready` |
+| `ControllerPublishVolume` | external-attacher | Pod scheduled to a node | Writes `ZfsShareAttachRequest{volume,node}`, waits for either a local "Ready, no export needed" verdict or the full export chain (Phase 2) to go `Ready` |
 | `ControllerUnpublishVolume` | external-attacher | Pod's volume no longer needed on that node | Deletes the `ZfsShareAttachRequest` |
 | `ControllerExpandVolume` | external-resizer | PVC size increased | Bumps `ZfsDataset.spec`'s size, waits for the agent to grow the zvol; tells the CO a node-side step is still needed |
 | `NodeGetInfo` | kubelet | Plugin registration | Returns this node's name |
 | `NodeGetCapabilities` | kubelet | Plugin registration | Advertises volume-expansion support |
 | `NodePublishVolume` | kubelet | Right before the pod's containers start | Resolves `ZfsDataset`/`ZfsPool` live, then **local**: mounts `Status.Path` directly, or **remote**: `nvme connect` + mount |
 | `NodeUnpublishVolume` | kubelet | Pod's containers have stopped | Unmounts; remote case also `nvme disconnect`s (a no-op if never connected) |
-| `NodeExpandVolume` | kubelet | After `ControllerExpandVolume`, if node work is needed | Rescans/grows the on-device filesystem to match the new zvol size (today: remote zvols only — see the open follow-up in [local-passthrough-redesign.md](local-passthrough-redesign.md)) |
+| `NodeExpandVolume` | kubelet | After `ControllerExpandVolume`, if node work is needed | **local**: resizes the filesystem straight from `Status.Path`, no rescan; **remote**: rescans the NVMe-oF namespace first, then resizes |
 
 There is deliberately **no `NodeStageVolume`/`NodeUnstageVolume`**: this
 driver publishes directly in one step rather than a separate stage+publish,
@@ -288,8 +305,9 @@ node" behavior those RPCs exist for.
 ## 8. The one-sentence version
 
 *A PVC first makes a zvol exist (Phase 1); scheduling a pod then asks
-permission and, if needed, switches on a network export for it (Phase 2);
-and finally, right before the pod starts, the node either reaches that
-export over NVMe-oF because the disk is elsewhere, or — when the disk is
-right there on the same machine — skips the network entirely and mounts it
-directly (Phase 3).*
+permission and — only if the consuming node turns out to be different from
+the pool's own node — switches on a network export for it (Phase 2); and
+finally, right before the pod starts, the node either reaches that export
+over NVMe-oF because the disk is elsewhere, or — when the disk is right there
+on the same machine — skips the network entirely and mounts it directly
+(Phase 3), exactly matching the decision already made back in Phase 2.*
