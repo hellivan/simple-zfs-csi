@@ -40,6 +40,13 @@ it can still be authored by hand for non-ZFS paths.
 
 ## Architecture
 
+Technical references:
+
+- [CSI technical reference](docs/csi-technical-reference.md) — concise runtime
+  flow + finalizers/guards table
+- [Kubernetes volume lifecycle facts](docs/kubernetes-volume-lifecycle-facts.md)
+- [Lifecycle protection matrix](docs/lifecycle-protection-matrix.md)
+
 ### Provisioning flow (PVC → mounted pod)
 
 ```
