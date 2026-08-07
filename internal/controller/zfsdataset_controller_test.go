@@ -1041,16 +1041,11 @@ func TestZfsDatasetReconcile_DeletePromotesBackingCloneAndSucceeds(t *testing.T)
 		},
 		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 	}
-	backing := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-x"},
-		Spec: storagev1alpha1.ZfsDatasetSpec{
-			PoolGUID: "999", Dataset: "k8s/csi-snap-x", Type: storagev1alpha1.DatasetTypeFilesystem,
-			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/pvc-1@csi-snap-x"},
-		},
-	}
+	// No ZfsDataset for the backing clone: it is a ZFS clone only (ADR-0030), so
+	// assertKnownDatasets has to recognise it through the live ZfsSnapshot.
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(onlinePool(), vol, snap, backing).
+		WithObjects(onlinePool(), vol, snap).
 		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsSnapshot{}).
 		Build()
 
@@ -1288,29 +1283,28 @@ func TestZfsDatasetReconcile_DirectCloneRemainsDeletableAfterSourceDeleted(t *te
 func TestZfsDatasetReconcile_DeleteBlocksOnUnprovisionedDependent(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
-	backing := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-x", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
-		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/csi-snap-x", Type: storagev1alpha1.DatasetTypeFilesystem},
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-src", Type: storagev1alpha1.DatasetTypeFilesystem},
 	}
 	pending := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-restore", Finalizers: []string{zfsDatasetFinalizer}},
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-clone", Finalizers: []string{zfsDatasetFinalizer}},
 		Spec: storagev1alpha1.ZfsDatasetSpec{
-			PoolGUID: "999", Dataset: "k8s/pvc-restore", Type: storagev1alpha1.DatasetTypeFilesystem,
-			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-x@" + restoreSourceSnapshotName},
+			PoolGUID: "999", Dataset: "k8s/pvc-clone", Type: storagev1alpha1.DatasetTypeFilesystem,
+			Source: &storagev1alpha1.DatasetSource{Volume: "k8s/pvc-src"},
 		},
 	}
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(onlinePool(), backing, pending).
+		WithObjects(onlinePool(), src, pending).
 		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
-	// Only the backing clone exists on disk; pvc-restore has not been cloned yet.
-	z := newFakeZFS("tank/k8s/csi-snap-x")
-	z.seedSnapshot("tank/k8s/csi-snap-x", restoreSourceSnapshotName)
+	// Only the source exists on disk; pvc-clone has not been cloned yet.
+	z := newFakeZFS("tank/k8s/pvc-src")
 
 	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-x"}})
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-src"}})
 	if err == nil {
 		t.Fatal("expected the delete to block while a declared dependent is not provisioned yet")
 	}

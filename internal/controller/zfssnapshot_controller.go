@@ -56,10 +56,10 @@ type ZfsSnapshotReconciler struct {
 
 // gateReader returns the reader used for decisions that guard an irreversible
 // `zfs destroy`, for the same reason as ZfsDatasetReconciler.gateReader: the
-// backing-clone ZfsDataset it looks up is a different kind than the ZfsSnapshot
-// that triggered the reconcile, so the two informers have no ordering
-// relationship and a stale NotFound would let the raw origin snapshot be torn
-// down while its backing clone is still live (known-pitfalls.md #19).
+// objects it looks up are a different kind than the ZfsSnapshot that triggered
+// the reconcile, so the two informers have no ordering relationship and a stale
+// read could let state be torn down while something still depends on it
+// (known-pitfalls.md #19).
 func (r *ZfsSnapshotReconciler) gateReader() client.Reader {
 	if r.APIReader != nil {
 		return r.APIReader
@@ -147,9 +147,8 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("created ZFS snapshot", "snapshot", full)
 	}
 
-	// Provision/await the owned backing-clone ZfsDataset, then take its
-	// "@restore-source" self-snapshot (D5) — restores always clone from that,
-	// never from the raw snapshot above directly (D0/§3.1).
+	// Restores clone the backing clone's "@restore-source" (D5), never the raw
+	// snapshot above directly (D0/§3.1).
 	return r.reconcileBackingClone(ctx, &snap, &pool, datasetPath, full)
 }
 
@@ -206,13 +205,8 @@ func (r *ZfsSnapshotReconciler) sourceDatasetPath(ctx context.Context, reader cl
 
 // reconcileDelete tears down a ZfsSnapshot on the node hosting its pool.
 //
-// All promote/dependent-chaining complexity is delegated to
-// ZfsDatasetReconciler: delete the owned backing-clone ZfsDataset, wait for it
-// to be fully gone, then perform the required (not best-effort)
-// raw-origin-snapshot cleanup. The order matters because the backing clone is
-// itself a dependent clone of the raw snapshot, so the raw snapshot cannot be
-// destroyed while it exists (D11) — though D19's detachSnapshotClones below
-// also handles a dependent that appeared some other way.
+// Order matters: the backing clone is a dependent clone of the raw snapshot, so
+// the raw snapshot cannot be destroyed while it exists (D11).
 func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -278,14 +272,13 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	return ctrl.Result{}, r.releaseSnapshotFinalizer(ctx, snap)
 }
 
-// reconcileBackingClone provisions (D15) the owned backing-clone ZfsDataset
-// for a snapshot — a flat sibling of the source dataset named
-// after Spec.SnapshotName (already an independent, opaque identifier per
-// independent-resource-naming-redesign.md, so it needs no extra prefixing here,
-// D1/D1a) — waits for it to become Ready, then takes its fixed-name
-// "@restore-source" self-snapshot (D5). Restores always clone from that, never
-// from the raw snapshot directly (D0/§3.1), so they keep working regardless of
-// what later happens to the true source volume.
+// reconcileBackingClone clones the raw snapshot into a flat sibling of the
+// source dataset named after Spec.SnapshotName, then takes its fixed-name
+// "@restore-source" self-snapshot (D5).
+//
+// Restores clone that self-snapshot, never the raw snapshot directly (D0/§3.1),
+// so they keep working regardless of what later happens to the source volume —
+// including a promote relocating the raw snapshot elsewhere.
 func (r *ZfsSnapshotReconciler) reconcileBackingClone(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool, datasetPath, rawFull string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 

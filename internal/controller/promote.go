@@ -39,7 +39,7 @@ import (
 // derived bookkeeping.
 
 // restoreSourceSnapshotName is the fixed, CSI-invisible self-snapshot name (D5)
-// taken on every backing-clone ZfsDataset (D15) immediately
+// taken on every backing clone immediately
 // after it is created. Restores always clone from
 // "<backing-clone-dataset>@restore-source", never from the raw origin snapshot
 // directly, so restores keep working whether the true source volume is still

@@ -17,7 +17,7 @@ import (
 
 // restoreSourceSnapshotName mirrors internal/controller's constant of the same
 // name (D5, snapshot-lifecycle-redesign.md): the fixed, CSI-invisible
-// self-snapshot every backing-clone ZfsDataset carries.
+// self-snapshot every backing clone carries.
 // Restores always clone from this, never from the raw origin snapshot.
 const restoreSourceSnapshotName = "restore-source"
 

@@ -22,10 +22,11 @@ const (
 // (derive-from-source, read-only, restore/clone) — see design-decisions ADR-0006.
 // The agent on the node currently hosting the pool takes `<dataset>@<snapshotName>`.
 //
-// Every snapshot is taken the same way (ADR-0026): a raw ZFS snapshot plus an
-// owned backing-clone ZfsDataset, which makes the snapshot independent of its
-// source volume. The former `mode` field, which could select a plain-snapshot
-// variant instead, was removed — see snapshot-lifecycle-redesign.md §11.
+// Every snapshot is taken the same way (ADR-0026): a raw ZFS snapshot plus a
+// backing ZFS clone of it, which makes the snapshot independent of its source
+// volume. That clone is not a Kubernetes object (ADR-0030). The former `mode`
+// field, which could select a plain-snapshot variant instead, was removed — see
+// snapshot-lifecycle-redesign.md §11.
 type ZfsSnapshotSpec struct {
 	// PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name without
 	// the "zpool-" prefix) that hosts the source dataset. The agent derives the

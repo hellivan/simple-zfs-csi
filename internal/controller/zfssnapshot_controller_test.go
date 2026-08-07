@@ -219,11 +219,9 @@ func TestZfsSnapshotReconcile_FollowsRenamedSourceDataset(t *testing.T) {
 	}
 }
 
-// TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot drives
-// both ZfsSnapshotReconciler and ZfsDatasetReconciler (as they'd run
-// concurrently in the real DaemonSet) through a full create
-// (D15): raw snapshot -> owned backing-clone ZfsDataset -> that dataset
-// becomes Ready -> "@restore-source" self-snapshot -> ZfsSnapshot Ready.
+// TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot drives a full
+// create: raw snapshot -> backing ZFS clone -> "@restore-source" self-snapshot
+// -> ZfsSnapshot Ready.
 func TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot(t *testing.T) {
 	scheme := newTestScheme(t)
 	src := &storagev1alpha1.ZfsDataset{
