@@ -63,14 +63,17 @@ type ZfsShareAttachRequestReconciler struct {
 	APIReader client.Reader
 }
 
-// gateReader returns the reader used for the two decisions whose blast radius is
-// a live export rather than a delayed reconcile: tearing the ZfsShare down
-// because no attach request remains, and picking the single node a zvol is
-// exported to. Attach requests are authored by the CSI controller with an
-// uncached client, and a ZfsShare-triggered reconcile has no ordering
-// relationship to the attach-request informer at all, so a cache that has not
-// caught up can show an empty (or older-entry-missing) set and unexport a volume
-// a node is actively using (known-pitfalls.md #19).
+// gateReader returns the reader used for decisions whose blast radius is a live
+// export rather than a delayed reconcile: tearing the ZfsShare down because no
+// attach request remains, picking the single node a zvol is exported to, and
+// (ADR-0031) deciding a local attach needs no ZfsShare at all. A stale cached
+// read of ZfsPool.status.currentNode here could wrongly conclude "still local"
+// after the pool has actually moved elsewhere, skipping the export a node now
+// needs. Attach requests are authored by the CSI controller with an uncached
+// client, and a ZfsShare-triggered reconcile has no ordering relationship to the
+// attach-request informer at all, so a cache that has not caught up can show an
+// empty (or older-entry-missing) set and unexport a volume a node is actively
+// using (known-pitfalls.md #19).
 //
 // Falls back to the cached client when no APIReader is wired (tests).
 func (r *ZfsShareAttachRequestReconciler) gateReader() client.Reader {
@@ -234,7 +237,7 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 		exported = []string{node}
 
 		var pool storagev1alpha1.ZfsPool
-		if err := r.Get(ctx, client.ObjectKey{Name: zpool.ResourceName(ds.Spec.PoolGUID)}, &pool); err != nil {
+		if err := r.gateReader().Get(ctx, client.ObjectKey{Name: zpool.ResourceName(ds.Spec.PoolGUID)}, &pool); err != nil {
 			return nil, nil, false, fmt.Errorf("get ZfsPool %q: %w", ds.Spec.PoolGUID, err)
 		}
 		if pool.Status.CurrentNode != "" && pool.Status.CurrentNode == node {
