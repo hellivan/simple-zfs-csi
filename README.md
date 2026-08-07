@@ -75,7 +75,7 @@ The driver has a strict two-tier split, and it is the single most useful thing t
 know when reading the code:
 
 > **The control plane declares what should exist. Node agents make it so.**
-> Nothing in the node tier ever authors a Kubernetes object.
+> A node agent never authors an object that directs another component to act.
 
 | Tier | Component | Workload | Authors (creates/deletes) | Reads |
 |---|---|---|---|---|
@@ -95,14 +95,21 @@ authoring in the control plane keeps that blast radius closed, and it is why
 Status writes are exempt: every component reports `status` on the objects it
 acts on. The rule is about `spec`/lifecycle authorship.
 
-The rule now holds without exception. `ZfsSnapshotReconciler` used to author the
-backing-clone `ZfsDataset` behind every snapshot; that backing clone is no longer
-a Kubernetes object at all, just a ZFS clone the snapshot reconciler creates and
-destroys like the raw snapshot it already managed. Nothing in the node tier
-creates or deletes objects, and the discovery role's `create`/`delete` on
+The rule now holds. `ZfsSnapshotReconciler` used to author the backing-clone
+`ZfsDataset` behind every snapshot; that backing clone is no longer a Kubernetes
+object at all, just a ZFS clone the snapshot reconciler creates and destroys like
+the raw snapshot it already managed. The discovery role's `create`/`delete` on
 `zfsdatasets` — the permission that let a node author an object naming a pool it
 does not host, and the source of a blocker-level RBAC defect — is gone with it.
 See [ADR-0030](docs/design-decisions.md).
+
+The one node-tier `create` that remains is the discovery agent registering a
+`ZfsPool` for a pool it has physically imported, and it is not the same kind of
+act: the object *reports the agent's own node*, rather than directing anyone. Its
+`poolGUID` is necessarily one this node hosts, so the lateral-movement path above
+cannot open — an agent can only ever announce what it already has. The role holds
+`create` but deliberately not `delete`: registration is additive, and a pool
+leaving a node is reflected in `status`, never by removing the object.
 
 ### Export execution
 
