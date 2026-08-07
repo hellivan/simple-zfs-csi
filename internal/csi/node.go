@@ -165,8 +165,11 @@ func (n *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 }
 
 // NodeExpandVolume finishes an online expansion on the node. For NVMe-oF zvols it
-// rescans the namespace (so the block device reflects the grown zvol) and grows
-// the on-device filesystem. NFS volumes and raw-block volumes need no node work.
+// grows the on-device filesystem: the remote case first rescans the namespace so
+// the block device reflects the grown zvol, while a local volume's device
+// (ZfsDataset.Status.Path) already reflects the new size with no rescan needed
+// (ADR-0031 — no NVMe-oF hop is involved at all). NFS volumes and raw-block
+// volumes need no node work.
 func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	volumePath := req.GetVolumePath()
@@ -177,31 +180,51 @@ func (n *NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 		return nil, status.Error(codes.InvalidArgument, "volume path is required")
 	}
 
-	// Only NVMe-oF (zvol) volumes have a node-local device to grow. Absence of a
-	// NetworkExport NQN means this is an NFS volume: nothing to do here.
-	nqn := n.lookupExportNQN(ctx, volumeID)
-	if nqn == "" {
+	poolGUID, _, statusPath, protocol, err := n.resolveVolume(ctx, volumeID)
+	if err != nil {
+		return nil, err
+	}
+	if protocol != storagev1alpha1.ProtocolNVMeoF {
+		// NFS volumes have no node-local device to grow.
 		return &csi.NodeExpandVolumeResponse{}, nil
 	}
-
-	device, err := n.Mounter.NVMeDevice(ctx, nqn)
+	pool, err := n.resolvePool(ctx, poolGUID)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "locate nvme device for %q: %v", volumeID, err)
-	}
-	if device == "" {
-		return nil, status.Errorf(codes.FailedPrecondition, "nvme device for volume %q is not connected", volumeID)
-	}
-	if err := n.Mounter.RescanNVMe(ctx, nqn); err != nil {
-		return nil, status.Errorf(codes.Internal, "rescan nvme device %q: %v", device, err)
+		return nil, err
 	}
 
-	// Raw block volumes have no filesystem to grow; the rescan is sufficient.
+	var device string
+	if isLocalToPool(n.NodeID, pool) {
+		if statusPath == "" {
+			return nil, status.Errorf(codes.FailedPrecondition, "volume %q has no local device path yet", volumeID)
+		}
+		device = statusPath
+	} else {
+		nqn := n.lookupExportNQN(ctx, volumeID)
+		if nqn == "" {
+			return nil, status.Errorf(codes.FailedPrecondition, "NVMe-oF export for volume %q not found", volumeID)
+		}
+		device, err = n.Mounter.NVMeDevice(ctx, nqn)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "locate nvme device for %q: %v", volumeID, err)
+		}
+		if device == "" {
+			return nil, status.Errorf(codes.FailedPrecondition, "nvme device for volume %q is not connected", volumeID)
+		}
+		if err := n.Mounter.RescanNVMe(ctx, nqn); err != nil {
+			return nil, status.Errorf(codes.Internal, "rescan nvme device %q: %v", device, err)
+		}
+	}
+
+	// Raw block volumes have no filesystem to grow; the rescan (if any) above is
+	// sufficient.
 	if req.GetVolumeCapability().GetBlock() != nil {
 		return &csi.NodeExpandVolumeResponse{}, nil
 	}
 	if err := n.Mounter.ResizeFS(device, volumePath); err != nil {
 		return nil, status.Errorf(codes.Internal, "resize filesystem on %q: %v", device, err)
 	}
+
 
 	n.Log.Info("expanded volume on node", "volume", volumeID, "device", device, "path", volumePath)
 	return &csi.NodeExpandVolumeResponse{}, nil

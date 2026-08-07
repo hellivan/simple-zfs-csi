@@ -544,7 +544,8 @@ func TestNodeExpand_NVMeoFFilesystem(t *testing.T) {
 	m.connectedNQN = "nqn.exp" // already connected from an earlier publish
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-e"}}
 	export.Status.NQN = "nqn.exp"
-	ns := newNodeServer(t, m, export)
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"), export,
+		dataset("pvc-e", "k8s/pvc-e", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
 		VolumeId:         "pvc-e",
@@ -567,7 +568,8 @@ func TestNodeExpand_NVMeoFBlockSkipsResize(t *testing.T) {
 	m.connectedNQN = "nqn.exp"
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-e"}}
 	export.Status.NQN = "nqn.exp"
-	ns := newNodeServer(t, m, export)
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"), export,
+		dataset("pvc-e", "k8s/pvc-e", storagev1alpha1.DatasetTypeVolume))
 
 	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
 		VolumeId:         "pvc-e",
@@ -587,8 +589,8 @@ func TestNodeExpand_NVMeoFBlockSkipsResize(t *testing.T) {
 
 func TestNodeExpand_NFSNoop(t *testing.T) {
 	m := newFakeMounter()
-	// No NetworkExport -> NFS volume; nothing to grow on the node.
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"))
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		dataset("pvc-nfs", "k8s/pvc-nfs", storagev1alpha1.DatasetTypeFilesystem))
 
 	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
 		VolumeId:   "pvc-nfs",
@@ -599,6 +601,30 @@ func TestNodeExpand_NFSNoop(t *testing.T) {
 	}
 	if len(m.rescanned) != 0 || len(m.resized) != 0 {
 		t.Errorf("nfs expand should be a no-op, rescanned=%v resized=%v", m.rescanned, m.resized)
+	}
+}
+
+// TestNodeExpand_NVMeoFLocal covers ADR-0031: a local zvol's device already
+// reflects the grown size (ZfsDataset.Status.Path), so no NetworkExport lookup
+// or nvme rescan is needed at all.
+func TestNodeExpand_NVMeoFLocal(t *testing.T) {
+	m := newFakeMounter()
+	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		datasetWithPath("pvc-13", "k8s/pvc-13", storagev1alpha1.DatasetTypeVolume, "/dev/zvol/tank/k8s/pvc-13"))
+
+	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:         "pvc-13",
+		VolumePath:       "/target/local-fs",
+		VolumeCapability: mountCap(),
+	})
+	if err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+	if len(m.rescanned) != 0 {
+		t.Errorf("expected no rescan for a local volume, got %v", m.rescanned)
+	}
+	if m.resized["/dev/zvol/tank/k8s/pvc-13"] != "/target/local-fs" {
+		t.Errorf("resized = %v, want /dev/zvol/tank/k8s/pvc-13 -> /target/local-fs", m.resized)
 	}
 }
 

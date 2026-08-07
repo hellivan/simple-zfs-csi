@@ -80,6 +80,24 @@ func (r *ZfsShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			"PathDeriveFailed", err.Error())
 	}
 
+	// ADR-0031: a single-node (NVMe-oF) share whose one attached node is also the
+	// pool's own current node needs no network export at all — the node plugin
+	// reads the zvol's local device path directly instead of looping back through
+	// NVMe-oF. Skip rendering (and clean up any now-stale) NetworkExport, and
+	// report Bound immediately: there is nothing left to wait for. Re-evaluated on
+	// every reconcile (including the ZfsPool watch below), so a pool takeover that
+	// moves the pool away from the attached node correctly falls back to a real
+	// export on the next pass.
+	if share.Spec.Protocol == storagev1alpha1.ProtocolNVMeoF &&
+		share.Spec.AttachedNode != "" && share.Spec.AttachedNode == pool.Status.CurrentNode {
+		export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: share.Name}}
+		if err := r.Delete(ctx, export); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.setLocalStatus(ctx, &share, pool.Status.CurrentNode, exportPath,
+			fmt.Sprintf("%s is local to %s; no network export needed", exportPath, pool.Status.CurrentNode))
+	}
+
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: share.Name}}
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, export, func() error {
 		export.Spec.NodeName = pool.Status.CurrentNode
@@ -172,6 +190,27 @@ func (r *ZfsShareReconciler) setStatus(ctx context.Context, share *storagev1alph
 		ObservedGeneration: share.Generation,
 	})
 
+	return r.Status().Patch(ctx, patched, client.MergeFrom(share))
+}
+
+// setLocalStatus patches the share Bound with no child NetworkExport (ADR-0031's
+// local-passthrough case): unlike setStatus, NetworkExportName is explicitly
+// cleared rather than set to share.Name, since no such object exists.
+func (r *ZfsShareReconciler) setLocalStatus(ctx context.Context, share *storagev1alpha1.ZfsShare, nodeName, exportPath, message string) error {
+	patched := share.DeepCopy()
+	patched.Status.Phase = storagev1alpha1.SharePhaseBound
+	patched.Status.NodeName = nodeName
+	patched.Status.Path = exportPath
+	patched.Status.ObservedGeneration = share.Generation
+	patched.Status.Message = message
+	patched.Status.NetworkExportName = ""
+	meta.SetStatusCondition(&patched.Status.Conditions, metav1.Condition{
+		Type:               "Bound",
+		Status:             metav1.ConditionTrue,
+		Reason:             "Local",
+		Message:            message,
+		ObservedGeneration: share.Generation,
+	})
 	return r.Status().Patch(ctx, patched, client.MergeFrom(share))
 }
 

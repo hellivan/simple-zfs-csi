@@ -69,6 +69,13 @@ spec:
               and compiles this down into a node-pinned NetworkExport. Consumers never
               author NetworkExports directly for ZFS-backed volumes.
             properties:
+              attachedNode:
+                description: |-
+                  AttachedNode is the single node currently attached, for a single-node
+                  (NVMe-oF) share; empty for NFS. The translator compares it against the
+                  pool's own current node to detect a fully node-local attach (ADR-0031),
+                  in which case no NetworkExport is rendered at all.
+                type: string
               dataset:
                 description: |-
                   Dataset is the logical dataset path relative to the pool root, e.g.

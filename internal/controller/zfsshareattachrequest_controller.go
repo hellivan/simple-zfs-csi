@@ -233,11 +233,13 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 		case storagev1alpha1.ProtocolNFS:
 			share.Spec.NFS = &storagev1alpha1.NFSExportSpec{Clients: nfsClients}
 			share.Spec.NVMeoF = nil
+			share.Spec.AttachedNode = ""
 		case storagev1alpha1.ProtocolNVMeoF:
 			// NVMe-oF is single-node (ADR-0010): default-deny by the attached node's
 			// derived host NQN, plus optional per-attach DH-CHAP (ADR-0011).
 			share.Spec.NVMeoF = nvmeSpec
 			share.Spec.NFS = nil
+			share.Spec.AttachedNode = exported[0]
 		}
 		return nil
 	})

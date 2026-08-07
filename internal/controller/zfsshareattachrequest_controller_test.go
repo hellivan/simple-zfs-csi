@@ -241,6 +241,9 @@ func TestAttachRequest_NVMeoFSingleNodeShare(t *testing.T) {
 	if share.Spec.NFS != nil {
 		t.Errorf("nfs export spec must be nil for nvmeof")
 	}
+	if share.Spec.AttachedNode != "node-a" {
+		t.Errorf("attachedNode = %q, want node-a", share.Spec.AttachedNode)
+	}
 }
 
 func TestAttachRequest_NVMeoFRaceExportsOldestNodeOnly(t *testing.T) {
