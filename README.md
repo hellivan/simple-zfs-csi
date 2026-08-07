@@ -44,6 +44,8 @@ Technical references:
 
 - [CSI technical reference](docs/csi-technical-reference.md) — concise runtime
   flow + finalizers/guards table
+- [Redesign strategy](docs/redesign-strategy.md) — open decision frames and
+  follow-up discussion baselines
 - [Kubernetes volume lifecycle facts](docs/kubernetes-volume-lifecycle-facts.md)
 - [Lifecycle protection matrix](docs/lifecycle-protection-matrix.md)
 
