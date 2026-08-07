@@ -1483,7 +1483,37 @@ Two incidental findings from the same spec text:
 later.** If it ever does, the cheap answer is to expose the backing dataset path on
 `ZfsSnapshot.status` — derived, read-only — rather than reintroducing an object.
 
-### 10.10 New finding (2026-08-06) — `DeleteVolume` must *refuse*, and today it does not
+### 10.9 If accepted, this supersedes
+
+- **D15** — backing clone represented as an owned child `ZfsDataset`.
+- **D26** — the node agent authoring it, deliberately, as a documented exception.
+- **D27** — moving authoring to the operator.
+- **D21** — the scan-based pending-dependent guard, replaced by §10.5.
+
+Note this **removes all three costs D27 accepted**, rather than paying them somewhere else:
+no new `RawSnapshotReady` condition (nothing waits on a cross-tier status contract), no
+two-component delete handshake (nothing to hand off), and no new availability coupling to
+the operator (the operator is not involved at all). D27's costs were the price of keeping
+the object; §10 stops paying for the object.
+
+### 10.10 RESOLVED — `DeleteVolume` must *refuse*, and today it does not
+
+> **Both claims below have since been overtaken; verified against the code 2026-08-07.**
+>
+> 1. *"`checkSnapshotDependents` (D3) is spec-mandated"* rested on `integrated` mode
+>    existing. That mode was removed ([ADR-0027](design-decisions.md)) and the function now
+>    carries only its "snapshot not yet Ready" clause, so we sit in the spec's *first*
+>    branch — "supports deleting a volume without affecting its existing snapshots" — where
+>    no refusal is mandated at all.
+> 2. *"our plumbing does not deliver it … not yet implemented"* was fixed by
+>    [ADR-0029](design-decisions.md): `DeleteVolume` now blocks on `waitVolumeGone` and
+>    returns `FAILED_PRECONDITION` carrying the agent's recorded refusal.
+>
+> The defect was real and is fixed — though its surviving trigger turned out to be
+> foreign snapshots and clones (protection-matrix §6.2), not the snapshot clause quoted
+> below. Kept as the record of how it was found.
+>
+> **This says nothing about §10.1–10.4, which remain open and undecided.**
 
 Verbatim from `spec@v1.11.0/spec.md`, `DeleteVolume`:
 
@@ -1520,23 +1550,8 @@ This is a genuine spec deviation with a real operational cost, and it is **indep
 whether §10 is accepted** — it is a defect in the current code. Fixing it means
 `DeleteVolume` must synchronously determine whether the delete is refusable and return
 `codes.FailedPrecondition` instead of `OK`, which the CO then retries with backoff exactly
-as the spec intends. Not yet implemented; no approach chosen.
-
-
-### 10.9 If accepted, this supersedes
-
-- **D15** — backing clone represented as an owned child `ZfsDataset`.
-- **D26** — the node agent authoring it, deliberately, as a documented exception.
-- **D27** — moving authoring to the operator.
-- **D21** — the scan-based pending-dependent guard, replaced by §10.5.
-
-Note this **removes all three costs D27 accepted**, rather than paying them somewhere else:
-no new `RawSnapshotReady` condition (nothing waits on a cross-tier status contract), no
-two-component delete handshake (nothing to hand off), and no new availability coupling to
-the operator (the operator is not involved at all). D27's costs were the price of keeping
-the object; §10 stops paying for the object.
-
-
+as the spec intends. **Implemented 2026-08-06 as ADR-0029** (commit `903995a`), in exactly
+that shape.
 
 ---
 
