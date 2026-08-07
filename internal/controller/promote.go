@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -113,9 +113,6 @@ func (r *ZfsDatasetReconciler) beforeDestroy(ctx context.Context, vol *storagev1
 	if err := r.checkSnapshotDependents(ctx, vol); err != nil {
 		return err
 	}
-	if err := r.checkOwningSnapshotLive(ctx, vol); err != nil {
-		return err
-	}
 	if err := r.checkPendingCloneDependents(ctx, vol, poolName); err != nil {
 		return err
 	}
@@ -148,35 +145,6 @@ func (r *ZfsDatasetReconciler) checkSnapshotDependents(ctx context.Context, vol 
 		}
 		if snap.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
 			return fmt.Errorf("volume %q has snapshot %q still in phase %q; requeue", vol.Name, snap.Name, snap.Status.Phase)
-		}
-	}
-	return nil
-}
-
-// checkOwningSnapshotLive refuses to destroy a backing clone
-// while the ZfsSnapshot that owns it is still live (F7).
-//
-// The only sanctioned ways a backing clone is deleted are garbage collection
-// after its owner went away, and the explicit Delete in
-// ZfsSnapshotReconciler.reconcileDelete — both imply the owner is already
-// terminating. A `kubectl delete zfsdataset csi-snap-<uuid>` run by hand does
-// not, and proceeding would destroy the snapshot's only copy of the data while
-// the user's VolumeSnapshot still claims to hold it.
-func (r *ZfsDatasetReconciler) checkOwningSnapshotLive(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
-	for _, ref := range vol.OwnerReferences {
-		if ref.Kind != "ZfsSnapshot" {
-			continue
-		}
-		owner := &storagev1alpha1.ZfsSnapshot{}
-		if err := r.gateReader().Get(ctx, client.ObjectKey{Name: ref.Name}, owner); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue // owner already gone: the normal garbage-collection path
-			}
-			return err
-		}
-		if owner.DeletionTimestamp.IsZero() {
-			return fmt.Errorf("refusing to destroy backing clone %q: its ZfsSnapshot %q is still live; delete the snapshot instead",
-				vol.Name, owner.Name)
 		}
 	}
 	return nil
@@ -346,11 +314,29 @@ func assertKnownDatasets(ctx context.Context, c client.Reader, poolGUID, poolNam
 			known[strings.Trim(d.Spec.Dataset, "/")] = true
 		}
 	}
-	for _, clone := range clones {
-		if !known[datasetPathOf(poolName, clone)] {
-			return fmt.Errorf("snapshot %q is cloned by %q, which is not a known ZfsDataset on this pool; "+
-				"refusing to promote a dataset the driver does not manage — resolve it manually", snap, clone)
+	// Backing clones are not Kubernetes objects (ADR-0030): they are an
+	// implementation detail of a ZfsSnapshot, named after its Spec.SnapshotName
+	// and living as a flat sibling of the source dataset. Without this they would
+	// look exactly like a dataset the driver does not manage, and deleting any
+	// volume that has a snapshot would refuse.
+	backing := map[string]bool{}
+	var snaps storagev1alpha1.ZfsSnapshotList
+	if err := c.List(ctx, &snaps); err != nil {
+		return err
+	}
+	for i := range snaps.Items {
+		if s := &snaps.Items[i]; s.Spec.PoolGUID == poolGUID && s.Spec.SnapshotName != "" {
+			backing[s.Spec.SnapshotName] = true
 		}
+	}
+	for _, clone := range clones {
+		p := datasetPathOf(poolName, clone)
+		if known[p] || backing[path.Base(p)] {
+			continue
+		}
+		return fmt.Errorf("snapshot %q is cloned by %q, which is neither a known ZfsDataset "+
+			"nor a live ZfsSnapshot's backing clone on this pool; "+
+			"refusing to promote a dataset the driver does not manage — resolve it manually", snap, clone)
 	}
 	return nil
 }

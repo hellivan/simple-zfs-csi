@@ -163,8 +163,10 @@ func TestZfsSnapshotReconcile_DestroysOnDeletion(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if len(z.destroyed) != 1 || z.destroyed[0] != "tank/k8s/pvc-3@snap-3" {
-		t.Fatalf("expected snapshot destroyed, got %v", z.destroyed)
+	// Both halves go in one pass now (ADR-0030): the backing clone is a plain
+	// dataset owned by this reconciler, so there is no object handshake.
+	if !reflect.DeepEqual(z.destroyed, []string{"tank/k8s/snap-3", "tank/k8s/pvc-3@snap-3"}) {
+		t.Fatalf("expected backing clone then raw snapshot destroyed, got %v", z.destroyed)
 	}
 }
 
@@ -210,7 +212,9 @@ func TestZfsSnapshotReconcile_FollowsRenamedSourceDataset(t *testing.T) {
 		t.Fatalf("reconcile 2: %v", err)
 	}
 
-	if len(z.createdDS) != 1 || z.createdDS[0] != "tank/k8s/renamed-pvc-1@snap-1" {
+	// The raw snapshot must land on the source's *current* path; the backing
+	// clone's self-snapshot follows in the same pass.
+	if len(z.createdDS) == 0 || z.createdDS[0] != "tank/k8s/renamed-pvc-1@snap-1" {
 		t.Fatalf("expected snapshot on the source's current path tank/k8s/renamed-pvc-1@snap-1, got %v", z.createdDS)
 	}
 }
@@ -248,9 +252,7 @@ func TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot(t *testing.T) {
 
 	z := newFakeZFS()
 	snapR := &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	dsR := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	snapReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
-	backingReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-abc"}}
 
 	if _, err := snapR.Reconcile(context.Background(), snapReq); err != nil { // installs finalizer
 		t.Fatalf("reconcile 1: %v", err)
@@ -260,36 +262,23 @@ func TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot(t *testing.T) {
 	}
 
 	wantRaw := "tank/k8s/pvc-src@csi-snap-abc"
-	if len(z.createdDS) != 1 || z.createdDS[0] != wantRaw {
-		t.Fatalf("expected raw snapshot %q, got %v", wantRaw, z.createdDS)
+	if len(z.createdDS) == 0 || z.createdDS[0] != wantRaw {
+		t.Fatalf("expected raw snapshot %q first, got %v", wantRaw, z.createdDS)
 	}
 
-	var backing storagev1alpha1.ZfsDataset
-	if err := c.Get(context.Background(), client.ObjectKey{Name: "csi-snap-abc"}, &backing); err != nil {
-		t.Fatalf("get backing clone: %v", err)
+	// The backing clone is a plain ZFS dataset, not an object (ADR-0030): assert
+	// it on the pool, and assert that nothing was authored in Kubernetes.
+	if !z.existing["tank/k8s/csi-snap-abc"] {
+		t.Fatalf("backing clone dataset not created; existing = %v", z.existing)
 	}
-	if backing.Spec.Dataset != "k8s/csi-snap-abc" {
-		t.Errorf("backing clone dataset = %q, want k8s/csi-snap-abc", backing.Spec.Dataset)
+	if origin := z.origin["tank/k8s/csi-snap-abc"]; origin != wantRaw {
+		t.Errorf("backing clone origin = %q, want %q", origin, wantRaw)
 	}
-	if backing.Spec.Source == nil || backing.Spec.Source.Snapshot != "k8s/pvc-src@csi-snap-abc" {
-		t.Errorf("backing clone source = %+v, want k8s/pvc-src@csi-snap-abc", backing.Spec.Source)
+	if props := z.lastCloneProps; props["canmount"] != "off" {
+		t.Errorf("backing clone properties = %+v, want canmount=off", props)
 	}
-	if backing.Spec.Properties["canmount"] != "off" {
-		t.Errorf("backing clone properties = %+v, want canmount=off", backing.Spec.Properties)
-	}
-	if len(backing.OwnerReferences) != 1 || backing.OwnerReferences[0].Name != "snap-1" || backing.OwnerReferences[0].Kind != "ZfsSnapshot" {
-		t.Errorf("backing clone ownerReferences = %+v", backing.OwnerReferences)
-	}
-	if backing.OwnerReferences[0].BlockOwnerDeletion == nil || !*backing.OwnerReferences[0].BlockOwnerDeletion {
-		t.Errorf("backing clone ownerReference.BlockOwnerDeletion = %v, want true", backing.OwnerReferences[0].BlockOwnerDeletion)
-	}
-
-	// Drive the backing clone's own reconciler to Ready (finalizer, then clone).
-	if _, err := dsR.Reconcile(context.Background(), backingReq); err != nil {
-		t.Fatalf("backing reconcile 1: %v", err)
-	}
-	if _, err := dsR.Reconcile(context.Background(), backingReq); err != nil {
-		t.Fatalf("backing reconcile 2: %v", err)
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "csi-snap-abc"}, &storagev1alpha1.ZfsDataset{}); !apierrors.IsNotFound(err) {
+		t.Errorf("no ZfsDataset object may be authored for a backing clone, got %v", err)
 	}
 
 	if _, err := snapR.Reconcile(context.Background(), snapReq); err != nil { // self-snapshot + Ready
@@ -316,12 +305,12 @@ func TestZfsSnapshotReconcile_CreatesBackingCloneAndSelfSnapshot(t *testing.T) {
 	}
 }
 
-// TestZfsSnapshotReconcile_DeleteDelegatesToBackingClone verifies
+// TestZfsSnapshotReconcile_DeleteTearsDownBothHalves verifies
 // D15's delete path: deleting a ZfsSnapshot deletes its owned
 // backing-clone ZfsDataset and waits (polling) for ZfsDatasetReconciler to
 // fully remove it before doing the required raw-origin-snapshot cleanup and
 // releasing its own finalizer.
-func TestZfsSnapshotReconcile_DeleteDelegatesToBackingClone(t *testing.T) {
+func TestZfsSnapshotReconcile_DeleteTearsDownBothHalves(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
 	snap := &storagev1alpha1.ZfsSnapshot{
@@ -337,65 +326,34 @@ func TestZfsSnapshotReconcile_DeleteDelegatesToBackingClone(t *testing.T) {
 			SourceVolume: "pvc-src",
 		},
 	}
-	backing := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-abc", Finalizers: []string{zfsDatasetFinalizer}},
-		Spec: storagev1alpha1.ZfsDatasetSpec{
-			PoolGUID: "999",
-			Dataset:  "k8s/csi-snap-abc",
-			Type:     storagev1alpha1.DatasetTypeFilesystem,
-			Source:   &storagev1alpha1.DatasetSource{Snapshot: "k8s/pvc-src@csi-snap-abc"},
-		},
-	}
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(onlinePool(), snap, backing).
+		WithObjects(onlinePool(), snap).
 		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsDataset{}).
 		Build()
 
 	z := newFakeZFS("tank/k8s/pvc-src@csi-snap-abc", "tank/k8s/csi-snap-abc")
+	z.origin["tank/k8s/csi-snap-abc"] = "tank/k8s/pvc-src@csi-snap-abc"
+	z.seedSnapshot("tank/k8s/csi-snap-abc", restoreSourceSnapshotName)
 	snapR := &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	dsR := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	snapReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
-	backingReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-abc"}}
 
-	// 1st pass: issues client.Delete on the backing clone, then polls.
+	// One pass tears down both halves: no object to delete, nothing to poll for.
 	if _, err := snapR.Reconcile(context.Background(), snapReq); err != nil {
-		t.Fatalf("snapshot reconcile 1: %v", err)
-	}
-	var stillBacking storagev1alpha1.ZfsDataset
-	if err := c.Get(context.Background(), client.ObjectKey{Name: "csi-snap-abc"}, &stillBacking); err != nil {
-		t.Fatalf("get backing clone: %v", err)
-	}
-	if stillBacking.DeletionTimestamp.IsZero() {
-		t.Fatalf("expected backing clone to have a deletionTimestamp after snapshot delete pass 1")
-	}
-	if len(z.destroyed) != 0 {
-		t.Fatalf("nothing should be destroyed yet, got %v", z.destroyed)
+		t.Fatalf("snapshot reconcile: %v", err)
 	}
 
-	// ZfsDatasetReconciler tears down the (now-terminating) backing clone.
-	if _, err := dsR.Reconcile(context.Background(), backingReq); err != nil {
-		t.Fatalf("backing clone reconcile: %v", err)
+	// The backing clone's own @restore-source goes first (it blocks the
+	// non-recursive destroy), then the clone, then the raw origin snapshot.
+	want := []string{
+		"tank/k8s/csi-snap-abc@" + restoreSourceSnapshotName,
+		"tank/k8s/csi-snap-abc",
+		"tank/k8s/pvc-src@csi-snap-abc",
 	}
-	var gone storagev1alpha1.ZfsDataset
-	if err := c.Get(context.Background(), client.ObjectKey{Name: "csi-snap-abc"}, &gone); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected backing clone to be gone, err = %v", err)
+	if !reflect.DeepEqual(z.destroyed, want) {
+		t.Fatalf("destroyed = %v, want %v", z.destroyed, want)
 	}
 
-	// 2nd pass: backing clone confirmed gone -> required raw-origin cleanup + finalizer release.
-	if _, err := snapR.Reconcile(context.Background(), snapReq); err != nil {
-		t.Fatalf("snapshot reconcile 2: %v", err)
-	}
-	wantRawDestroyed := "tank/k8s/pvc-src@csi-snap-abc"
-	found := false
-	for _, d := range z.destroyed {
-		if d == wantRawDestroyed {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected raw origin snapshot %q destroyed, got %v", wantRawDestroyed, z.destroyed)
-	}
 	var goneSnap storagev1alpha1.ZfsSnapshot
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &goneSnap); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected ZfsSnapshot to be gone, err = %v", err)
@@ -429,18 +387,6 @@ func TestZfsSnapshotReconcile_DeleteWithLiveRestore(t *testing.T) {
 			SourceVolume: "pvc-a",
 		},
 	}
-	backing := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "csi-snap-x", Finalizers: []string{zfsDatasetFinalizer},
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(snap, storagev1alpha1.GroupVersion.WithKind("ZfsSnapshot")),
-			},
-		},
-		Spec: storagev1alpha1.ZfsDatasetSpec{
-			PoolGUID: "999", Dataset: "k8s/csi-snap-x", Type: storagev1alpha1.DatasetTypeFilesystem,
-			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/pvc-a@csi-snap-x"},
-		},
-	}
 	restored := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-r", Finalizers: []string{zfsDatasetFinalizer}},
 		Spec: storagev1alpha1.ZfsDatasetSpec{
@@ -450,7 +396,7 @@ func TestZfsSnapshotReconcile_DeleteWithLiveRestore(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(onlinePool(), source, snap, backing, restored).
+		WithObjects(onlinePool(), source, snap, restored).
 		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsDataset{}).
 		Build()
 
@@ -462,19 +408,10 @@ func TestZfsSnapshotReconcile_DeleteWithLiveRestore(t *testing.T) {
 	dsR := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	snapReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
 
+	// One pass now: promote the restore off the backing clone, destroy the clone,
+	// then deal with the raw origin snapshot the restore has inherited.
 	if _, err := snapR.Reconcile(ctx, snapReq); err != nil {
-		t.Fatalf("snapshot reconcile 1: %v", err)
-	}
-	if _, err := dsR.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-x"}}); err != nil {
-		t.Fatalf("backing clone reconcile: %v", err)
-	}
-	// The restored PVC is now a clone of the raw origin snapshot on pvc-a.
-	if o, want := z.origin["tank/k8s/pvc-r"], "tank/k8s/pvc-a@csi-snap-x"; o != want {
-		t.Fatalf("pvc-r origin = %q, want %q", o, want)
-	}
-
-	if _, err := snapR.Reconcile(ctx, snapReq); err != nil {
-		t.Fatalf("snapshot reconcile 2 (raw-origin cleanup): %v", err)
+		t.Fatalf("snapshot reconcile: %v", err)
 	}
 	var gone storagev1alpha1.ZfsSnapshot
 	if err := c.Get(ctx, client.ObjectKey{Name: "snap-1"}, &gone); !apierrors.IsNotFound(err) {

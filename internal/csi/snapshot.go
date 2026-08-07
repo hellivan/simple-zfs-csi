@@ -208,30 +208,6 @@ func rejectRemovedModeParam(params map[string]string) error {
 		snapshotModeParam, raw)
 }
 
-// checkBackingCloneUsable rejects a restore whose backing clone
-// is already being torn down.
-//
-// This previously also registered a "restored-by.<pvcName>" finalizer on that
-// ZfsDataset to record the dependency. D17 removed that bookkeeping entirely:
-// the agent's delete path now discovers dependents from the live ZFS clone
-// graph, and D21 blocks a destroy while a declared-but-not-yet-provisioned
-// dependent exists — which covers strictly more of the race than the finalizer
-// did (it only ever protected the window *after* the dependent object was
-// created, since a missing dependent object was treated as "gone").
-func (c *ControllerServer) checkBackingCloneUsable(ctx context.Context, backingName string) error {
-	cur := &storagev1alpha1.ZfsDataset{}
-	if err := c.Client.Get(ctx, client.ObjectKey{Name: backingName}, cur); err != nil {
-		if apierrors.IsNotFound(err) {
-			return status.Errorf(codes.Internal, "backing clone %q for the source snapshot is missing", backingName)
-		}
-		return status.Errorf(codes.Internal, "get backing clone %q: %v", backingName, err)
-	}
-	if !cur.DeletionTimestamp.IsZero() {
-		return status.Errorf(codes.FailedPrecondition, "backing clone %q for the source snapshot is being deleted; retry", backingName)
-	}
-	return nil
-}
-
 // waitSnapshotReady polls the ZfsSnapshot until it is ready to use, fails, or the
 // deadline elapses (DeadlineExceeded so external-snapshotter retries).
 func (c *ControllerServer) waitSnapshotReady(ctx context.Context, name string) (*storagev1alpha1.ZfsSnapshot, error) {

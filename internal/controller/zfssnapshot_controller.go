@@ -69,13 +69,8 @@ func (r *ZfsSnapshotReconciler) gateReader() client.Reader {
 
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots/status,verbs=get;update;patch
-// Every snapshot is backed by a real, owned child ZfsDataset (D15), so this
-// reconciler — unlike ZfsDatasetReconciler, which only ever fulfils objects the
-// csi-controller authored — creates and deletes ZfsDataset objects itself (D26).
-// The finalizers rule covers the backing clone's ownerReference, which sets
-// blockOwnerDeletion: true.
-// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfssnapshots/finalizers,verbs=update
+// Reads the source volume to resolve its dataset path; authors no objects.
+// +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfsdatasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.simple-zfs-csi.io,resources=zfspools,verbs=get;list;watch
 
 // Reconcile takes or destroys the ZFS snapshot backing a ZfsSnapshot, but only on
@@ -230,24 +225,19 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 		return ctrl.Result{}, err
 	}
 
-	backing := &storagev1alpha1.ZfsDataset{}
-	getErr := r.gateReader().Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing)
-	switch {
-	case apierrors.IsNotFound(getErr):
-		// Backing clone is fully gone; fall through to the raw-origin cleanup.
-	case getErr != nil:
-		return ctrl.Result{}, getErr
-	default:
-		if backing.DeletionTimestamp.IsZero() {
-			if err := r.Delete(ctx, backing); err != nil && !apierrors.IsNotFound(err) {
-				return ctrl.Result{}, err
-			}
-		}
-		// ZfsDatasetReconciler owns all promote/dependent-chaining complexity
-		// for the backing clone (D3/D7/D9/D12/D13); poll until it's confirmed
-		// gone rather than adding a second watch/queueing path here.
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+	backingDataset := path.Join(path.Dir(strings.Trim(datasetPath, "/")), snap.Spec.SnapshotName)
+	backingFull, err := datasetName(pool.Status.PoolName, backingDataset)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	// Restores clone the backing clone, so promote those away before destroying it.
+	if err := detachAndCleanSnapshots(ctx, r.gateReader(), r.ZFS, snap.Spec.PoolGUID, pool.Status.PoolName, backingFull); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ZFS.Destroy(ctx, backingFull, false); err != nil {
+		return ctrl.Result{}, err
+	}
+	logger.Info("destroyed backing clone", "dataset", backingFull)
 
 	// Where the raw snapshot *actually* is, which need not be where this object
 	// recorded it: `zfs promote` relocates the origin snapshot and everything
@@ -301,50 +291,31 @@ func (r *ZfsSnapshotReconciler) reconcileBackingClone(ctx context.Context, snap 
 
 	backingName := snap.Spec.SnapshotName
 	backingDataset := path.Join(path.Dir(strings.Trim(datasetPath, "/")), backingName)
-
-	backing := &storagev1alpha1.ZfsDataset{}
-	err := r.Get(ctx, client.ObjectKey{Name: backingName}, backing)
-	switch {
-	case apierrors.IsNotFound(err):
-		sourceType := snap.Spec.SourceType
-		if sourceType == "" {
-			// Legacy fallback only: SourceType is always set for snapshots created
-			// after ADR-0017. Default to filesystem rather than fail outright.
-			sourceType = storagev1alpha1.DatasetTypeFilesystem
-		}
-		desired := &storagev1alpha1.ZfsDataset{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: backingName,
-				OwnerReferences: []metav1.OwnerReference{
-					*metav1.NewControllerRef(snap, storagev1alpha1.GroupVersion.WithKind("ZfsSnapshot")),
-				},
-			},
-			Spec: storagev1alpha1.ZfsDatasetSpec{
-				PoolGUID:   snap.Spec.PoolGUID,
-				Dataset:    backingDataset,
-				Type:       sourceType,
-				Properties: backingCloneProperties(sourceType),
-				Source:     &storagev1alpha1.DatasetSource{Snapshot: datasetPath + "@" + snap.Spec.SnapshotName},
-			},
-		}
-		if createErr := r.Create(ctx, desired); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
-			return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
-				"BackingCloneCreateFailed", createErr.Error())
-		}
-		return ctrl.Result{Requeue: true}, nil
-	case err != nil:
-		return ctrl.Result{}, err
-	}
-
-	if backing.Status.Phase != storagev1alpha1.DatasetPhaseReady {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
-	}
-
-	backingFull, err := datasetName(pool.Status.PoolName, backing.Spec.Dataset)
+	backingFull, err := datasetName(pool.Status.PoolName, backingDataset)
 	if err != nil {
 		return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
 			"InvalidBackingClone", err.Error())
 	}
+
+	sourceType := snap.Spec.SourceType
+	if sourceType == "" {
+		// Legacy fallback only: SourceType is always set for snapshots created
+		// after ADR-0017. Default to filesystem rather than fail outright.
+		sourceType = storagev1alpha1.DatasetTypeFilesystem
+	}
+
+	if _, err := r.ZFS.Get(ctx, backingFull, "type"); err != nil {
+		if !errors.Is(err, zpool.ErrNotExist) {
+			return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
+				"LookupFailed", err.Error())
+		}
+		if err := r.ZFS.Clone(ctx, rawFull, backingFull, backingCloneProperties(sourceType)); err != nil {
+			return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
+				"BackingCloneFailed", err.Error())
+		}
+		logger.Info("created backing clone", "dataset", backingFull, "origin", rawFull)
+	}
+
 	restoreSourceFull := backingFull + "@" + restoreSourceSnapshotName
 	if _, err := r.ZFS.Get(ctx, restoreSourceFull, "type"); err != nil {
 		if !errors.Is(err, zpool.ErrNotExist) {

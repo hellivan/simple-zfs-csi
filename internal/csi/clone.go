@@ -94,17 +94,25 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		// deleted-but-not-yet-promoted, or already promoted away — and, unlike a
 		// reference to the raw snapshot, it survives a promote relocating that
 		// snapshot onto another dataset (§11.1).
-		backing := &storagev1alpha1.ZfsDataset{}
-		if err := c.Client.Get(ctx, client.ObjectKey{Name: snap.Spec.SnapshotName}, backing); err != nil {
-			return nil, status.Errorf(codes.Internal, "get backing clone %q for snapshot %q: %v", snap.Spec.SnapshotName, id, err)
+		//
+		// The backing clone is not an object (ADR-0030), so its path is derived
+		// the same way the agent derives it: a flat sibling of the source dataset
+		// named after Spec.SnapshotName. The "is it usable?" precondition becomes
+		// the ZfsSnapshot's own state, which is more direct than the old check on
+		// the backing clone object's deletionTimestamp — a snapshot that is
+		// terminating or not yet Ready has no usable @restore-source.
+		if !snap.DeletionTimestamp.IsZero() {
+			return nil, status.Errorf(codes.FailedPrecondition, "snapshot %q is being deleted; retry", id)
 		}
-		if err := checkSamePrefix(rp, backing.Spec.Dataset, "restore", id); err != nil {
+		if snap.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"snapshot %q is in phase %q, not yet restorable; retry", id, snap.Status.Phase)
+		}
+		backingDataset := path.Join(path.Dir(strings.Trim(c.snapshotSourceDataset(ctx, snap), "/")), snap.Spec.SnapshotName)
+		if err := checkSamePrefix(rp, backingDataset, "restore", id); err != nil {
 			return nil, err
 		}
-		if err := c.checkBackingCloneUsable(ctx, backing.Name); err != nil {
-			return nil, err
-		}
-		return &storagev1alpha1.DatasetSource{Snapshot: backing.Spec.Dataset + "@" + restoreSourceSnapshotName}, nil
+		return &storagev1alpha1.DatasetSource{Snapshot: backingDataset + "@" + restoreSourceSnapshotName}, nil
 
 	case *csi.VolumeContentSource_Volume:
 		id := cs.GetVolume().GetVolumeId()
@@ -164,6 +172,26 @@ func (c *ControllerServer) sourceDatasetType(ctx context.Context, name string) s
 		return ""
 	}
 	return ds.Spec.Type
+}
+
+// snapshotSourceDataset resolves the pool-relative path of the dataset a
+// snapshot was taken on: the source ZfsDataset's current Spec.Dataset while that
+// object exists, otherwise the copy recorded on the snapshot at creation time.
+// A source renamed after the snapshot was taken therefore still restores
+// (ADR-0025) — the ZFS objects move with the dataset, but the recorded copy
+// cannot follow.
+//
+// The backing clone's path is derived from this (ADR-0030), mirroring exactly
+// what ZfsSnapshotReconciler does when it creates the clone.
+func (c *ControllerServer) snapshotSourceDataset(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot) string {
+	if snap.Spec.SourceVolume == "" {
+		return snap.Spec.Dataset
+	}
+	ds := &storagev1alpha1.ZfsDataset{}
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: snap.Spec.SourceVolume}, ds); err != nil {
+		return snap.Spec.Dataset
+	}
+	return ds.Spec.Dataset
 }
 
 // requestedFsType returns the fsType carried by the first Mount capability, or

@@ -1245,7 +1245,20 @@ re-provision.
 
 ---
 
-## 10. PROPOSAL (under discussion, 2026-08-05) — the backing clone stops being a Kubernetes object
+## 10. ACCEPTED and IMPLEMENTED (2026-08-07) — the backing clone stops being a Kubernetes object
+
+> **Decided and shipped as [ADR-0030](design-decisions.md).** The premises below were
+> re-verified against the code before implementing: the delete-path helpers are free
+> functions, `ZfsSnapshotReconciler` already called one of them, and D19 had dissolved
+> D15's teardown-ordering constraint. All three still held.
+>
+> Migration was nil — zero `ZfsSnapshot` objects and zero backing-clone `ZfsDataset`s
+> existed on the cluster. The F2a–F2d regressions pass unchanged, which was the property
+> that mattered: this moved where the backing clone lives, not how the delete path reasons
+> about the clone graph.
+>
+> §10.5 was withdrawn and §10.8 partially refuted before implementation; §10.10 was fixed
+> separately by ADR-0029. The rest of this section is the design as built.
 
 > **Status: proposal, not a decision.** Nothing here is agreed or implemented. It is
 > written down so it can be reviewed as a whole. If accepted it becomes D28+ in §4 and an

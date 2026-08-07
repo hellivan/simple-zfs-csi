@@ -11,6 +11,97 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0030 — The backing clone is a ZFS clone, not a Kubernetes object
+
+**Status:** Accepted (2026-08-07) · **Scope:** `internal/controller/{zfssnapshot_controller,promote}.go`, `internal/csi/{clone,snapshot}.go`, chart RBAC, README · **Supersedes:** D15, D26, D27 · **Related:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §10.
+
+### Context
+
+Every snapshot is backed by a clone of its raw snapshot, which restores clone
+from. D15 made that backing clone a `ZfsDataset` **object**, authored by
+`ZfsSnapshotReconciler` — a node-tier component.
+
+That was the project's only violation of the two-tier ownership rule (the control
+plane declares what should exist, node agents make it so, and nothing in the node
+tier authors objects). It was not a cosmetic complaint:
+
+- It forced `create`/`delete` on `zfsdatasets` into the **discovery** role,
+  letting a node author an object carrying an arbitrary `poolGUID` and so induce
+  a *different* node's agent to act on a pool it does not host.
+- It produced the 2026-08-03 review's only **Blocker** (F1).
+
+D26 documented the exception; D27 proposed relocating authoring to the operator.
+Both accepted the object and tried to make its ownership tolerable.
+
+**D15's sole justification had already dissolved.** It made the backing clone an
+object to reuse `ZfsDatasetReconciler`'s clone-creation and promote-then-destroy
+logic. [ADR-0020](design-decisions.md) turned that logic into free functions
+(`detachAndCleanSnapshots`, `detachSnapshotClones`, `assertKnownDatasets`,
+`assertDriverSnapshot`), and `ZfsSnapshotReconciler` already called one of them
+for D19. The sharing now comes from sharing a *function*; the object no longer
+delivers it. The remaining "reuse" was one line: `r.ZFS.Clone(...)`.
+
+A second D15 premise was also void: it ordered teardown as "delete the object,
+wait for it to be gone, then clean the raw snapshot" because the two could not
+coexist. D19 replaced "require dependents gone" with "promote dependents away",
+which dissolves that constraint.
+
+### Options weighed
+
+- **Keep the object, move authoring to the operator (D27).** Rejected: it pays
+  three costs — a new cross-tier readiness contract, a two-component delete
+  handshake, and a new availability coupling to the operator — all to preserve an
+  object whose only justification had already gone.
+- **Keep the object, document the exception (D26).** That is the status quo, and
+  it is what produced F1.
+- **Stop making it an object.** Accepted.
+
+### Decision
+
+The backing clone becomes what it always was in substance: an implementation
+detail of a snapshot, created and destroyed by the reconciler that owns
+snapshots, exactly as the raw snapshot and `@restore-source` already were.
+
+- **Create:** `zfs snapshot` → `zfs clone` → `zfs snapshot @restore-source`, all
+  in `ZfsSnapshotReconciler`. Each step is already idempotent, so the reconcile
+  is naturally resumable.
+- **Delete:** the shared helpers directly, then `zfs destroy`. No `client.Delete`,
+  no `RequeueAfter` polling handshake, one finalizer instead of two.
+- **Restore:** the CSI controller derives the backing path
+  (`path.Join(path.Dir(sourceDataset), snap.Spec.SnapshotName)`) instead of
+  reading it off an object, and the "is it being torn down?" precondition becomes
+  a check on the `ZfsSnapshot`'s own `deletionTimestamp` — more direct than the
+  indirection it replaces.
+- **Delete source volume:** unchanged. `detachAndCleanSnapshots` still finds the
+  backing clone through the `clones` property and promotes it away.
+
+### Consequences
+
+- **The two-tier ownership rule holds without exception.** Nothing in the node
+  tier authors objects.
+- **The discovery role loses `create`/`delete` on `zfsdatasets`**, closing the
+  path by which a node could act on a pool it does not host, and with it the
+  `zfssnapshots/finalizers` rule that existed only for the backing clone's
+  `blockOwnerDeletion` ownerReference. Markers and chart were re-checked against
+  each other after the narrowing.
+- **F7's `checkOwningSnapshotLive` guard is deleted** — nobody can `kubectl
+  delete` an object that does not exist. `assertDriverSnapshot`'s "a live
+  `ZfsSnapshot` still claims this" check carries the remaining weight.
+- **`kubectl get zfsdataset csi-snap-<uuid>` stops working.** The backing clone is
+  no longer visible through the API; its existence is implied by the
+  `ZfsSnapshot` being Ready, and `zfs list` shows it on the host. If something
+  outside the repo ever needs it, the cheap answer is to expose the path on
+  `ZfsSnapshot.status` — derived and read-only — rather than reintroducing an
+  object.
+- **It reverses D15**, recorded here rather than quietly dropped.
+- **Migration: none.** Verified before starting: zero `ZfsSnapshot` objects and
+  zero backing-clone `ZfsDataset`s exist on the target cluster.
+- Net −252/+170 lines. The F2a–F2d regressions still pass unchanged, which is the
+  property that mattered most: this changes where the backing clone *lives*, not
+  how the delete path reasons about the clone graph.
+
+---
+
 ## ADR-0029 — `DeleteVolume` reports success only when the volume is actually gone
 
 **Status:** Accepted (2026-08-06) · **Scope:** `internal/csi/controller.go`, `internal/controller/zfsdataset_controller.go`, `api/v1alpha1/zfsdataset_types.go` · **Related:** [lifecycle-protection-matrix.md](lifecycle-protection-matrix.md) §6.2, [known-pitfalls.md](known-pitfalls.md) #20.

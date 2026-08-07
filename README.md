@@ -95,12 +95,14 @@ authoring in the control plane keeps that blast radius closed, and it is why
 Status writes are exempt: every component reports `status` on the objects it
 acts on. The rule is about `spec`/lifecycle authorship.
 
-> **One exception exists today and is being removed.** `ZfsSnapshotReconciler`
-> (node tier) authors the backing-clone `ZfsDataset` that every snapshot owns.
-> That is a layering violation, it is what forced `create`/`delete` on
-> `zfsdatasets` into the discovery role, and it directly produced a blocker-level
-> RBAC defect. It moves to the operator — see D27 in
-> [docs/snapshot-lifecycle-redesign.md](docs/snapshot-lifecycle-redesign.md).
+The rule now holds without exception. `ZfsSnapshotReconciler` used to author the
+backing-clone `ZfsDataset` behind every snapshot; that backing clone is no longer
+a Kubernetes object at all, just a ZFS clone the snapshot reconciler creates and
+destroys like the raw snapshot it already managed. Nothing in the node tier
+creates or deletes objects, and the discovery role's `create`/`delete` on
+`zfsdatasets` — the permission that let a node author an object naming a pool it
+does not host, and the source of a blocker-level RBAC defect — is gone with it.
+See [ADR-0030](docs/design-decisions.md).
 
 ### Export execution
 

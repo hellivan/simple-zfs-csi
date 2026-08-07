@@ -68,14 +68,13 @@ rules:
   # ZfsDataset allocation: the agent creates/destroys the on-disk datasets and
   # zvols for volumes whose pool is currently hosted on this node.
   #
-  # create/delete are for the *objects*, not the on-disk datasets: standalone
-  # snapshots (D15) are backed by a ZfsSnapshot-owned child ZfsDataset that
-  # ZfsSnapshotReconciler authors on create and deletes on teardown. Every other
-  # ZfsDataset object is authored by the csi-controller, which has its own role.
-  # See snapshot-lifecycle-redesign.md D26 for why that one exception exists.
+  # Read-only on the *objects*. Every ZfsDataset is authored by the csi-controller
+  # (ADR-0030); nothing in the node tier creates or deletes one, which is what
+  # restores the two-tier ownership rule and closes the path by which a node
+  # could author an object naming a pool it does not host.
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfsdatasets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfsdatasets/status"]
     verbs: ["get", "update", "patch"]
@@ -86,14 +85,6 @@ rules:
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfssnapshots/status"]
     verbs: ["get", "update", "patch"]
-  # The backing clone carries an ownerReference with blockOwnerDeletion: true
-  # (metav1.NewControllerRef). The OwnerReferencesPermissionEnforcement admission
-  # plugin rejects such a reference unless the creator may update the *owner's*
-  # finalizers subresource. That plugin is off by default in kubeadm but on in
-  # several managed distributions, so this must not depend on cluster config.
-  - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfssnapshots/finalizers"]
-    verbs: ["update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

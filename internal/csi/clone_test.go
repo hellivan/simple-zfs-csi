@@ -19,6 +19,7 @@ func snapshotObj(name, pool, dataset, source string) *storagev1alpha1.ZfsSnapsho
 	return &storagev1alpha1.ZfsSnapshot{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec:       storagev1alpha1.ZfsSnapshotSpec{PoolGUID: pool, Dataset: dataset, SnapshotName: name, SourceVolume: source},
+		Status:     storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 	}
 }
 
@@ -280,6 +281,7 @@ func TestCreateVolume_RestoreClonesFromBackingClone(t *testing.T) {
 			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
 			SourceVolume: "pvc-src", SourceType: storagev1alpha1.DatasetTypeFilesystem,
 		},
+		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 	}
 	backing := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-x"},
@@ -336,6 +338,7 @@ func TestCreateVolume_RestoreCrossPrefixRejected(t *testing.T) {
 			PoolGUID: "999", Dataset: "k8s/pvc-src", SnapshotName: "csi-snap-x",
 			SourceVolume: "pvc-src", SourceType: storagev1alpha1.DatasetTypeFilesystem,
 		},
+		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 	}
 	backing := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-x"},
@@ -398,6 +401,7 @@ func TestCreateVolume_RestoreChecksCapturedSourceFSType(t *testing.T) {
 			SourceFSType:       "ext4",
 			SourceVolblocksize: "16k",
 		},
+		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 	}
 	backing := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-x"},
