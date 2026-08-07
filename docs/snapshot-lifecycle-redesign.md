@@ -1787,6 +1787,28 @@ deleted, so nothing objects.
 
 Option 1 is the only one that removes the mirror rather than compensating for it.
 
+### 12.5 Live-pool verification (2026-08-07)
+
+`FindSnapshot`'s invocation had only ever run against the fake, which is exactly the
+gap known-pitfalls #17 warns about. Checked read-only against `spinning-archive`:
+
+| Assumption | Result |
+|---|---|
+| `-r <pool>` reaches descendant datasets' snapshots | **Confirmed** — returns `spinning-archive/BACKUP@auto-…` etc., one full `dataset@snap` per line, no header |
+| Cost of a pool-wide listing | 837 snapshots today — trivial; the `-r <pool>/<prefix>` narrowing stays correctly deferred |
+| Nonexistent pool | `cannot open 'no-such-pool': dataset does not exist` → matches `isNotExist`, so `FindSnapshot` returns `("", nil)` as intended |
+| Subtree with no snapshots (`-r <pool>/k8s`) | empty output, exit 0 → returns `("", nil)` |
+
+All four hold. ADR-0028's implementation is sound against real ZFS, not just against
+the model.
+
+**Incidental finding, acted on separately:** all 837 snapshots are `auto-*` from a
+periodic tool, and none is on a driver-managed dataset — so ADR-0029's refusal
+trigger is not currently active here, but is one schedule change away from being so.
+Recorded as a runbook in [runbooks.md](runbooks.md).
+
+---
+
 **Chosen: option 1.** Implemented as ADR-0028 on 2026-08-06, with the pool-wide search
 taken first and the prefix narrowing recorded in `FindSnapshot`'s doc comment as an
 available optimisation rather than applied speculatively.

@@ -99,3 +99,52 @@ changes.
   Renaming `k8s/a` → `k8s/b` is unaffected; renaming `k8s/a` → `archive/a` means
   the volume can no longer be cloned or restored from through a StorageClass
   with `datasetPrefix: k8s`.
+
+---
+
+## Keeping periodic-snapshot tools off the driver's datasets
+
+A `zfs-auto-snapshot`-style tool, a TrueNAS periodic task, or anything feeding a
+`zfs send -R` replication schedule takes snapshots the driver did not create. If
+such a schedule covers a dataset the driver manages, **that PVC can no longer be
+deleted**: `assertDriverSnapshot` (D18) refuses to destroy a snapshot the driver
+does not own, which is correct — it will not destroy state it did not create —
+and `DeleteVolume` reports it as `FAILED_PRECONDITION` ([ADR-0029](design-decisions.md)),
+which surfaces on the PVC as:
+
+```
+snapshot "<pool>/<prefix>/csi-vol-<uuid>@auto-2026-08-06_00-00" was not created
+by this driver; refusing to destroy it — remove it manually to continue
+```
+
+### Checking the current state
+
+List every snapshot on the pool and see which parent datasets carry them:
+
+```sh
+zfs list -H -o name -t snapshot -r <pool> | sed 's/@.*//' | sort -u
+```
+
+Compare that against the prefixes the driver provisions into (the
+`datasetPrefix` StorageClass parameter — e.g. `k8s/backup-tier`,
+`k8s/scratch-tier`). **No dataset under a driver prefix should appear.**
+
+Verified on `spinning-archive` (2026-08-07): 837 snapshots, all `auto-*`, and
+every one of them on a non-`k8s/` dataset — `BACKUP`, `immich`, `paperless-ngx`,
+`vaultwarden` and friends. No overlap today.
+
+### If they do overlap
+
+Either narrow the snapshot schedule so it excludes the driver's prefix, or accept
+that those PVCs need the foreign snapshots removed by hand before they can be
+deleted. Narrowing is strongly preferred: the driver deliberately will not delete
+what it did not create, and that guard is what stops it from destroying a
+replication source.
+
+### Why the driver cannot simply skip them
+
+A snapshot on the dataset blocks a non-recursive `zfs destroy`, so the dataset
+cannot be removed while it exists. The alternatives are to destroy it (unsafe —
+it may be a replication source) or to refuse (current behaviour). There is no
+third option that both deletes the volume and preserves the snapshot, because the
+snapshot lives *on* the volume's dataset.
