@@ -11,6 +11,79 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0031 — Node-local passthrough: bypass NVMe-oF/NFS when the workload and the pool share a node
+
+**Status:** Proposed (2026-08-07) · **Scope:** `internal/csi/{node,mount,controller}.go`, `internal/controller/{zfsshareattachrequest_controller,nfs_controller}.go`, `internal/nvmet`, chart · **Related:** [local-passthrough-redesign.md](local-passthrough-redesign.md), [known-pitfalls.md](known-pitfalls.md) class 21.
+
+### Context
+
+Every CSI-provisioned volume is attached over a network protocol — NVMe-oF for
+zvols, NFS for filesystem datasets — even when the consuming pod runs on the
+same node that hosts the ZFS pool. On a single-node deployment this is true for
+*every* attach, unconditionally; on a multi-node deployment it is still
+frequently true. This is not free: stacking NVMe-over-TCP, ZFS, and (for
+datasets) NFS on top of each other for what is physically local disk I/O
+produces real, measured overhead (class 21's "loopback stacking" note) and was
+implicated in a separate boot-time race between the NVMe-oF initiator and
+target sides observed on 2026-08-07.
+
+Both pieces of routing data this decision needs already exist:
+`ZfsPool.status.currentNode` (the pool's home node) and the requesting node ID
+(already threaded through `ControllerPublishVolume`/`NodeStageVolume`). No new
+CRD field is required.
+
+### Options weighed
+
+- **Status quo: always use the network path.** Simplest, and what the driver
+  does today. Pays the loopback tax unconditionally, including on the single-
+  node topology where it can never be avoided by scheduling instead.
+- **Drop the network path entirely; require colocation.** Rejected — breaks
+  true multi-node scheduling and RWX volumes, both explicitly supported today.
+- **Locality-aware dual path (accepted).** Compare the requesting node against
+  `ZfsPool.status.currentNode` on every Stage/Publish call (never cached, never
+  decided once at `CreateVolume` — consistent with ADR-0021's "resolve live"
+  precedent). When they match, bypass the network protocol: zvols use the
+  local block device directly; RWO filesystem datasets bind-mount the pool's
+  own mountpoint directly. RWX datasets always use NFS regardless of locality,
+  since multiple nodes may need concurrent access.
+
+### Decision
+
+Accepted, to be implemented in two phases (see
+[local-passthrough-redesign.md](local-passthrough-redesign.md) for the full
+task list):
+
+1. **Zvol / NVMe-oF passthrough first.** Zvols are already single-node-only
+   (class 7), so this phase has no RWX interaction to reason about. The
+   existing `ZfsShareAttachRequest` zero-trust lifecycle (ADR-0010) is kept
+   unchanged; only the nvmet configfs programming step becomes
+   locality-aware, avoiding a second bookkeeping mechanism.
+2. **Dataset / NFS passthrough second**, RWO-only, after Phase 1 has proven the
+   routing/transition machinery works. This phase carries the larger open risk
+   (SELinux relabeling of a bind-mounted host path under Talos's `pod_t`
+   context) and is deliberately sequenced after the simpler zvol case.
+
+### Consequences
+
+- Two routing paths (local/network) per volume type to test and maintain,
+  instead of one.
+- The volume/pod locality relationship must be re-resolved on every
+  Stage/Publish call and cleanly transitioned in both directions (a
+  previously-local volume becoming remote, and vice versa) — the highest-risk
+  part of the change, called out explicitly in the task list.
+- For zvols, local access removes the NVMe-oF network path (and with it, its
+  DH-CHAP auth surface, ADR-0011) for the local case entirely — a smaller
+  attack surface, not a weaker one, since there is no network hop left to
+  secure.
+- For datasets, a locally bind-mounted RWO volume trades NFS `lockd` advisory
+  locking semantics for native POSIX locks — expected to be equivalent or
+  better, but worth documenting for any workload that depends on NFS-specific
+  lock behavior.
+- **Not started.** This ADR records the decision and plan; implementation
+  status is tracked in local-passthrough-redesign.md.
+
+---
+
 ## ADR-0030 — The backing clone is a ZFS clone, not a Kubernetes object
 
 **Status:** Accepted (2026-08-07) · **Scope:** `internal/controller/{zfssnapshot_controller,promote}.go`, `internal/csi/{clone,snapshot}.go`, chart RBAC, README · **Supersedes:** D15, D26, D27 · **Related:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §10.

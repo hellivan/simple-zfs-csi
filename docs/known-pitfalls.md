@@ -1103,6 +1103,60 @@ runtime; it has to be right in the deployment.
 **Where the guard lives:** `charts/simple-zfs-csi/templates/csi-controller-deployment.yaml`
 and the `csiController.provisioner.timeout` value. **Status: fixed 2026-08-06.**
 
+## 21. Unbounded ZFS ARC on a shared node — Talos `kernel.modules[].parameters` did not apply to an extension-loaded module
+
+**Symptom:** elevated/erratic system load average on the Talos storage node,
+with CPU still mostly idle. Kernel log shows **all** NVMe-oF loopback
+controllers hitting `starting error recovery` near-simultaneously on a roughly
+~10h cadence, occasionally with real I/O errors (`nvmet_tcp: failed to map
+data`, `EXT4-fs warning ... I/O error`) rather than a clean, silent
+reconnect.
+
+**Root cause (evidence-backed hypothesis, not proven):** `zfs_arc_max`/
+`zfs_arc_min` were unset (`0` = auto), so ARC was free to grow toward the
+node's full RAM while competing for memory with ordinary workload pods
+co-scheduled on the same single node (JVMs, ML workers, databases, etc.).
+Under that pressure, the in-kernel `nvmet_tcp`/`nvme_tcp` threads serving the
+loopback NVMe-oF path appear to stall long enough to miss keepalives on every
+controller at once, at roughly the interval it takes memory pressure to build
+back up. This has not been proven mechanically, only correlated.
+
+**A machine config fix already existed but silently did not apply, even across
+a reboot:** the node's Talos machine config had
+`machine.kernel.modules: [{name: zfs, parameters: [zfs_arc_max=12884901888]}]`
+set — with the correct comment that such changes "applied after reboot". A
+full reboot of the node did **not** change the live value:
+`/sys/module/zfs/parameters/zfs_arc_max` still read `0`, and
+`/proc/spl/kstat/zfs/arcstats`'s `c_max` line still reflected the unbounded
+default (tracking total RAM). Neither `/etc/modprobe.d` nor
+`/usr/lib/modprobe.d` exist on the node at all. This strongly suggests Talos's
+`kernel.modules[].parameters` mechanism does not apply to modules provided by
+a **System Extension** (the `zfs` module here) the way it does for built-in
+kernel modules — no matching open Talos issue was found as of 2026-08-07, so
+treat this as unconfirmed, not as a known Talos bug.
+
+**Workaround (temporary — does not survive a reboot):** `zfs_arc_max`/
+`zfs_arc_min` are runtime-writable ZFS tunables. Write the desired value
+directly into the live sysfs parameter from a privileged pod with the host's
+`/sys` mounted — the chart's own toolbox pod already qualifies:
+
+```sh
+kubectl exec -n simple-zfs-csi <toolbox-pod> -- \
+  sh -c 'echo 12884901888 > /sys/module/zfs/parameters/zfs_arc_max'
+```
+
+Verify against `/proc/spl/kstat/zfs/arcstats`'s `c_max` line, **not** the
+module parameter file — the parameter file reports the configured knob (`0`
+meaning "auto"), while `c_max` in arcstats is the actual effective ceiling
+currently enforced.
+
+**Status: open.** The runtime workaround is confirmed effective; the
+machine-config non-application (and therefore a persistent fix) is unresolved
+and needs further research. See also
+[local-passthrough-redesign.md](local-passthrough-redesign.md), which would
+reduce (not eliminate) the pressure this class describes by removing
+unnecessary loopback network traffic for co-located workloads.
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing
@@ -1146,6 +1200,22 @@ and permissions **once, right after the dataset is created** (via host
   [internal/zpool/zfs.go](../internal/zpool/zfs.go), `applyRootOwnership` in
   [internal/controller/zfsdataset_controller.go](../internal/controller/zfsdataset_controller.go),
   and ADR-0015 in [design-decisions.md](design-decisions.md).
+
+### Loopback NVMe-oF + ZFS + NFS stacking inflates load average even when nothing is wrong
+
+When the CSI's storage node also runs Kubernetes workloads (the norm on a
+single-node deployment, common elsewhere), every volume attach today loops
+back through NVMe-over-TCP and/or NFS on the same machine (see ADR-0031 /
+[local-passthrough-redesign.md](local-passthrough-redesign.md) for a proposed
+fix). Every I/O crosses the network stack, ZFS's task queues, and — for NFS —
+`nfsd`/`lockd`, generating real, sustained context-switch traffic even though
+the data never leaves the box. A **load average of 15-17 on a 6-core node with
+CPU 85-90% idle** is consistent with this architecture on its own and is not,
+by itself, evidence of a fault: load average counts uninterruptible-I/O wait,
+and this stack produces a lot of very short waits. Before treating a high load
+average as a bug, check for **actual** evidence of trouble first — hung-task
+warnings, `starting error recovery` bursts, or real I/O errors in dmesg (see
+class 21) — rather than the load-average number alone.
 
 ---
 
