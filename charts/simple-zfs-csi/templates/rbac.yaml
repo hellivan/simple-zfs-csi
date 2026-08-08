@@ -8,7 +8,10 @@ metadata:
 rules:
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["networkexports"]
-    verbs: ["get", "list", "watch"]
+    # update/patch are needed to add/remove networkExportFinalizer (see
+    # internal/controller/common.go) so a NetworkExport deleted while the
+    # owning node's exporter pod is down is not lost before it can be rendered.
+    verbs: ["get", "list", "watch", "update", "patch"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["networkexports/status"]
     verbs: ["get", "update", "patch"]

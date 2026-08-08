@@ -15,6 +15,27 @@ import (
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
+// networkExportFinalizer guards a NetworkExport so its owning node's exporter
+// (NFSReconciler or NVMeoFReconciler — whichever matches Spec.Protocol) can
+// un-export it from the host before the object actually disappears.
+//
+// Without it, a plain owner-reference cascade delete (ZfsShare -> NetworkExport,
+// ADR-0010) removes the object from etcd immediately and irrevocably. If the
+// exporter pod for that node happens to be down at that exact moment, its next
+// startup List will simply never see the object again — there is nothing left
+// to generate the event that would tell it to drop the corresponding
+// /etc/exports line or nvmet configfs subsystem, so the stale export could
+// survive until some unrelated NetworkExport event happens to touch that node
+// again, which may be never.
+//
+// The finalizer closes that: the API server keeps the object present (with
+// DeletionTimestamp set) until it is removed below, so even across a restart
+// the exporter's next List still returns it, triggers a reconcile, and
+// listOwnedExports already excludes anything with a DeletionTimestamp from the
+// desired render — so that reconcile correctly converges the host state to
+// exclude it before the finalizer is removed and deletion actually proceeds.
+const networkExportFinalizer = "storage.simple-zfs-csi.io/networkexport"
+
 // nodeProtocolPredicate limits the reconcilers' work queue to exports pinned to
 // this node and using the given protocol.
 func nodeProtocolPredicate(nodeName string, protocol storagev1alpha1.Protocol) predicate.Predicate {

@@ -54,6 +54,9 @@ func (r *ZfsShareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	if !share.DeletionTimestamp.IsZero() {
 		// The child NetworkExport is garbage-collected via its owner reference.
+		// Its own networkExportFinalizer (see common.go) holds it Terminating
+		// until the owning node's exporter has actually unexported it, so the
+		// cascade is not instantaneous but is guaranteed to run to completion.
 		return ctrl.Result{}, nil
 	}
 

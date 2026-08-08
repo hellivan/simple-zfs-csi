@@ -11,6 +11,68 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0032 — `NetworkExport` gets a finalizer so a delete during exporter-pod downtime is not lost
+
+**Status:** Accepted, implemented · **Scope:** `internal/controller/common.go`, `internal/controller/nfs_controller.go`, `internal/controller/nvmeof_controller.go`, `charts/simple-zfs-csi/templates/rbac.yaml`.
+
+### Context
+
+The per-node `NFSReconciler`/`NVMeoFReconciler` each converge host state (an
+`/etc/exports` line, an nvmet configfs subsystem) by fully re-rendering from
+every currently-live `NetworkExport` owned by their node on each reconcile
+(`listOwnedExports`, which already excludes anything with a
+`DeletionTimestamp` set). This "declarative resync" is correct as long as
+*some* reconcile actually fires after a `NetworkExport` is deleted.
+
+`NetworkExport` previously had no finalizer, so deletion was immediate: the
+object was removed from etcd as soon as its owning `ZfsShare` was deleted (via
+owner-reference garbage collection). controller-runtime's startup behavior
+only emits one "Add" event per object still present in its initial List — if
+the *last* `NetworkExport` for a node was deleted from etcd while that node's
+exporter pod was down, there is nothing left to List for that node once it
+restarts, so no reconcile ever fires again and the stale host-side export can
+persist indefinitely. A periodic cache resync would not help either, since it
+can only re-trigger work for objects still present in the informer's cache —
+if the object is truly gone there is nothing to resync from.
+
+### Decisions
+
+* Added `networkExportFinalizer` (`internal/controller/common.go`), following
+  the exact same pattern already used for `ZfsDataset`, `ZfsSnapshot`, and
+  `ZfsShareAttachRequest`: real cleanup runs first, the finalizer is removed
+  only after it succeeds.
+* `NFSReconciler.Reconcile`/`NVMeoFReconciler.Reconcile` now: add the
+  finalizer on first sight of a `NetworkExport`; on deletion, re-render the
+  node's exports (which already excludes the object being deleted) *before*
+  removing the finalizer.
+* Net effect: the API server keeps a `NetworkExport` present (Terminating,
+  `DeletionTimestamp` set, but not actually removed) until its own exporter
+  reconciler has explicitly acknowledged and rendered around its removal. Even
+  a pod that was down at the moment of deletion will still see the object on
+  its next startup List — because it isn't actually gone yet — closing the
+  gap immediately and without any staleness window.
+* Rejected a wall-clock ticker/periodic-full-resync alternative (which was
+  implemented and then reverted during this work) for consistency: no other
+  reconciler in this codebase uses a bare timer-driven resync, and the
+  finalizer is strictly more precise (event-driven, no polling interval to
+  tune) for this specific gap.
+* `charts/simple-zfs-csi/templates/rbac.yaml` (hand-authored, not
+  controller-gen-generated) needed `update`/`patch` added for `networkexports`
+  on the shared nfs/nvmeof `ClusterRole`, since adding/removing a finalizer
+  requires updating the object itself, not just its `/status` subresource.
+
+### Consequences
+
+* `ZfsShare`'s child `NetworkExport` is still garbage-collected via its owner
+  reference (`zfsshare_controller.go` does not itself need a finalizer), but
+  the cascade is no longer instantaneous — it completes only once the owning
+  node's exporter has rendered the removal. This is a deliberate trade: a
+  short-lived Terminating state in exchange for guaranteed convergence.
+* No new periodic/ticker machinery was introduced, keeping this fix
+  consistent with every other reconciler in the project.
+
+---
+
 ## ADR-0031 — Node-local passthrough: bypass NVMe-oF entirely when the workload and the pool share a node
 
 **Status:** Accepted, Phase 1 + Phase 2 implemented (2026-08-08) · **Scope:** `internal/csi/{node,mount}.go`, `internal/controller/zfsshareattachrequest_controller.go` · **Related:** [local-passthrough-redesign.md](local-passthrough-redesign.md).
