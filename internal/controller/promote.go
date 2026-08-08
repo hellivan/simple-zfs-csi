@@ -57,18 +57,19 @@ const maxDetachRounds = 100
 // this driver creates, and only those:
 //
 //   - "restore-source" — a backing clone's self-snapshot (D5);
-//   - "clone-<16 hex>" — the ephemeral intermediate snapshot ADR-0009's direct
-//     PVC-to-PVC clone path takes (see cloneSnapshotSuffix);
+//   - "clone-<dest-name>" — the ephemeral intermediate snapshot ADR-0009's
+//     direct PVC-to-PVC clone path takes on the source dataset, named after the
+//     destination ZfsDataset's own object name (see cloneSnapshotSuffix);
 //   - "csi-snap-<uuid>" — a CSI-visible raw snapshot
 //     (independent-resource-naming-redesign.md).
 //
 // It is deliberately an allow-list (D18): anything else living on a driver
 // dataset was put there from outside the driver, and the delete path refuses to
-// touch it rather than guessing. The "csi-snap-" arm matches on prefix rather
-// than on UUID shape because that prefix is reserved for the driver by design
-// (D1a); assertDriverSnapshot additionally refuses any such snapshot that a
-// live ZfsSnapshot still claims.
-var driverSnapshotSuffix = regexp.MustCompile(`^(restore-source|clone-[0-9a-f]{16}|csi-snap-.+)$`)
+// touch it rather than guessing. The "clone-" and "csi-snap-" arms match on
+// prefix rather than a fixed shape because both suffixes are reserved for the
+// driver by design (D1a); assertDriverSnapshot additionally refuses any
+// "csi-snap-" snapshot that a live ZfsSnapshot still claims.
+var driverSnapshotSuffix = regexp.MustCompile(`^(restore-source|clone-.+|csi-snap-.+)$`)
 
 // splitSnapshot splits a full ZFS snapshot name into its dataset and short
 // name, e.g. "tank/k8s/vol@restore-source" -> ("tank/k8s/vol", "restore-source").

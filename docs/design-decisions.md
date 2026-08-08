@@ -1033,9 +1033,14 @@ deterministically recomputable by the caller).
 ADR-0009's direct-clone path (`zfsdataset_controller.go`'s `clone()`) had the
 same exposure in its intermediate `"@clone-" + vol.Name` snapshot suffix; this
 is purely internal/ephemeral (re-derived fresh every reconcile, never
-persisted), so it was closed more cheaply by hashing the destination object
-name (`cloneSnapshotSuffix`, SHA-256 truncated to 16 hex chars) rather than
-adding a new persisted field.
+persisted), so it was closed by using the destination object name directly as
+the suffix (`cloneSnapshotSuffix`) rather than adding a new persisted field.
+(An interim revision hashed the name with SHA-256 truncated to 16 hex chars;
+this was reverted back to the raw name once it became clear the API server
+already guarantees `ZfsDataset` object names are DNS-1123-safe — and thus
+ZFS-safe — making the hash pure overhead. Using the raw name also matches how a
+`ZfsSnapshot`'s backing clone is named directly after `Spec.SnapshotName`
+rather than a derived hash.)
 
 ### Consequences
 

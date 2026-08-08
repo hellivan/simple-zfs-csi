@@ -234,4 +234,10 @@ to derive itself.
   hashing, final call during implementation.~~ **Resolved during implementation
   (2026-08-02): hashing was used** (`cloneSnapshotSuffix` in
   `internal/controller/zfsdataset_controller.go`, SHA-256 of the destination object
-  name, truncated to 16 hex chars) — no new persisted field was added. None outstanding.
+  name, truncated to 16 hex chars) — no new persisted field was added. **Superseded
+  (later revision): the hash was dropped in favor of using `vol.Name` raw** — the
+  API server already guarantees `ZfsDataset` object names are DNS-1123-safe (and
+  thus ZFS-safe), so the hash added no safety, only made `zfs list -t snapshot`
+  output opaque. This also unifies the pattern with the backing-clone snapshot,
+  which is likewise named directly after its owning object's name
+  (`Spec.SnapshotName`) rather than a derived hash. None outstanding.

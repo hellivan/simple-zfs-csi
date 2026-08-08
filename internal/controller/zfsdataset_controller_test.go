@@ -1212,7 +1212,7 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 
 // TestZfsDatasetReconcile_DirectCloneRemainsDeletableAfterSourceDeleted is the
 // F2a regression. Deleting a direct PVC-to-PVC clone's source promotes the
-// clone, which relocates ADR-0009's intermediate "@clone-<hash>" snapshot onto
+// clone, which relocates ADR-0009's intermediate "@clone-<dest-name>" snapshot onto
 // it. Before D17/D18 nothing ever cleaned that relocated snapshot up, so the
 // clone's own non-recursive destroy failed with "filesystem has children" on
 // every retry and its ZfsDataset stayed Terminating forever — the PV never

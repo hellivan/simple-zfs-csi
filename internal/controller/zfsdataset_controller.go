@@ -2,8 +2,6 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"path"
@@ -282,18 +280,20 @@ func (r *ZfsDatasetReconciler) clone(ctx context.Context, vol *storagev1alpha1.Z
 	}
 }
 
-// cloneSnapshotSuffix derives a sanitized, ZFS-safe identifier for the
-// intermediate "@clone-<suffix>" snapshot ADR-0009's direct-clone path takes on
-// the source dataset. It's a deterministic hash of the destination ZfsDataset's
-// object name rather than that name used raw
-// (independent-resource-naming-redesign.md, step 4): this snapshot is purely
-// internal/ephemeral and re-derived fresh on every reconcile (never persisted),
-// so hashing is enough to keep it independent of whatever characters the
-// CO-provided volume id happens to contain, without needing a new persisted
-// field.
+// cloneSnapshotSuffix derives the identifier for the intermediate
+// "@clone-<suffix>" snapshot ADR-0009's direct-clone path takes on the source
+// dataset. It is the destination ZfsDataset's own object name, used raw rather
+// than hashed: the API server already guarantees that name is a DNS-1123
+// subdomain, which is a legal ZFS component name too, so nothing further needs
+// sanitizing. This mirrors how a ZfsSnapshot's backing clone snapshot is named
+// directly after Spec.SnapshotName (see restoreSourceSnapshotName's sibling
+// logic in zfssnapshot_controller.go) instead of a derived hash, and — because
+// this snapshot is purely internal/ephemeral and re-derived fresh on every
+// reconcile (never persisted) — keeps it unique per destination without
+// needing a new persisted field (independent-resource-naming-redesign.md, step
+// 4, superseded).
 func cloneSnapshotSuffix(destName string) string {
-	sum := sha256.Sum256([]byte(destName))
-	return hex.EncodeToString(sum[:])[:16]
+	return destName
 }
 
 // ensureSize converges the on-disk size of an existing object toward the spec:
