@@ -162,7 +162,9 @@ dump() {
 
 # --------------------------------------------------------------------------
 # Scenario A (F2a): direct PVC-to-PVC clone; delete source, then delete clone.
-# The clone inherits the "@clone-<hash>" snapshot and must stay deletable.
+# The clone inherits the "@clone-<dest-name>" snapshot and must stay deletable.
+# (The exact suffix below is just an illustrative placeholder for this raw-ZFS
+# behavior test; it doesn't exercise the driver's naming/allow-list code.)
 # --------------------------------------------------------------------------
 scenario_a() {
   step "A (F2a): direct clone -> delete source -> delete clone"
