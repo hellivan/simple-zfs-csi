@@ -694,3 +694,38 @@ A: One thing, and it is cosmetic: it creates no extra datasets. Standalone carri
 inside a `zfs send -R` subtree. §2.5 established the flat-sibling placement keeps `send -R`
 correct, and a clone consumes no space until it diverges, so this is presentation rather
 than cost — but it is the one honest argument in integrated mode's favour.
+
+## 2026-08-08 — why does `ZfsDataset.status.fsType` exist, and does it belong there?
+
+**Q: Why do we need `fsType` on the `ZfsDataset` level? Can't this live a level higher up —
+on the source (a PV or a snapshot), since a clone always has one? And is it a status or a
+spec field — if it's spec, why does nothing seem to consider it?**
+
+A: It is **status-only** — there is no `spec.fsType` anywhere; nothing is silently ignored.
+It's set once, in [`recordFSType`](../internal/csi/node.go), the first time the node plugin
+actually formats/mounts a zvol, and never rewritten afterwards. It can't live any higher or
+earlier, because at `CreateVolume` time (when the `ZfsDataset` and any PV/PVC are created)
+the fs type simply isn't known yet — it's discovered later, at first mount, so there is no
+earlier object in the chain that could hold it.
+
+The "ask the source, one level up" instinct is already exactly how both clone paths work,
+just via two different objects depending on whether the source can be expected to still
+exist:
+
+- **Direct volume→volume clone** (`spec.source.volume`): `checkCloneCompatibility`
+  ([`clone.go`](../internal/csi/clone.go)) reads the **live source `ZfsDataset`'s own
+  `Status.FSType`** directly — no copy needed, the source object still exists.
+- **Snapshot-based restore** (`spec.source.snapshot`): a `ZfsSnapshot` is designed to
+  outlive its source volume, so `CreateSnapshot` captures a copy onto
+  `ZfsSnapshot.spec.sourceFSType` at snapshot-creation time (D25) as the fallback for when
+  the live source is already gone by restore time — the *headline* case for a snapshot, not
+  an edge case.
+
+So the field is required (D10 has nothing to check a restore's requested `fsType` against
+without it — a mismatch would otherwise pass `CreateVolume` silently and fail much later at
+`NodeStageVolume`, exactly the bug `TestCreateVolume_RestoreChecksCapturedSourceFSType`
+guards against) and it must stay where it is: `ZfsDataset.status.fsType` as the live
+per-instance record, `ZfsSnapshot.spec.sourceFSType` as its captured-at-snapshot-time
+fallback. Neither is redundant with the other. See D10/D25 above and
+[api-conventions.md §5](api-conventions.md) for why `sourceFSType` is a *captured fact*
+field rather than a mutable pointer.
