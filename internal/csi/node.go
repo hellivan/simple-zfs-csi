@@ -116,7 +116,11 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		if block {
 			return nil, status.Error(codes.InvalidArgument, "block volumeMode is not supported for nfs")
 		}
-		if err := n.publishNFS(pool, dataset, targetPath, readOnly, mountFlags); err != nil {
+		if isLocalToPool(n.NodeID, pool) {
+			if err := n.publishLocalDataset(statusPath, targetPath, readOnly, mountFlags); err != nil {
+				return nil, err
+			}
+		} else if err := n.publishNFS(pool, dataset, targetPath, readOnly, mountFlags); err != nil {
 			return nil, err
 		}
 	case storagev1alpha1.ProtocolNVMeoF:
@@ -398,6 +402,26 @@ func (n *NodeServer) publishLocalZvol(ctx context.Context, volumeID, devicePath,
 	// Best-effort (D10), same as publishNVMeoF above.
 	if err := n.recordFSType(ctx, volumeID, effectiveFS); err != nil {
 		n.Log.Error(err, "failed to record fsType on ZfsDataset status", "volume", volumeID, "fsType", effectiveFS)
+	}
+	return nil
+}
+
+// publishLocalDataset bind-mounts the dataset's host mountpoint directly when
+// this node hosts the pool itself (ADR-0031, Phase 2): no NFS round-trip, no
+// nfsd dependency, no loopback network hop at all. sourcePath is the
+// agent-reported ZfsDataset.Status.Path (the ZFS mountpoint on the host).
+// A SELinux context= override is baked into BindMountDir so the mount is safe
+// under both permissive and enforcing SELinux — NFS never carried per-file
+// labels; this gives the same single-label behaviour with no on-disk relabel.
+func (n *NodeServer) publishLocalDataset(sourcePath, targetPath string, readOnly bool, flags []string) error {
+	if sourcePath == "" {
+		return status.Error(codes.FailedPrecondition, "dataset has no local mount path yet")
+	}
+	if err := n.Mounter.MakeDir(targetPath); err != nil {
+		return status.Errorf(codes.Internal, "create target %q: %v", targetPath, err)
+	}
+	if err := n.Mounter.BindMountDir(sourcePath, targetPath, readOnly); err != nil {
+		return status.Errorf(codes.Internal, "bind-mount dataset %q: %v", sourcePath, err)
 	}
 	return nil
 }

@@ -216,6 +216,21 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 	var nvmeSpec *storagev1alpha1.NVMeoFExportSpec
 	switch protocol {
 	case storagev1alpha1.ProtocolNFS:
+		var pool storagev1alpha1.ZfsPool
+		if err := r.gateReader().Get(ctx, client.ObjectKey{Name: zpool.ResourceName(ds.Spec.PoolGUID)}, &pool); err != nil {
+			return nil, nil, false, fmt.Errorf("get ZfsPool %q: %w", ds.Spec.PoolGUID, err)
+		}
+		// Pure-local: every requesting node IS the pool's own node → bind-mount
+		// path, no NFS export needed, no ZfsShare. A ZfsShare's existence means
+		// "exported over the network" (ADR-0031); skip it entirely here rather
+		// than letting a downstream component silently produce nothing.
+		if pool.Status.CurrentNode != "" && allNodesLocal(nodes, pool.Status.CurrentNode) {
+			share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
+			if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
+				return nil, nil, false, err
+			}
+			return nil, exported, true, nil
+		}
 		nfsClients, err = r.nfsClientsForNodes(ctx, nodes)
 		if err != nil {
 			return nil, nil, false, err
@@ -451,6 +466,19 @@ func (r *ZfsShareAttachRequestReconciler) deleteDHChapSecret(ctx context.Context
 
 // dhchapSecretName is the deterministic Secret name for a volume's DH-CHAP key.
 func dhchapSecretName(volume string) string { return "dhchap-" + volume }
+
+// allNodesLocal reports whether every node in nodes equals poolNode. Used by
+// reconcileVolume to decide if an NFS dataset needs a network export at all
+// (ADR-0031 Phase 2): when every requesting node IS the pool's own node, a
+// bind-mount is used instead, and no ZfsShare is created.
+func allNodesLocal(nodes []string, poolNode string) bool {
+	for _, n := range nodes {
+		if n != poolNode {
+			return false
+		}
+	}
+	return len(nodes) > 0
+}
 
 // setStatus patches the attach request status subresource.
 func (r *ZfsShareAttachRequestReconciler) setStatus(ctx context.Context, ar *storagev1alpha1.ZfsShareAttachRequest, ready bool, shareName, reason, message string) error {

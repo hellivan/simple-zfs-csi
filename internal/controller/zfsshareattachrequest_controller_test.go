@@ -73,7 +73,7 @@ func TestAttachRequest_AggregatesShareAndReportsReady(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(ds, node, ar).
+		WithObjects(ds, remoteAttachPool("999"), node, ar).
 		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
 		Build()
 
@@ -134,7 +134,7 @@ func TestAttachRequest_LastDetachDeletesShare(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(ds, node, ar).
+		WithObjects(ds, remoteAttachPool("999"), node, ar).
 		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
 		Build()
 
@@ -186,13 +186,13 @@ func TestAttachRequest_StaleCacheDoesNotTearDownLiveShare(t *testing.T) {
 
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(ds, nodeA, nodeB, arA).
+		WithObjects(ds, remoteAttachPool("999"), nodeA, nodeB, arA).
 		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
 		Build()
 	// The API server already holds node-b's request; the informer behind `c` does not.
 	api := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(ds, nodeA, nodeB, arB).
+		WithObjects(ds, remoteAttachPool("999"), nodeA, nodeB, arB).
 		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
 		Build()
 
@@ -457,5 +457,148 @@ func TestAttachRequest_NVMeoFPoolMovesAwayCreatesShare(t *testing.T) {
 
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-11"}, &storagev1alpha1.ZfsShare{}); err != nil {
 		t.Fatalf("expected a ZfsShare once the pool is no longer local: %v", err)
+	}
+}
+
+// TestAttachRequest_NFSLocalSkipsShare covers ADR-0031 Phase 2: when all
+// requesting nodes are the pool's own current node, no ZfsShare is created (a
+// ZfsShare's existence means "exported over the network") and the attach request
+// is immediately Ready.
+func TestAttachRequest_NFSLocalSkipsShare(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-20"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-20", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	pool := &storagev1alpha1.ZfsPool{
+		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName("999")},
+		Status:     storagev1alpha1.ZfsPoolStatus{GUID: "999", CurrentNode: "node-a"},
+	}
+	node := nodeWithIP("node-a", "10.0.0.20")
+	ar := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-20-node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-20", NodeName: "node-a"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, pool, node, ar).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme}
+	reconcileAttach(t, r, "pvc-20-node-a") // finalizer
+	reconcileAttach(t, r, "pvc-20-node-a") // local: no share, ready immediately
+
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-20"}, &storagev1alpha1.ZfsShare{}); err == nil {
+		t.Fatalf("expected no ZfsShare for a local NFS attach")
+	}
+
+	got := &storagev1alpha1.ZfsShareAttachRequest{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-20-node-a"}, got); err != nil {
+		t.Fatalf("get attach request: %v", err)
+	}
+	if !got.Status.Ready {
+		t.Errorf("local NFS attach should be Ready with no ZfsShare to wait on, got %+v", got.Status)
+	}
+}
+
+// TestAttachRequest_NFSMixedNodesCreatesShare covers the case where some nodes
+// are local and some are remote: a ZfsShare must still be created so the remote
+// nodes can reach the volume via NFS.
+func TestAttachRequest_NFSMixedNodesCreatesShare(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-21"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-21", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	// Pool is on node-a; node-b is remote.
+	pool := &storagev1alpha1.ZfsPool{
+		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName("999")},
+		Status:     storagev1alpha1.ZfsPoolStatus{GUID: "999", CurrentNode: "node-a"},
+	}
+	nodeA := nodeWithIP("node-a", "10.0.0.21")
+	nodeB := nodeWithIP("node-b", "10.0.0.22")
+	arA := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-21-node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-21", NodeName: "node-a"},
+	}
+	arB := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-21-node-b"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-21", NodeName: "node-b"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, pool, nodeA, nodeB, arA, arB).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme}
+	reconcileAttach(t, r, "pvc-21-node-a") // finalizer
+	reconcileAttach(t, r, "pvc-21-node-a") // mixed: share must be created
+
+	share := &storagev1alpha1.ZfsShare{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-21"}, share); err != nil {
+		t.Fatalf("expected ZfsShare when any requesting node is remote: %v", err)
+	}
+	if share.Spec.NFS == nil {
+		t.Fatalf("expected NFS spec on share")
+	}
+	// Both nodes must be in the allow-list.
+	if len(share.Spec.NFS.Clients) != 2 {
+		t.Errorf("expected 2 NFS clients, got %d: %+v", len(share.Spec.NFS.Clients), share.Spec.NFS.Clients)
+	}
+}
+
+// TestAttachRequest_NFSPoolMovesAwayCreatesShare covers the NFS pool-migration
+// transition: an NFS attach that was local must fall back to a ZfsShare once
+// the pool moves off the node.
+func TestAttachRequest_NFSPoolMovesAwayCreatesShare(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-22"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-22", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	pool := &storagev1alpha1.ZfsPool{
+		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName("999")},
+		Status:     storagev1alpha1.ZfsPoolStatus{GUID: "999", CurrentNode: "node-a"},
+	}
+	node := nodeWithIP("node-a", "10.0.0.23")
+	ar := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-22-node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-22", NodeName: "node-a"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, pool, node, ar).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}, &storagev1alpha1.ZfsPool{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme}
+	reconcileAttach(t, r, "pvc-22-node-a") // finalizer
+	reconcileAttach(t, r, "pvc-22-node-a") // local: no share
+
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-22"}, &storagev1alpha1.ZfsShare{}); err == nil {
+		t.Fatalf("expected no ZfsShare while pool is local")
+	}
+
+	var moved storagev1alpha1.ZfsPool
+	if err := c.Get(context.Background(), client.ObjectKey{Name: zpool.ResourceName("999")}, &moved); err != nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	moved.Status.CurrentNode = "node-b"
+	if err := c.Status().Update(context.Background(), &moved); err != nil {
+		t.Fatalf("update pool: %v", err)
+	}
+
+	reconcileAttach(t, r, "pvc-22-node-a")
+
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-22"}, &storagev1alpha1.ZfsShare{}); err != nil {
+		t.Fatalf("expected ZfsShare once the NFS pool is no longer local: %v", err)
 	}
 }

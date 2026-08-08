@@ -20,7 +20,8 @@ import (
 // fakeMounter records operations and lets tests script mount state.
 type fakeMounter struct {
 	mounted        map[string]bool
-	nfsMounts      map[string]string // target -> source
+	nfsMounts      map[string]string // target -> source (NFS network mounts)
+	dirMounts      map[string]string // target -> source (local bind-mount of directories)
 	fsMounts       map[string]string // target -> device
 	blockMounts    map[string]string // target -> device
 	connectedNQN   string
@@ -44,6 +45,7 @@ func newFakeMounter() *fakeMounter {
 	return &fakeMounter{
 		mounted:     map[string]bool{},
 		nfsMounts:   map[string]string{},
+		dirMounts:   map[string]string{},
 		fsMounts:    map[string]string{},
 		blockMounts: map[string]string{},
 		resized:     map[string]string{},
@@ -76,6 +78,11 @@ func (f *fakeMounter) FormatAndMount(device, target, fsType string, _ []string) 
 }
 func (f *fakeMounter) BindMountDevice(device, target string, _ bool) error {
 	f.blockMounts[target] = device
+	f.mounted[target] = true
+	return nil
+}
+func (f *fakeMounter) BindMountDir(source, target string, _ bool) error {
+	f.dirMounts[target] = source
 	f.mounted[target] = true
 	return nil
 }
@@ -178,7 +185,7 @@ func datasetWithPath(name, path string, typ storagev1alpha1.DatasetType, statusP
 
 func TestNodePublish_NFS(t *testing.T) {
 	m := newFakeMounter()
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"),
 		dataset("pvc-1", "k8s/pvc-1", storagev1alpha1.DatasetTypeFilesystem))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
@@ -203,7 +210,7 @@ func TestNodePublish_NFS(t *testing.T) {
 // Spec.Dataset, whatever the PV was created with.
 func TestNodePublish_NFS_LiveResolvesRenamedDataset(t *testing.T) {
 	m := newFakeMounter()
-	ns := newNodeServer(t, m, onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+	ns := newNodeServer(t, m, remotePool("999", "10.0.0.5", "/mnt/tank", "tank"),
 		dataset("pvc-1", "k8s/renamed-pvc-1", storagev1alpha1.DatasetTypeFilesystem))
 
 	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
@@ -220,6 +227,50 @@ func TestNodePublish_NFS_LiveResolvesRenamedDataset(t *testing.T) {
 	want := "10.0.0.5:/mnt/tank/k8s/renamed-pvc-1"
 	if got := m.nfsMounts["/var/lib/kubelet/pods/x/vol"]; got != want {
 		t.Errorf("nfs source = %q, want %q (live ZfsDataset.Spec.Dataset, not the PV's cached copy)", got, want)
+	}
+}
+
+// TestNodePublish_NFS_Local covers ADR-0031 Phase 2: when this node IS the pool's
+// own node, a dataset is bind-mounted directly from its host mountpoint instead
+// of round-tripping through NFS-over-loopback.
+func TestNodePublish_NFS_Local(t *testing.T) {
+	m := newFakeMounter()
+	ns := newNodeServer(t, m,
+		onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		datasetWithPath("pvc-local-nfs", "k8s/pvc-local-nfs", storagev1alpha1.DatasetTypeFilesystem, "/mnt/tank/k8s/pvc-local-nfs"))
+
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-local-nfs",
+		TargetPath:       "/var/lib/kubelet/pods/x/local-vol",
+		VolumeCapability: mountCap(),
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	if len(m.nfsMounts) != 0 {
+		t.Errorf("expected no NFS mount for a local dataset, got %v", m.nfsMounts)
+	}
+	if got := m.dirMounts["/var/lib/kubelet/pods/x/local-vol"]; got != "/mnt/tank/k8s/pvc-local-nfs" {
+		t.Errorf("dirMounts source = %q, want /mnt/tank/k8s/pvc-local-nfs", got)
+	}
+}
+
+// TestNodePublish_NFS_LocalRequiresStatusPath covers the case where the pool is
+// local but the agent has not yet populated ZfsDataset.Status.Path: the publish
+// must fail loudly rather than silently mounting the wrong thing.
+func TestNodePublish_NFS_LocalRequiresStatusPath(t *testing.T) {
+	m := newFakeMounter()
+	ns := newNodeServer(t, m,
+		onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		dataset("pvc-local-nfs-nopath", "k8s/pvc-local-nfs-nopath", storagev1alpha1.DatasetTypeFilesystem))
+
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:         "pvc-local-nfs-nopath",
+		TargetPath:       "/var/lib/kubelet/pods/x/vol",
+		VolumeCapability: mountCap(),
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("err = %v, want FailedPrecondition", err)
 	}
 }
 

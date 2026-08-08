@@ -28,7 +28,7 @@
   alternatives" for two earlier designs (a `ZfsShareSpec.AttachedNode` field,
   then a field-free derivation in the translator) that worked but were backed
   out for violating "a `ZfsShare`'s existence means it's exported."
-- **Not started:** Phase 2 (dataset/NFS passthrough).
+- **Done — Phase 2 (dataset/NFS passthrough):** see below.
 
 ## Motivation
 

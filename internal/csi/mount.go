@@ -57,6 +57,12 @@ type NodeMounter interface {
 	FormatAndMount(device, target, fsType string, options []string) (string, error)
 	// BindMountDevice bind-mounts a block device node at target (block volumes).
 	BindMountDevice(device, target string, readOnly bool) error
+	// BindMountDir bind-mounts a host directory at target for local dataset
+	// passthrough (ADR-0031 Phase 2). A SELinux context= override is baked in
+	// (container_file_t:s0) so the mount is safe under both permissive and
+	// enforcing SELinux — the same single-label behaviour NFS already provides,
+	// with no on-disk relabel.
+	BindMountDir(source, target string, readOnly bool) error
 	// Unmount unmounts target, ignoring an already-unmounted target.
 	Unmount(target string) error
 	// NVMeConnect connects to the NVMe-oF subsystem and returns the resulting
@@ -243,6 +249,19 @@ func (m *hostMounter) BindMountDevice(device, target string, readOnly bool) erro
 		opts = "bind,ro"
 	}
 	_, err := m.run(context.Background(), "mount", "-o", opts, device, target)
+	return err
+}
+
+func (m *hostMounter) BindMountDir(source, target string, readOnly bool) error {
+	// container_file_t:s0 overrides the SELinux label seen by all processes
+	// accessing this mount — the same single-label behaviour NFS provides (NFS
+	// has no per-inode labels at all). Without this, files labeled unlabeled_t
+	// (ZFS datasets' default) would be denied under an enforcing policy.
+	opts := "bind,context=system_u:object_r:container_file_t:s0"
+	if readOnly {
+		opts += ",ro"
+	}
+	_, err := m.run(context.Background(), "mount", "-o", opts, source, target)
 	return err
 }
 
