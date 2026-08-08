@@ -1189,6 +1189,49 @@ new node capability flag, a label-construction helper, and updating
 only one pod mounts a given local-optimised RWO dataset at a time (which is
 already enforced architecturally — RWO is single-node).
 
+## 23. Local bind-mount passthrough needs its source path visible in `csi-node` — neither the chart nor the driver enforces this
+
+**A real deployment gap, found live, now fixed at the chart level.** ADR-0031
+Phase 2's dataset bind-mount passthrough runs `mount -o bind <dataset's host
+mountpoint> <target>` from inside the `csi-node` container
+(`BindMountDir`/`publishLocalDataset`). If that source path — e.g.
+`/var/mnt/spinning-archive/k8s/backup-tier/csi-vol-...` — isn't visible
+*somewhere* in the container's own mount namespace, the `mount` call fails:
+
+```
+rpc error: code = Internal desc = bind-mount dataset "/var/mnt/.../csi-vol-...":
+mount -o bind ... : exit status 32: mount: ... : special device
+/var/mnt/.../csi-vol-... does not exist.
+```
+
+This happened on a real cluster the first time a RWO NFS-protocol PVC's
+consuming pod landed on the pool's own node: `csi-node`'s only hostPath
+volumes are `plugin-dir`, `registration-dir`, `pods-mount-dir` and `/dev` —
+none of them puts the pool's mount tree in view, unlike `toolbox`'s explicit
+`datasetMountRoot`. Neither `NodePublishVolume` nor the chart's install-time
+checks (there are none for this) catch the misconfiguration ahead of time —
+the failure surfaces only at first mount, as a kubelet-visible `FailedMount`
+event, which reads like a corrupted/missing dataset rather than a deployment
+gap.
+
+**The fix:** set `csiNode.datasetMountRoot` (added for this, mirrors
+`toolbox.datasetMountRoot`) to the pool's mount root (its parent is fine and
+is the recommended, node-independent choice — see that value's docstring).
+This adds a `HostToContainer` hostPath volume at the same path, which is all
+`BindMountDir`'s source side needs — the new mount is born at the *target*
+(`pods-mount-dir`, always `Bidirectional`), not the source, so the source
+volume never needs `Bidirectional` and no `hostPID`/host-exec is required.
+`csiNode.hostExec.enabled: true` is a working alternative (it enters the
+host's mount namespace directly, so the source always resolves) but is
+strictly broader: it also adds `hostPID: true` and reroutes every other
+mount/nvme call through `chroot`/`nsenter`. See design-decisions.md ADR-0033.
+
+**Takeaway:** any new code path that bind-mounts a host path *outside* the
+paths a component's existing hostPath volumes already cover needs an explicit
+audit of what's actually visible in that container's mount namespace — "it's
+privileged, it can mount anything" is true of *capability*, not of *path
+resolution*, and it was the latter that bit here.
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing

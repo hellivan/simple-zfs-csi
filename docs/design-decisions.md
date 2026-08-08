@@ -11,6 +11,85 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0033 — Local dataset bind-mount needs the source path in-container; prefer a scoped `HostToContainer` volume over enabling `csiNode.hostExec`
+
+**Status:** Accepted, implemented · **Scope:** `charts/simple-zfs-csi/values.yaml` (`csiNode.datasetMountRoot`), `charts/simple-zfs-csi/templates/csi-node-daemonset.yaml`. No Go code changes.
+
+### Context
+
+ADR-0031 Phase 2's local dataset passthrough calls `BindMountDir(sourcePath,
+targetPath, ...)` (`internal/csi/node.go`'s `publishLocalDataset`), which
+shells out to a plain `mount -o bind <sourcePath> <targetPath>`
+(`internal/csi/mount.go`). `sourcePath` is the dataset's actual host ZFS
+mountpoint (`ZfsDataset.status.path`, e.g.
+`/var/mnt/spinning-archive/k8s/backup-tier/csi-vol-...`).
+
+Neither the design doc nor the implementation ever wired this path into the
+`csi-node` container — unlike `toolbox`, which has always had an explicit
+`datasetMountRoot` volume for browsing. This was a genuine gap, not a
+documented, deliberate deferral: `local-passthrough-redesign.md` doesn't
+mention it. It surfaced on a live cluster as soon as a RWO NFS-protocol
+volume's consuming pod first tried to mount on the pool's own node: `mount`
+failed with `special device ... does not exist`, because `sourcePath` simply
+doesn't resolve inside the `csi-node` container's own mount namespace.
+
+The obvious-looking fix — set `csiNode.hostExec.enabled: true` — works (it
+already did, live), because `nsenter`-mode host-exec runs `mount` directly in
+the host's own mount namespace, where `sourcePath` obviously resolves. But
+this is a broader change than the bind-mount actually needs:
+
+* It adds `hostPID: true` to the whole pod (see the DaemonSet template's
+  conditional), giving `csi-node` visibility into every process on the host
+  (PIDs, cmdlines, `/proc/<pid>`), not just its own — a real widening of
+  blast radius, distinct from (and additional to) the `privileged: true` it
+  already runs with.
+* It reroutes *every* mount/nvme call this component makes — `MountNFS`,
+  `FormatAndMount`, `NVMeConnect`, etc. — through `nsenter`, even though only
+  the new bind-mount path actually needs host-namespace access; the in-image
+  `nfs-common`/`nvme-cli` tools were always sufficient for the others.
+
+### Decision
+
+Add `csiNode.datasetMountRoot` (mirrors `toolbox.datasetMountRoot`): an
+optional hostPath volume mounted into `csi-node` at the *same* path, with
+`HostToContainer` propagation — not `Bidirectional`. This is sufficient
+because of where the new mount is actually born: `mount --bind SRC DST`
+creates its new mount entry at `DST`, cloned from whatever `SRC` currently is;
+`SRC`'s own propagation setting is irrelevant to that operation, it only needs
+to *resolve* in the caller's mount namespace. `DST` here is always
+`pods-mount-dir` (`$kubeletDir/pods`), which the chart already mounts
+`Bidirectional` unconditionally — so the new bind-mount reaches kubelet/the
+host exactly the same way every other mount this driver creates already does.
+No `hostPID`, no `nsenter`, no behavior change for NFS/NVMe-oF.
+
+With this volume set (recommended: the pool's mount root's parent, e.g.
+`/var/mnt`, same rationale/Talos `extraMounts` split as
+`toolbox.datasetMountRoot`'s docstring), `hostExec` does not need to be
+enabled on `csiNode` at all for local passthrough to work.
+
+`hostExec.enabled: true` remains available and correct for operators who
+already need it for other reasons, or who prefer one mechanism over two — this
+ADR adds a narrower alternative, it does not remove the broader one.
+
+### Consequences
+
+* `csiNode.datasetMountRoot` defaults to `""` (disabled), matching
+  `toolbox.datasetMountRoot`'s existing default — no behavior change for
+  deployments that don't use local passthrough, or that already have
+  `hostExec` enabled.
+* Deployments adopting ADR-0031 Phase 2 (dataset bind-mount passthrough) on a
+  node where `csi-node` cannot otherwise see the pool's host mountpoint (e.g.
+  Talos, where kubelet has its own isolated mount namespace) must set
+  **either** `csiNode.datasetMountRoot` **or** `csiNode.hostExec.enabled:
+  true` — the chart does not fail loudly if neither is set; the bind-mount
+  simply fails at publish time with kubelet-visible `special device ... does
+  not exist`. See known-pitfalls.md class 23.
+* No Go code changes were needed: `BindMountDir`/`m.run` already just execs
+  `mount` with the raw source/target paths when host-exec is disabled: the
+  fix is entirely a chart-level volume/mount addition.
+
+---
+
 ## ADR-0032 — `NetworkExport` gets a finalizer so a delete during exporter-pod downtime is not lost
 
 **Status:** Accepted, implemented · **Scope:** `internal/controller/common.go`, `internal/controller/nfs_controller.go`, `internal/controller/nvmeof_controller.go`, `charts/simple-zfs-csi/templates/rbac.yaml`.

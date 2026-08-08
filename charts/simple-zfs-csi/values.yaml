@@ -420,6 +420,30 @@ csiNode:
     targetPid: 1
     # -- Host root path bind-mounted to /host in chroot mode.
     hostRootPath: /
+  # -- Optional host directory bind-mounted into the csi-node container at the
+  # -- SAME path, with HostToContainer propagation. This is what makes local
+  # -- dataset bind-mount passthrough (ADR-0031 Phase 2) work WITHOUT enabling
+  # -- `hostExec` above: `BindMountDir` runs a plain in-container
+  # -- `mount --bind <dataset's host mountpoint> <target>` — it only needs the
+  # -- source path to resolve inside the container (this volume), because the
+  # -- target is already under `pods-mount-dir`, which the chart always mounts
+  # -- Bidirectional. HostToContainer is sufficient here (never Bidirectional):
+  # -- the new mount is born at the TARGET, not the source, so this volume only
+  # -- ever needs to receive the host's existing mounts, not publish new ones.
+  # -- See design-decisions.md ADR-0033 and known-pitfalls.md class 23.
+  # --
+  # -- Set this to the same value as `toolbox.datasetMountRoot` (a parent of
+  # -- the pool's mountpoint is recommended, e.g. "/var/mnt" when the pool
+  # -- mounts at "/var/mnt/spinning-archive" — see that value's docstring for
+  # -- the full rationale, including the Talos `extraMounts` split).
+  # --
+  # -- Leave empty to disable (default). With this empty AND local dataset
+  # -- passthrough in use, the bind-mount fails with "special device ... does
+  # -- not exist" unless `hostExec.enabled: true` is set instead (which also
+  # -- reroutes every other mount/nvme call through chroot/nsenter — this value
+  # -- is the narrower, lower-privilege fix: it grants no `hostPID`, no host
+  # -- process visibility, and changes nothing about NFS/NVMe-oF mounts).
+  datasetMountRoot: ""
   # node-driver-registrar sidecar.
   registrar:
     # -- node-driver-registrar image repository.

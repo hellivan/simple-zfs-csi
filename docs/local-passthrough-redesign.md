@@ -168,6 +168,24 @@ translator's own pre-existing `sharesForPool` watch.
    `TestAttachRequest_NFSRWORaceExportsOldestNodeOnly`
    (zfsshareattachrequest_controller_test.go).
 
+### Deployment prerequisite: the bind-mount source path must be visible in `csi-node`
+
+**This was not called out when Phase 2 was designed/implemented — a genuine
+gap, found live.** `publishLocalDataset` bind-mounts `ZfsDataset.Status.Path`,
+which is the dataset's real host ZFS mountpoint. `csi-node`'s stock hostPath
+volumes (`plugin-dir`, `registration-dir`, `pods-mount-dir`, `/dev`) don't put
+that path anywhere in the container — so on any node where it isn't otherwise
+made visible, the bind-mount fails at first publish with a kubelet-visible
+`special device ... does not exist` `FailedMount`, not at chart-install or
+build time. Fixed in ADR-0033 by adding `csiNode.datasetMountRoot` (a
+`HostToContainer` hostPath volume, mirroring `toolbox.datasetMountRoot`) — see
+that ADR and known-pitfalls.md class 23 for the full mount-propagation
+reasoning for why `HostToContainer` (not `hostExec`/`hostPID`) is sufficient.
+`csiNode.hostExec.enabled: true` is a working, broader alternative for
+deployments that already need it. Either one must be set before adopting Phase
+2 on a node where `csi-node` doesn't otherwise see the pool's mount tree (e.g.
+Talos, where kubelet has its own isolated mount namespace).
+
 ## SELinux future work (not implemented)
 
 The `context=container_file_t:s0` option applies the same **single label per

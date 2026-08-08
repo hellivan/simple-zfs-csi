@@ -113,6 +113,16 @@ spec:
               # creates the mount on the host directly.)
               mountPropagation: Bidirectional
             {{- end }}
+            {{- with .Values.csiNode.datasetMountRoot }}
+            - name: dataset-mount-root
+              mountPath: {{ . }}
+              # HostToContainer (receive-only): this volume only needs to make
+              # the dataset's existing host mountpoint resolve inside the
+              # container as the *source* of `mount --bind`. The new mount is
+              # born at the target (pods-mount-dir, already Bidirectional
+              # above), never here. See ADR-0033/known-pitfalls.md class 23.
+              mountPropagation: HostToContainer
+            {{- end }}
           {{- with .Values.csiNode.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -154,5 +164,11 @@ spec:
           hostPath:
             path: {{ .Values.csiNode.hostExec.hostRootPath }}
             type: Directory
+        {{- end }}
+        {{- with .Values.csiNode.datasetMountRoot }}
+        - name: dataset-mount-root
+          hostPath:
+            path: {{ . }}
+            type: DirectoryOrCreate
         {{- end }}
 {{- end }}

@@ -390,7 +390,8 @@ Common values (see [charts/simple-zfs-csi/values.yaml](charts/simple-zfs-csi/val
 | `csiController.enabled` | `true` | provisioner Deployment (+ external-provisioner sidecar) |
 | `csiController.defaultParameters` | `{}` | lowest-priority parameter layer (`poolGUID`/`datasetPrefix` ignored here) |
 | `csiNode.enabled` | `true` | node-publish DaemonSet (+ node-driver-registrar sidecar) |
-| `csiNode.hostExec.*` | `chroot` | how the node plugin runs `nvme`/`mount` against the host |
+| `csiNode.hostExec.*` | `enabled: false`, `mode: nsenter` | run the node plugin's `nvme`/`mount` against the host directly (needed for other-node mounts; local dataset passthrough has a narrower alternative, see below) |
+| `csiNode.datasetMountRoot` | `""` | hostPath (`HostToContainer`) that lets local dataset bind-mount passthrough (ADR-0031 Phase 2) resolve its source without enabling `hostExec` at all |
 | `nfs.enabled` / `nvmeof.enabled` | `true` | toggle each export controller |
 | `nfs.pool.hostPath` / `mountPath` | `/tank` | ZFS pool root visible to the NFS pod |
 | `nfs.v4Only` | `false` | NFSv4-only mode (drops rpcbind) |
@@ -484,10 +485,18 @@ specially:
 - **All nodes (csi-node client mounts):**
   - **NFS client:** `nfs`/`nfsd` client support to `mount -t nfs`.
   - **NVMe-oF initiator:** `nvme_tcp` (+ `nvme_fabrics`) modules loaded; the
-    plugin shells `nvme connect`/`nvme disconnect` against the host via
-    `csiNode.hostExec` (`chroot /host` by default).
+    plugin ships its own `nvme-cli`/`nfs-common`, so `csiNode.hostExec` is
+    **off by default** — enable it (`mode: nsenter`) only if the host's own
+    binaries must be used instead.
   - **Mount propagation:** the kubelet must allow rshared bind-mount propagation
     (the default on Talos) so the node plugin's mounts reach consuming pods.
+  - **Local dataset passthrough (ADR-0031 Phase 2):** on a node where
+    `csi-node` doesn't already see the pool's mount tree (e.g. Talos), set
+    `csiNode.datasetMountRoot` (or `csiNode.hostExec.enabled: true`) — see
+    [docs/local-passthrough-redesign.md](docs/local-passthrough-redesign.md)
+    and [docs/known-pitfalls.md](docs/known-pitfalls.md) class 23. Without
+    either, the bind-mount fails at first publish with a `FailedMount`
+    `special device ... does not exist` error.
 - **Cluster-wide (optional):**
   - **Snapshots:** the external snapshot CRDs (`VolumeSnapshot`,
     `VolumeSnapshotClass`, `VolumeSnapshotContent`) and the `snapshot-controller`
