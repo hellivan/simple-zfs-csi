@@ -179,6 +179,23 @@ the driver apply per-pod `context=` labels instead of a fixed shared type. That
 requires implementing `NODE_SERVICE_CAPABILITY_VOLUME_MOUNT_GROUP` and is
 currently noted as future work in [known-pitfalls.md](known-pitfalls.md).
 
+## RWX local passthrough (considered, rejected/postponed)
+
+Extending Phase 2's bind-mount optimization to RWX volumes (bind-mount for
+pods co-located with the pool, NFS for everyone else, same volume at once) was
+investigated and **rejected as unsafe by default** — a mixed mount puts
+`flock()` (native on the bind-mount side) and NFS's `fcntl()`-translated locks
+in two domains the kernel does not cross-check, so both a local and a remote
+pod can hold what looks like an exclusive lock simultaneously. Unlike the RWO
+case, where "mixed" is only a brief migration transient the aggregator closes
+by picking one winning node, RWX by design allows multiple nodes to hold the
+volume at once — so a mixed RWX mount would be the steady state, not a
+transient. Full writeup, including the NFS cache-coherency and delegation
+angles and a possible guarded opt-in design, is in
+[future-work.md](future-work.md#mixed-localnfs-mounts-for-rwx-volumes-rejectedpostponed).
+RWX volumes therefore always use NFS regardless of locality (see Phase 2
+above).
+
 ## Open questions
 
 - Should the "no `ZfsShare` for a local attach" state be surfaced more

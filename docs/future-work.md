@@ -127,6 +127,81 @@ delete a snapshot on a fresh install.
 Either way the markers should stop being advisory, since they are currently the
 only place a reconciler's real permission needs are written down.
 
+## Mixed local/NFS mounts for RWX volumes (rejected/postponed)
+
+**Why considered:** ADR-0031 Phase 2 gives RWO NFS datasets a local bind-mount
+when the pod and the pool share a node. The natural next question is whether
+RWX (multi-node) datasets could get the same optimization per-pod — pods that
+land on the pool's own node get a bind-mount, pods on other nodes get NFS, same
+volume, mixed transport. Investigated and **rejected as unsafe by default**;
+documenting the findings here so it isn't re-attempted without re-deriving why.
+
+**The core problem: lock-domain collision between `flock()` and NFS.**
+Linux has two independent locking domains, `flock()` (BSD, whole-file) and
+`fcntl()`/OFD (POSIX, byte-range), and the kernel does not cross-check between
+them. NFS has no native `flock()` support: the Linux NFS client silently
+translates a client's `flock()` call into an `fcntl()` byte-range lock over the
+wire. So under a mixed mount:
+
+- A pod using the **local bind-mount** calls `flock()` → gets a native BSD lock
+  directly against the ZFS dataset.
+- A pod using the **NFS mount** calls `flock()` → the NFS client turns this
+  into an `fcntl()` lock, which the NFS server (`nfsd`) then places on the same
+  underlying dataset.
+- The kernel holds both a `flock()` and an `fcntl()` lock on the same file
+  *simultaneously*, from two different "views" of the same storage, and treats
+  them as non-conflicting because they're different domains. **Both pods get
+  write access at once.** Silent corruption, not a crash — the worst kind of
+  failure for a storage layer to introduce.
+
+Any application replica scaled across nodes that calls `flock()` (a very common
+pattern for `.pid` files, simple daemons, and plenty of "simple" locking code)
+would be exposed to this the moment one replica landed on the pool's node and
+another didn't — which, on a cluster where pods get rescheduled routinely, is
+not a rare edge case but an eventual certainty.
+
+**Two more problems on top of that, even for `fcntl()`-only / lock-free apps:**
+
+- **Cache coherency (NFS close-to-open):** NFS clients only guarantee
+  consistency at open/close time and otherwise trust their attribute cache
+  (typically several seconds to a minute). A local bind-mount pod's write hits
+  ZFS immediately; a same-volume NFS pod reading without an intervening
+  open/close (e.g. tailing a file) can serve stale data from its own cache
+  indefinitely, because the local writer never went through anything the NFS
+  server's revalidation would notice in time.
+- **NFSv4 delegations:** `nfsd` can hand a client a delegation (full
+  read/write control, cached locally, no round-trip). Recalling it when a
+  *different path* (the local bind-mount) modifies the file depends on the
+  kernel's VFS lease-break mechanism noticing the change — a known
+  race-prone path. A missed or delayed lease break lets the delegation holder
+  keep writing its stale cached copy while the local bind-mount pod writes
+  concurrently to disk.
+
+**Why this differs from the RWO fix:** the RWO restriction (see ADR-0031 above)
+exists precisely because a *single* volume must never be visible through two
+lock domains from two different nodes at once. RWX by definition allows
+multiple nodes to hold the volume simultaneously, so "mixed" isn't a transient
+race to close (like the RWO migration case) — it would be the **steady state**
+for as long as pods are scheduled across nodes, which is indefinite for any
+long-running RWX deployment.
+
+**Candidate approach if ever revisited:** do **not** make this the default.
+Expose it, if at all, as an explicit, scarily-named opt-in StorageClass
+parameter (e.g. `unsafeLocalBypassRWX: true` / `experimentalMixedRWX: true`),
+document loudly that it requires every workload sharing the volume to either
+use only `fcntl()`/OFD byte-range locks (never `flock()`), avoid relying on
+timely cross-node read-after-write visibility, or coordinate externally (e.g.
+a lock service), and treat it as a niche "hub-and-spoke" optimization (one
+heavy local writer, several remote read-mostly consumers) rather than a
+general-purpose RWX speedup.
+
+**Decision: not pursued.** The blast radius (silent corruption for any RWX
+workload using `flock()`, which the driver cannot detect or prevent) outweighs
+the loopback-avoidance benefit for the common case. RWX volumes continue to
+always go through NFS regardless of locality (current, safe behavior — see
+ADR-0031 Phase 2). Revisit only if a concrete workload needs it badly enough to
+justify a guarded, explicitly unsafe opt-in.
+
 ## Not pursuing (for now)
 
 - **`VolumeReplication`** (csi-addons) — would mean building `zfs

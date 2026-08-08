@@ -86,13 +86,23 @@ since the aggregator and the two other reconcilers that already read
 - The aggregator gained a `ZfsPool` `Get` + a new `Watches` for migration
   correctness — a small, well-precedented addition (the translator already
   had the equivalent `sharesForPool` watch for the same reason).
-- **Phase 2 (dataset/NFS passthrough) also done.** Same aggregator-decides
-  principle: when every requesting node IS the pool's node, no `ZfsShare` is
-  created. `publishLocalDataset` in the node plugin bind-mounts
-  `ZfsDataset.Status.Path` with a `context=container_file_t:s0` SELinux
-  override (same single-label behaviour NFS always had; see session notes for
-  the full SELinux analysis). Mixed local+remote: `ZfsShare` created for
-  remote nodes; local node still uses bind-mount at publish time.
+- **Phase 2 (dataset/NFS passthrough) also done, RWO only.** Same
+  aggregator-decides principle, but restricted to single-node access modes
+  (`ZfsShareAttachRequestSpec.SingleNode`, set by `ControllerPublishVolume`
+  from the PVC's `VolumeCapability`): the aggregator picks the winning node the
+  same way NVMe-oF does (`oldestAttachNode`), and only skips the `ZfsShare` when
+  that winner is the pool's own node. `publishLocalDataset` in the node plugin
+  bind-mounts `ZfsDataset.Status.Path`, with a
+  `context=container_file_t:s0` SELinux override applied only when the kernel
+  has SELinux compiled in (`selinuxActive()` checks `/sys/fs/selinux/enforce`
+  at runtime, avoiding `EINVAL` on kernels without it). **RWX volumes never use
+  local passthrough**, regardless of locality: a pod migrating off the pool's
+  node while other RWX pods are already bind-mounted would leave the same
+  directory served through two different file-locking domains (BSD `flock()`
+  as seen by the local bind-mount vs. NFS's `fcntl()`-translated locks as seen
+  by everyone else) at once, which the kernel does not reconcile — see
+  [future-work.md](future-work.md#mixed-localnfs-mounts-for-rwx-volumes-rejectedpostponed)
+  for the full analysis of why this was considered and rejected/postponed.
 
 ---
 
