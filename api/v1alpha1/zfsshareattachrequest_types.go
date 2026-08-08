@@ -24,6 +24,17 @@ type ZfsShareAttachRequestSpec struct {
 	// added to the aggregated share's allow-list.
 	// +kubebuilder:validation:MinLength=1
 	NodeName string `json:"nodeName"`
+
+	// SingleNode is true when the volume's access mode is single-node (RWO /
+	// ROX single-node): only one node may attach at a time. The operator uses
+	// this to decide whether a dataset can use the local bind-mount passthrough
+	// (ADR-0031 Phase 2) — local passthrough is safe only for single-node
+	// access modes, because a bind-mount and an NFS mount of the same directory
+	// use different lock domains (POSIX vs. lockd) and must never coexist on
+	// different nodes for the same volume. Multi-node (RWX) volumes always use
+	// NFS regardless of locality.
+	// +optional
+	SingleNode bool `json:"singleNode,omitempty"`
 }
 
 // ZfsShareAttachRequestStatus reports whether the export is live for this node.

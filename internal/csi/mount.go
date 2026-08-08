@@ -253,16 +253,30 @@ func (m *hostMounter) BindMountDevice(device, target string, readOnly bool) erro
 }
 
 func (m *hostMounter) BindMountDir(source, target string, readOnly bool) error {
-	// container_file_t:s0 overrides the SELinux label seen by all processes
-	// accessing this mount — the same single-label behaviour NFS provides (NFS
-	// has no per-inode labels at all). Without this, files labeled unlabeled_t
-	// (ZFS datasets' default) would be denied under an enforcing policy.
-	opts := "bind,context=system_u:object_r:container_file_t:s0"
+	opts := "bind"
+	if selinuxActive() {
+		// context=container_file_t:s0 overrides the SELinux label seen by all
+		// processes accessing this mount — the same single-label behaviour NFS
+		// provides (NFS has no per-inode labels). Without this, files labeled
+		// unlabeled_t (ZFS datasets' default) would be denied under an enforcing
+		// policy. Only applied when SELinux is active to avoid EINVAL on kernels
+		// compiled without CONFIG_SECURITY_SELINUX.
+		opts += ",context=system_u:object_r:container_file_t:s0"
+	}
 	if readOnly {
 		opts += ",ro"
 	}
 	_, err := m.run(context.Background(), "mount", "-o", opts, source, target)
 	return err
+}
+
+// selinuxActive reports whether SELinux is currently enabled on this host. It
+// checks the enforce file under the well-known securityfs mount point; if the
+// file exists and is readable the kernel has SELinux compiled in and mounted.
+// On kernels without CONFIG_SECURITY_SELINUX the file simply does not exist.
+func selinuxActive() bool {
+	_, err := os.ReadFile("/sys/fs/selinux/enforce")
+	return err == nil
 }
 
 func (m *hostMounter) Unmount(target string) error {

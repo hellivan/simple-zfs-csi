@@ -116,7 +116,14 @@ func (n *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 		if block {
 			return nil, status.Error(codes.InvalidArgument, "block volumeMode is not supported for nfs")
 		}
-		if isLocalToPool(n.NodeID, pool) {
+		// Local passthrough (ADR-0031 Phase 2) is safe only for single-node access
+		// modes. With multi-node (RWX), pods on different nodes may hold both bind
+		// mounts and NFS mounts of the same directory simultaneously, which puts
+		// POSIX locks and NFS lockd locks in separate domains — they don't
+		// interoperate and can corrupt data.
+		isSingleNode := volCap.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER ||
+			volCap.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY
+		if isSingleNode && isLocalToPool(n.NodeID, pool) {
 			if err := n.publishLocalDataset(statusPath, targetPath, readOnly, mountFlags); err != nil {
 				return nil, err
 			}

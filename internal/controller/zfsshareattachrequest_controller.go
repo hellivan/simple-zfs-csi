@@ -220,20 +220,48 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 		if err := r.gateReader().Get(ctx, client.ObjectKey{Name: zpool.ResourceName(ds.Spec.PoolGUID)}, &pool); err != nil {
 			return nil, nil, false, fmt.Errorf("get ZfsPool %q: %w", ds.Spec.PoolGUID, err)
 		}
-		// Pure-local: every requesting node IS the pool's own node → bind-mount
-		// path, no NFS export needed, no ZfsShare. A ZfsShare's existence means
-		// "exported over the network" (ADR-0031); skip it entirely here rather
-		// than letting a downstream component silently produce nothing.
-		if pool.Status.CurrentNode != "" && allNodesLocal(nodes, pool.Status.CurrentNode) {
-			share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
-			if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
+
+		if r.isSingleNodeVolume(ctx, volume) {
+			// Single-node (RWO) NFS: "oldest wins" safety + optional local passthrough
+			// (ADR-0031 Phase 2). Only one node may hold the NFS mount at a time; in
+			// the rare case of multiple requests (e.g. a forced pod move that attaches
+			// to the new node before the old one detaches), export to the oldest only.
+			node, err := r.oldestAttachNode(ctx, volume)
+			if err != nil {
 				return nil, nil, false, err
 			}
-			return nil, exported, true, nil
-		}
-		nfsClients, err = r.nfsClientsForNodes(ctx, nodes)
-		if err != nil {
-			return nil, nil, false, err
+			if len(nodes) > 1 {
+				logger.Info("NFS single-node volume has attach requests from multiple nodes; exporting only to the oldest",
+					"volume", volume, "nodes", nodes, "chosen", node)
+			}
+			exported = []string{node}
+
+			// Local passthrough: if the winning node IS the pool's current node, skip
+			// the ZfsShare entirely — the node plugin bind-mounts the dataset directly.
+			// A ZfsShare's existence means "exported over the network" (ADR-0031); we
+			// must not create one for a local-only case.
+			if pool.Status.CurrentNode != "" && pool.Status.CurrentNode == node {
+				share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
+				if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
+					return nil, nil, false, err
+				}
+				return nil, exported, true, nil
+			}
+
+			// Remote single-node: NFS export to the one winning node only.
+			nfsClients, err = r.nfsClientsForNodes(ctx, exported)
+			if err != nil {
+				return nil, nil, false, err
+			}
+		} else {
+			// Multi-node (RWX): all requesting nodes get NFS access. No local
+			// passthrough ever: mixing bind-mounts and NFS mounts of the same directory
+			// on different nodes uses different lock domains (POSIX vs. lockd) and
+			// breaks file-locking semantics (ADR-0031).
+			nfsClients, err = r.nfsClientsForNodes(ctx, nodes)
+			if err != nil {
+				return nil, nil, false, err
+			}
 		}
 	case storagev1alpha1.ProtocolNVMeoF:
 		// Single-node safety (defense in depth; the CSI controller already rejects a
@@ -467,17 +495,25 @@ func (r *ZfsShareAttachRequestReconciler) deleteDHChapSecret(ctx context.Context
 // dhchapSecretName is the deterministic Secret name for a volume's DH-CHAP key.
 func dhchapSecretName(volume string) string { return "dhchap-" + volume }
 
-// allNodesLocal reports whether every node in nodes equals poolNode. Used by
-// reconcileVolume to decide if an NFS dataset needs a network export at all
-// (ADR-0031 Phase 2): when every requesting node IS the pool's own node, a
-// bind-mount is used instead, and no ZfsShare is created.
-func allNodesLocal(nodes []string, poolNode string) bool {
-	for _, n := range nodes {
-		if n != poolNode {
-			return false
-		}
+// isSingleNodeVolume reports whether the volume was provisioned with a
+// single-node access mode (SingleNode=true on the attach request). It uses the
+// authoritative API-server reader so a stale cache cannot produce a false
+// positive that skips an NFS export prematurely. All attach requests for the
+// same PV carry the same SingleNode value (it is derived from the PV's fixed
+// access mode); checking any one non-terminating request is sufficient.
+func (r *ZfsShareAttachRequestReconciler) isSingleNodeVolume(ctx context.Context, volume string) bool {
+	var list storagev1alpha1.ZfsShareAttachRequestList
+	if err := r.gateReader().List(ctx, &list); err != nil {
+		return false
 	}
-	return len(nodes) > 0
+	for i := range list.Items {
+		it := &list.Items[i]
+		if it.Spec.VolumeName != volume || !it.DeletionTimestamp.IsZero() {
+			continue
+		}
+		return it.Spec.SingleNode
+	}
+	return false
 }
 
 // setStatus patches the attach request status subresource.

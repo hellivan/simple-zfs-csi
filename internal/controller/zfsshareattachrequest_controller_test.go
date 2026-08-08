@@ -460,10 +460,9 @@ func TestAttachRequest_NVMeoFPoolMovesAwayCreatesShare(t *testing.T) {
 	}
 }
 
-// TestAttachRequest_NFSLocalSkipsShare covers ADR-0031 Phase 2: when all
-// requesting nodes are the pool's own current node, no ZfsShare is created (a
-// ZfsShare's existence means "exported over the network") and the attach request
-// is immediately Ready.
+// TestAttachRequest_NFSLocalSkipsShare covers ADR-0031 Phase 2: for a
+// single-node (RWO) NFS volume whose requesting node IS the pool's own node, no
+// ZfsShare is created and the attach request is immediately Ready.
 func TestAttachRequest_NFSLocalSkipsShare(t *testing.T) {
 	scheme := newAttachScheme(t)
 
@@ -478,7 +477,7 @@ func TestAttachRequest_NFSLocalSkipsShare(t *testing.T) {
 	node := nodeWithIP("node-a", "10.0.0.20")
 	ar := &storagev1alpha1.ZfsShareAttachRequest{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-20-node-a"},
-		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-20", NodeName: "node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-20", NodeName: "node-a", SingleNode: true},
 	}
 
 	c := fake.NewClientBuilder().
@@ -492,7 +491,7 @@ func TestAttachRequest_NFSLocalSkipsShare(t *testing.T) {
 	reconcileAttach(t, r, "pvc-20-node-a") // local: no share, ready immediately
 
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-20"}, &storagev1alpha1.ZfsShare{}); err == nil {
-		t.Fatalf("expected no ZfsShare for a local NFS attach")
+		t.Fatalf("expected no ZfsShare for a local RWO NFS attach")
 	}
 
 	got := &storagev1alpha1.ZfsShareAttachRequest{}
@@ -500,13 +499,56 @@ func TestAttachRequest_NFSLocalSkipsShare(t *testing.T) {
 		t.Fatalf("get attach request: %v", err)
 	}
 	if !got.Status.Ready {
-		t.Errorf("local NFS attach should be Ready with no ZfsShare to wait on, got %+v", got.Status)
+		t.Errorf("local NFS RWO attach should be Ready with no ZfsShare to wait on, got %+v", got.Status)
 	}
 }
 
-// TestAttachRequest_NFSMixedNodesCreatesShare covers the case where some nodes
-// are local and some are remote: a ZfsShare must still be created so the remote
-// nodes can reach the volume via NFS.
+// TestAttachRequest_NFSRWXAlwaysNFS covers ADR-0031's safety restriction: a
+// multi-node (RWX) NFS volume ALWAYS gets a ZfsShare and NFS export, even when
+// all requesting nodes are on the pool's own node. Mixing bind-mounts and NFS
+// mounts of the same directory across nodes puts POSIX and lockd locks in
+// different domains and breaks file-locking semantics.
+func TestAttachRequest_NFSRWXAlwaysNFS(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-23"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-23", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	// Pool is on node-a — the same node that is requesting. Despite being fully
+	// local, RWX (SingleNode: false) must still produce a ZfsShare.
+	pool := &storagev1alpha1.ZfsPool{
+		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName("999")},
+		Status:     storagev1alpha1.ZfsPoolStatus{GUID: "999", CurrentNode: "node-a"},
+	}
+	node := nodeWithIP("node-a", "10.0.0.24")
+	ar := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-23-node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-23", NodeName: "node-a", SingleNode: false},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, pool, node, ar).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme}
+	reconcileAttach(t, r, "pvc-23-node-a") // finalizer
+	reconcileAttach(t, r, "pvc-23-node-a") // RWX: ZfsShare always created
+
+	share := &storagev1alpha1.ZfsShare{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-23"}, share); err != nil {
+		t.Fatalf("RWX volume on local node must still have a ZfsShare: %v", err)
+	}
+	if share.Spec.NFS == nil || len(share.Spec.NFS.Clients) != 1 || share.Spec.NFS.Clients[0].Client != "10.0.0.24" {
+		t.Errorf("NFS clients = %+v, want [{10.0.0.24}]", share.Spec.NFS)
+	}
+}
+
+// TestAttachRequest_NFSMixedNodesCreatesShare verifies that a multi-node (RWX)
+// NFS volume with multiple requesting nodes produces a ZfsShare containing all
+// nodes in the NFS allow-list, regardless of which nodes are local to the pool.
 func TestAttachRequest_NFSMixedNodesCreatesShare(t *testing.T) {
 	scheme := newAttachScheme(t)
 
@@ -514,7 +556,7 @@ func TestAttachRequest_NFSMixedNodesCreatesShare(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-21"},
 		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-21", Type: storagev1alpha1.DatasetTypeFilesystem},
 	}
-	// Pool is on node-a; node-b is remote.
+	// Pool is on node-a; node-b is remote. Both get NFS under RWX (SingleNode: false).
 	pool := &storagev1alpha1.ZfsPool{
 		ObjectMeta: metav1.ObjectMeta{Name: zpool.ResourceName("999")},
 		Status:     storagev1alpha1.ZfsPoolStatus{GUID: "999", CurrentNode: "node-a"},
@@ -523,11 +565,11 @@ func TestAttachRequest_NFSMixedNodesCreatesShare(t *testing.T) {
 	nodeB := nodeWithIP("node-b", "10.0.0.22")
 	arA := &storagev1alpha1.ZfsShareAttachRequest{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-21-node-a"},
-		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-21", NodeName: "node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-21", NodeName: "node-a", SingleNode: false},
 	}
 	arB := &storagev1alpha1.ZfsShareAttachRequest{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-21-node-b"},
-		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-21", NodeName: "node-b"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-21", NodeName: "node-b", SingleNode: false},
 	}
 
 	c := fake.NewClientBuilder().
@@ -538,24 +580,23 @@ func TestAttachRequest_NFSMixedNodesCreatesShare(t *testing.T) {
 
 	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme}
 	reconcileAttach(t, r, "pvc-21-node-a") // finalizer
-	reconcileAttach(t, r, "pvc-21-node-a") // mixed: share must be created
+	reconcileAttach(t, r, "pvc-21-node-a") // RWX: share with all nodes
 
 	share := &storagev1alpha1.ZfsShare{}
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-21"}, share); err != nil {
-		t.Fatalf("expected ZfsShare when any requesting node is remote: %v", err)
+		t.Fatalf("expected ZfsShare for RWX NFS volume: %v", err)
 	}
 	if share.Spec.NFS == nil {
 		t.Fatalf("expected NFS spec on share")
 	}
-	// Both nodes must be in the allow-list.
 	if len(share.Spec.NFS.Clients) != 2 {
 		t.Errorf("expected 2 NFS clients, got %d: %+v", len(share.Spec.NFS.Clients), share.Spec.NFS.Clients)
 	}
 }
 
 // TestAttachRequest_NFSPoolMovesAwayCreatesShare covers the NFS pool-migration
-// transition: an NFS attach that was local must fall back to a ZfsShare once
-// the pool moves off the node.
+// transition: a single-node (RWO) NFS attach that was local must fall back to a
+// ZfsShare once the pool moves off the node.
 func TestAttachRequest_NFSPoolMovesAwayCreatesShare(t *testing.T) {
 	scheme := newAttachScheme(t)
 
@@ -570,7 +611,7 @@ func TestAttachRequest_NFSPoolMovesAwayCreatesShare(t *testing.T) {
 	node := nodeWithIP("node-a", "10.0.0.23")
 	ar := &storagev1alpha1.ZfsShareAttachRequest{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-22-node-a"},
-		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-22", NodeName: "node-a"},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-22", NodeName: "node-a", SingleNode: true},
 	}
 
 	c := fake.NewClientBuilder().
@@ -600,5 +641,49 @@ func TestAttachRequest_NFSPoolMovesAwayCreatesShare(t *testing.T) {
 
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-22"}, &storagev1alpha1.ZfsShare{}); err != nil {
 		t.Fatalf("expected ZfsShare once the NFS pool is no longer local: %v", err)
+	}
+}
+
+// TestAttachRequest_NFSRWORaceExportsOldestNodeOnly covers the defense-in-depth
+// single-node safety check for RWO NFS: in the rare case of two attach requests
+// racing (e.g. a forced pod move attaching to the new node before the old one
+// detaches), only the oldest request wins the NFS export.
+func TestAttachRequest_NFSRWORaceExportsOldestNodeOnly(t *testing.T) {
+	scheme := newAttachScheme(t)
+
+	ds := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-24"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-24", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	// Pool is remote so both requests go through NFS (not local passthrough).
+	pool := remoteAttachPool("999")
+	nodeA := nodeWithIP("node-a", "10.0.0.25")
+	nodeB := nodeWithIP("node-b", "10.0.0.26")
+	// node-a attached first (older); node-b is a racing newcomer.
+	older := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-24-node-a", CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour))},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-24", NodeName: "node-a", SingleNode: true},
+	}
+	newer := &storagev1alpha1.ZfsShareAttachRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-24-node-b", CreationTimestamp: metav1.NewTime(time.Now())},
+		Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: "pvc-24", NodeName: "node-b", SingleNode: true},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(ds, pool, nodeA, nodeB, older, newer).
+		WithStatusSubresource(&storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		Build()
+
+	r := &ZfsShareAttachRequestReconciler{Client: c, Scheme: scheme}
+	reconcileAttach(t, r, "pvc-24-node-b") // finalizer
+	reconcileAttach(t, r, "pvc-24-node-b") // aggregate
+
+	share := &storagev1alpha1.ZfsShare{}
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-24"}, share); err != nil {
+		t.Fatalf("get share: %v", err)
+	}
+	if share.Spec.NFS == nil || len(share.Spec.NFS.Clients) != 1 || share.Spec.NFS.Clients[0].Client != "10.0.0.25" {
+		t.Errorf("RWO NFS share must export only to the oldest node (10.0.0.25/node-a), got: %+v", share.Spec.NFS)
 	}
 }

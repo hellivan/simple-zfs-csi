@@ -1157,6 +1157,38 @@ and needs further research. See also
 (not eliminates) the pressure this class describes by removing unnecessary
 loopback network traffic for co-located workloads.
 
+## 22. Local bind-mount SELinux future work — per-pod MCS label isolation
+
+**Not a bug; a known capability gap.** The local bind-mount passthrough added
+in ADR-0031 Phase 2 applies a **fixed** SELinux label to the entire mount:
+`context=system_u:object_r:container_file_t:s0`. This gives every process that
+accesses the mount the same label, which is exactly the same behaviour NFS
+always had (NFS filesystems carry no per-inode labels at all). It is safe under
+both permissive and enforcing SELinux, and it degrades gracefully on kernels
+without `CONFIG_SECURITY_SELINUX` (the `context=` option is omitted rather than
+causing `EINVAL`).
+
+**What is missing:** per-pod MCS level isolation. When two pods (with different
+UIDs/MCS labels) mount the same bind-mounted dataset at the same time, they see
+the same `container_file_t:s0` label on every file — they cannot be isolated
+from each other at the SELinux level. NFS mounts (all of them) have the same
+limitation in this driver. A block volume (`SINGLE_NODE_WRITER`, NVMe-oF) is
+fully MCS-isolated by the block device itself.
+
+**The fix (future):** implement `NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP`
+(`csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP`). With this capability
+declared, kubelet passes the pod's exact SELinux context (and fsGroup GID)
+into `NodePublishVolumeRequest.volume_context`; the driver can then apply the
+pod-specific `context=system_u:object_r:container_file_t:<MCS>` label to its
+bind-mount instead of a fixed one. This is the mechanism other CSI drivers
+(e.g. the in-tree `local` volume type) use for this isolation. It requires a
+new node capability flag, a label-construction helper, and updating
+`BindMountDir` to accept an optional context override.
+
+**Workaround now:** use NFS (the default, always the path for RWX) or ensure
+only one pod mounts a given local-optimised RWO dataset at a time (which is
+already enforced architecturally — RWO is single-node).
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing

@@ -119,24 +119,65 @@ translator's own pre-existing `sharesForPool` watch.
    objects for a same-node PVC attach, and that cross-node attach is
    unchanged.
 
-## Phase 2 — dataset / NFS local passthrough (not started)
+## Phase 2 — dataset / NFS local passthrough (done, RWO only)
 
-**Scope:** `internal/csi/{node,mount,controller}.go`,
-`internal/controller/nfs_controller.go`, chart.
+**Scope:** `internal/csi/{node,mount}.go`,
+`internal/controller/zfsshareattachrequest_controller.go`,
+`api/v1alpha1/zfsshareattachrequest_types.go`.
 
-1. Reuse `isLocalToPool`.
-2. `NodePublishVolume` (filesystem/dataset path): if the access mode is RWO
-   **and** local, bind-mount `ZfsPool.status.baseMountPath/<dataset>` directly
-   instead of `mount -t nfs`. RWX always uses NFS regardless of locality.
-3. **SELinux is the biggest unknown.** Pods run under `pod_t` on Talos. NFS
-   never triggers relabeling because it's a network filesystem; a direct
-   bind-mount of a host ZFS mountpoint may need an explicit mount `context=`
-   option or an equivalent relabel step. **Prototype this first.**
-4. Audit `uid`/`gid`/`mode` (ADR-0015) and fsGroup interaction.
-5. Document that local-bind datasets use native POSIX locks, not NFS
-   `lockd`.
-6. `NodeUnpublishVolume` + transition handling, mirroring Phase 1.
-7. Tests + manual verification, mirroring Phase 1.
+1. ~~`isLocalToPool` reused from Phase 1~~ — no new routing helper needed.
+2. ~~`NodePublishVolume` (filesystem/dataset path)~~: **RWO only.** If the
+   VolumeCapability is `SINGLE_NODE_WRITER` or `SINGLE_NODE_READER_ONLY` AND the
+   pool is local, calls `publishLocalDataset` which bind-mounts
+   `ZfsDataset.Status.Path` directly. **RWX always uses NFS regardless of
+   locality** — mixing bind-mounts and NFS mounts from different nodes puts POSIX
+   locks and NFS lockd locks in separate domains and breaks file-locking semantics
+   (e.g. database journalling).
+3. SELinux: `BindMountDir` applies `context=system_u:object_r:container_file_t:s0`
+   **conditionally** — it checks whether `/sys/fs/selinux/enforce` exists at
+   runtime. If the kernel has `CONFIG_SECURITY_SELINUX` compiled in, the option
+   is added (providing the same single-label behaviour NFS always provided); if not
+   (e.g. an embedded or minimal kernel), it is omitted to avoid `EINVAL`. See
+   `selinuxActive()` in `mount.go`.
+4. **`ZfsShareAttachRequestSpec.SingleNode bool`** added (true = RWO): the CSI
+   controller sets this at `ControllerPublishVolume` time from the request's
+   VolumeCapability, so the aggregator doesn't have to re-derive it.
+5. Aggregator (NFS): `reconcileVolume` checks `isSingleNodeVolume` via
+   `gateReader()`.
+   - **Single-node (RWO):** uses `oldestAttachNode` ("oldest wins," same as
+     NVMe-oF), then checks locality. If the winning node IS the pool's node → no
+     `ZfsShare` (bind-mount path). If remote → NFS export to the single winning
+     node only. Multiple requests here are a race the CSI controller already
+     rejects; the aggregator handles them defensively by exporting only to the
+     oldest.
+   - **Multi-node (RWX):** all requesting nodes get NFS. Never local, never
+     skips `ZfsShare`.
+6. Pool migration (NFS): existing `requestsForPool` watch re-triggers
+   reconciliation; if the pool moves away, the aggregator creates a `ZfsShare`
+   on the next reconcile. Tested with
+   `TestAttachRequest_NFSPoolMovesAwayCreatesShare`.
+7. `NodeUnpublishVolume`: unchanged — `Unmount` + `RemovePath` works for bind
+   mounts and NFS mounts identically.
+8. `NodeExpandVolume`: NFS early-return is unchanged — local datasets need no
+   node-side resize work (ZFS handles capacity via dataset quota/reservation).
+9. Tests: `TestNodePublish_NFS_Local`, `TestNodePublish_NFS_LocalRequiresStatusPath`,
+   `TestNodePublish_NFS_RWX_NeverLocal` (node_test.go);
+   `TestAttachRequest_NFSLocalSkipsShare`, `TestAttachRequest_NFSRWXAlwaysNFS`,
+   `TestAttachRequest_NFSMixedNodesCreatesShare`,
+   `TestAttachRequest_NFSPoolMovesAwayCreatesShare`,
+   `TestAttachRequest_NFSRWORaceExportsOldestNodeOnly`
+   (zfsshareattachrequest_controller_test.go).
+
+## SELinux future work (not implemented)
+
+The `context=container_file_t:s0` option applies the same **single label per
+mount** that NFS always provided. A more precise future improvement is to pass the
+pod's exact SELinux MCS context through via the CSI
+`NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP` capability: kubelet would then
+supply the pod's `fsGroup`/SELinux context at `NodePublishVolume` time, letting
+the driver apply per-pod `context=` labels instead of a fixed shared type. That
+requires implementing `NODE_SERVICE_CAPABILITY_VOLUME_MOUNT_GROUP` and is
+currently noted as future work in [known-pitfalls.md](known-pitfalls.md).
 
 ## Open questions
 

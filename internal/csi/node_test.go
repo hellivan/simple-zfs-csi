@@ -274,6 +274,36 @@ func TestNodePublish_NFS_LocalRequiresStatusPath(t *testing.T) {
 	}
 }
 
+// TestNodePublish_NFS_RWX_NeverLocal covers ADR-0031's safety restriction: a
+// multi-node (RWX) NFS volume always uses the NFS path, even when this node is
+// the pool's own node. Using a bind-mount alongside NFS mounts from other nodes
+// mixes POSIX and lockd lock domains and can corrupt data.
+func TestNodePublish_NFS_RWX_NeverLocal(t *testing.T) {
+	m := newFakeMounter()
+	ns := newNodeServer(t, m,
+		// Pool is local to this node (node-a) — but RWX means NFS is still used.
+		onlinePool("999", "10.0.0.5", "/mnt/tank", "tank"),
+		datasetWithPath("pvc-rwx-local", "k8s/pvc-rwx-local", storagev1alpha1.DatasetTypeFilesystem, "/mnt/tank/k8s/pvc-rwx-local"))
+
+	_, err := ns.NodePublishVolume(context.Background(), &csi.NodePublishVolumeRequest{
+		VolumeId:   "pvc-rwx-local",
+		TargetPath: "/var/lib/kubelet/pods/x/rwx-vol",
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NodePublishVolume: %v", err)
+	}
+	if len(m.dirMounts) != 0 {
+		t.Errorf("expected no bind-mount for RWX volume (even on local node), got %v", m.dirMounts)
+	}
+	if got := m.nfsMounts["/var/lib/kubelet/pods/x/rwx-vol"]; got != "10.0.0.5:/mnt/tank/k8s/pvc-rwx-local" {
+		t.Errorf("nfs source = %q, want 10.0.0.5:/mnt/tank/k8s/pvc-rwx-local", got)
+	}
+}
+
 func TestNodePublish_NVMeoF_Filesystem(t *testing.T) {
 	m := newFakeMounter()
 	export := &storagev1alpha1.NetworkExport{ObjectMeta: metav1.ObjectMeta{Name: "pvc-2"}}

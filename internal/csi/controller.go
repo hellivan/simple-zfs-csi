@@ -285,7 +285,8 @@ func (c *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	}
 
 	name := attachRequestName(volumeID, nodeID)
-	if err := c.ensureAttachRequest(ctx, name, volumeID, nodeID); err != nil {
+	singleNode := !hasMultiNodeAccessMode([]*csi.VolumeCapability{req.GetVolumeCapability()})
+	if err := c.ensureAttachRequest(ctx, name, volumeID, nodeID, singleNode); err != nil {
 		return nil, err
 	}
 	if err := c.waitAttachReady(ctx, name); err != nil {
@@ -481,18 +482,18 @@ func (c *ControllerServer) ensureVolume(ctx context.Context, name string, desire
 
 // ensureAttachRequest creates the ZfsShareAttachRequest for a (volume, node)
 // pair, or validates that an existing one matches (idempotent publish).
-func (c *ControllerServer) ensureAttachRequest(ctx context.Context, name, volume, node string) error {
+func (c *ControllerServer) ensureAttachRequest(ctx context.Context, name, volume, node string, singleNode bool) error {
 	existing := &storagev1alpha1.ZfsShareAttachRequest{}
 	err := c.Client.Get(ctx, client.ObjectKey{Name: name}, existing)
 	switch {
 	case apierrors.IsNotFound(err):
 		ar := &storagev1alpha1.ZfsShareAttachRequest{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
-			Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: volume, NodeName: node},
+			Spec:       storagev1alpha1.ZfsShareAttachRequestSpec{VolumeName: volume, NodeName: node, SingleNode: singleNode},
 		}
 		if err := c.Client.Create(ctx, ar); err != nil {
 			if apierrors.IsAlreadyExists(err) {
-				return c.ensureAttachRequest(ctx, name, volume, node)
+				return c.ensureAttachRequest(ctx, name, volume, node, singleNode)
 			}
 			return status.Errorf(codes.Internal, "create ZfsShareAttachRequest %q: %v", name, err)
 		}

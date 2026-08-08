@@ -13,7 +13,7 @@ in [runbooks.md](runbooks.md).
 
 ## ADR-0031 — Node-local passthrough: bypass NVMe-oF entirely when the workload and the pool share a node
 
-**Status:** Accepted, Phase 1 implemented (2026-08-08) · **Scope:** `internal/csi/{node,mount,controller}.go`, `internal/controller/zfsshareattachrequest_controller.go` · **Related:** [local-passthrough-redesign.md](local-passthrough-redesign.md).
+**Status:** Accepted, Phase 1 + Phase 2 implemented (2026-08-08) · **Scope:** `internal/csi/{node,mount}.go`, `internal/controller/zfsshareattachrequest_controller.go` · **Related:** [local-passthrough-redesign.md](local-passthrough-redesign.md).
 
 ### Context
 
@@ -86,8 +86,13 @@ since the aggregator and the two other reconcilers that already read
 - The aggregator gained a `ZfsPool` `Get` + a new `Watches` for migration
   correctness — a small, well-precedented addition (the translator already
   had the equivalent `sharesForPool` watch for the same reason).
-- **Not started:** Phase 2 (dataset/NFS passthrough). Implementation status is
-  tracked in [local-passthrough-redesign.md](local-passthrough-redesign.md).
+- **Phase 2 (dataset/NFS passthrough) also done.** Same aggregator-decides
+  principle: when every requesting node IS the pool's node, no `ZfsShare` is
+  created. `publishLocalDataset` in the node plugin bind-mounts
+  `ZfsDataset.Status.Path` with a `context=container_file_t:s0` SELinux
+  override (same single-label behaviour NFS always had; see session notes for
+  the full SELinux analysis). Mixed local+remote: `ZfsShare` created for
+  remote nodes; local node still uses bind-mount at publish time.
 
 ---
 
