@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // NVMeConnectOptions carries the parameters for an `nvme connect`. HostNQN/HostID
@@ -81,6 +83,27 @@ type NodeMounter interface {
 	// ResizeFS grows the filesystem on device (mounted at volumePath) to fill the
 	// device. It is a no-op when the device carries no filesystem (raw block).
 	ResizeFS(device, volumePath string) error
+	// VolumeStats reports capacity usage for volumePath, which is either a
+	// mounted filesystem directory or (for raw block volumes) a bind-mounted
+	// block device node. Used by NodeGetVolumeStats so kubelet can expose
+	// kubelet_volume_stats_* metrics for the volume.
+	VolumeStats(volumePath string) (VolumeStats, error)
+}
+
+// VolumeStats is the capacity/inode usage of a published volume, as reported
+// by NodeGetVolumeStats. Block is true when volumePath referred to a raw block
+// device, in which case only TotalBytes is meaningful (a raw block device has
+// no filesystem-level used/available split and no inode concept).
+type VolumeStats struct {
+	AvailableBytes int64
+	TotalBytes     int64
+	UsedBytes      int64
+
+	AvailableInodes int64
+	TotalInodes     int64
+	UsedInodes      int64
+
+	Block bool
 }
 
 // hostMounter is the real NodeMounter. It shells out to mount(8), nvme(1) and
@@ -465,6 +488,64 @@ func (m *hostMounter) detectFS(device string) (string, error) {
 		return "", nil
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// VolumeStats reports capacity/inode usage for volumePath. A block volume's
+// target is a regular file that BindMountDevice has bind-mounted a device node
+// onto (NodePublishVolume), so stat(2) on it reports the device's file type
+// (S_IFBLK) rather than the empty regular file underneath — that's what
+// distinguishes the two cases here, without needing to consult the
+// ZfsDataset's protocol/type again.
+func (m *hostMounter) VolumeStats(volumePath string) (VolumeStats, error) {
+	fi, err := os.Stat(volumePath)
+	if err != nil {
+		return VolumeStats{}, err
+	}
+	if fi.Mode()&os.ModeDevice != 0 && fi.Mode()&os.ModeCharDevice == 0 {
+		return m.blockDeviceStats(volumePath)
+	}
+	return m.filesystemStats(volumePath)
+}
+
+// blockDeviceStats reads a raw block device's byte capacity via the
+// BLKGETSIZE64 ioctl. Raw block has no used/available split and no inode
+// concept, so only TotalBytes is populated.
+func (m *hostMounter) blockDeviceStats(devicePath string) (VolumeStats, error) {
+	f, err := os.Open(devicePath)
+	if err != nil {
+		return VolumeStats{}, fmt.Errorf("open block device %q: %w", devicePath, err)
+	}
+	defer f.Close()
+
+	size, err := unix.IoctlGetInt(int(f.Fd()), unix.BLKGETSIZE64)
+	if err != nil {
+		return VolumeStats{}, fmt.Errorf("get size of block device %q: %w", devicePath, err)
+	}
+	return VolumeStats{TotalBytes: int64(size), Block: true}, nil
+}
+
+// filesystemStats reads byte/inode usage of the filesystem mounted at path via
+// statfs(2).
+func (m *hostMounter) filesystemStats(path string) (VolumeStats, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return VolumeStats{}, fmt.Errorf("statfs %q: %w", path, err)
+	}
+
+	total := int64(stat.Blocks) * stat.Bsize
+	free := int64(stat.Bfree) * stat.Bsize
+	avail := int64(stat.Bavail) * stat.Bsize
+	totalInodes := int64(stat.Files)
+	availInodes := int64(stat.Ffree)
+
+	return VolumeStats{
+		TotalBytes:      total,
+		AvailableBytes:  avail,
+		UsedBytes:       total - free,
+		TotalInodes:     totalInodes,
+		AvailableInodes: availInodes,
+		UsedInodes:      totalInodes - availInodes,
+	}, nil
 }
 
 // sysClassNVMe is the sysfs directory listing connected NVMe controllers. It is

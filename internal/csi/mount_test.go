@@ -390,3 +390,34 @@ func TestHostMounterFormatAndMount(t *testing.T) {
 		}
 	})
 }
+
+func TestHostMounterVolumeStats(t *testing.T) {
+	m := &hostMounter{}
+
+	t.Run("directory reports filesystem byte and inode usage", func(t *testing.T) {
+		dir := t.TempDir()
+		stats, err := m.VolumeStats(dir)
+		if err != nil {
+			t.Fatalf("VolumeStats(%q) = %v, want nil", dir, err)
+		}
+		if stats.Block {
+			t.Errorf("Block = true for a directory, want false")
+		}
+		if stats.TotalBytes <= 0 {
+			t.Errorf("TotalBytes = %d, want > 0", stats.TotalBytes)
+		}
+		if stats.TotalInodes <= 0 {
+			t.Errorf("TotalInodes = %d, want > 0", stats.TotalInodes)
+		}
+		if stats.UsedBytes < 0 || stats.AvailableBytes < 0 {
+			t.Errorf("UsedBytes/AvailableBytes = %d/%d, want both >= 0", stats.UsedBytes, stats.AvailableBytes)
+		}
+	})
+
+	t.Run("missing path surfaces the underlying stat error", func(t *testing.T) {
+		_, err := m.VolumeStats(filepath.Join(t.TempDir(), "does-not-exist"))
+		if !os.IsNotExist(err) {
+			t.Errorf("VolumeStats() err = %v, want os.IsNotExist", err)
+		}
+	})
+}

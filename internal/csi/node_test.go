@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -39,6 +40,11 @@ type fakeMounter struct {
 	// existing-fs behavior); left empty, FormatAndMount "formats" with whatever
 	// fsType is requested and remembers it for subsequent calls.
 	formattedFS string
+	// volumeStats and volumeStatsErr let tests script VolumeStats' return value
+	// per volumePath, keyed the same way hostMounter would be called (the
+	// target path from NodePublishVolume/kubelet).
+	volumeStats    map[string]VolumeStats
+	volumeStatsErr map[string]error
 }
 
 func newFakeMounter() *fakeMounter {
@@ -114,6 +120,12 @@ func (f *fakeMounter) RescanNVMe(_ context.Context, nqn string) error {
 func (f *fakeMounter) ResizeFS(device, volumePath string) error {
 	f.resized[device] = volumePath
 	return nil
+}
+func (f *fakeMounter) VolumeStats(volumePath string) (VolumeStats, error) {
+	if err, ok := f.volumeStatsErr[volumePath]; ok {
+		return VolumeStats{}, err
+	}
+	return f.volumeStats[volumePath], nil
 }
 
 // onlinePool's CurrentNode ("node-a") matches newNodeServer's NodeID, i.e. it
@@ -723,5 +735,100 @@ func TestNodeGetCapabilities_Expand(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("EXPAND_VOLUME capability not advertised")
+	}
+}
+
+func TestNodeGetCapabilities_GetVolumeStats(t *testing.T) {
+	ns := newNodeServer(t, newFakeMounter())
+	resp, err := ns.NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("NodeGetCapabilities: %v", err)
+	}
+	found := false
+	for _, c := range resp.GetCapabilities() {
+		if c.GetRpc().GetType() == csi.NodeServiceCapability_RPC_GET_VOLUME_STATS {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("GET_VOLUME_STATS capability not advertised")
+	}
+}
+
+func TestNodeGetVolumeStats_Filesystem(t *testing.T) {
+	m := newFakeMounter()
+	m.volumeStats = map[string]VolumeStats{
+		"/target": {
+			AvailableBytes: 100, TotalBytes: 200, UsedBytes: 100,
+			AvailableInodes: 10, TotalInodes: 20, UsedInodes: 10,
+		},
+	}
+	ns := newNodeServer(t, m)
+
+	resp, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "pvc-a",
+		VolumePath: "/target",
+	})
+	if err != nil {
+		t.Fatalf("NodeGetVolumeStats: %v", err)
+	}
+	if len(resp.GetUsage()) != 2 {
+		t.Fatalf("usage = %v, want 2 entries (bytes + inodes)", resp.GetUsage())
+	}
+	bytes := resp.GetUsage()[0]
+	if bytes.GetUnit() != csi.VolumeUsage_BYTES || bytes.GetTotal() != 200 || bytes.GetAvailable() != 100 || bytes.GetUsed() != 100 {
+		t.Errorf("bytes usage = %+v, want total=200 available=100 used=100", bytes)
+	}
+	inodes := resp.GetUsage()[1]
+	if inodes.GetUnit() != csi.VolumeUsage_INODES || inodes.GetTotal() != 20 || inodes.GetAvailable() != 10 || inodes.GetUsed() != 10 {
+		t.Errorf("inodes usage = %+v, want total=20 available=10 used=10", inodes)
+	}
+}
+
+func TestNodeGetVolumeStats_Block(t *testing.T) {
+	m := newFakeMounter()
+	m.volumeStats = map[string]VolumeStats{
+		"/target": {TotalBytes: 1024, Block: true},
+	}
+	ns := newNodeServer(t, m)
+
+	resp, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "pvc-a",
+		VolumePath: "/target",
+	})
+	if err != nil {
+		t.Fatalf("NodeGetVolumeStats: %v", err)
+	}
+	// A raw block volume has no inode concept: only the byte usage entry.
+	if len(resp.GetUsage()) != 1 {
+		t.Fatalf("usage = %v, want 1 entry (bytes only)", resp.GetUsage())
+	}
+	if resp.GetUsage()[0].GetUnit() != csi.VolumeUsage_BYTES || resp.GetUsage()[0].GetTotal() != 1024 {
+		t.Errorf("usage = %+v, want bytes total=1024", resp.GetUsage()[0])
+	}
+}
+
+func TestNodeGetVolumeStats_MissingPathNotFound(t *testing.T) {
+	m := newFakeMounter()
+	m.volumeStatsErr = map[string]error{"/gone": os.ErrNotExist}
+	ns := newNodeServer(t, m)
+
+	_, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
+		VolumeId:   "pvc-a",
+		VolumePath: "/gone",
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("err = %v, want NotFound", err)
+	}
+}
+
+func TestNodeGetVolumeStats_RequiresVolumeIDAndPath(t *testing.T) {
+	ns := newNodeServer(t, newFakeMounter())
+
+	if _, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{VolumePath: "/target"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("missing volume id: err = %v, want InvalidArgument", err)
+	}
+	if _, err := ns.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{VolumeId: "pvc-a"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("missing volume path: err = %v, want InvalidArgument", err)
 	}
 }

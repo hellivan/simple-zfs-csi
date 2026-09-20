@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -51,15 +52,63 @@ func (n *NodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (
 	return &csi.NodeGetInfoResponse{NodeId: n.NodeID}, nil
 }
 
-// NodeGetCapabilities advertises EXPAND_VOLUME: the plugin can finish an online
-// zvol expansion by growing the on-device filesystem. It still publishes
-// directly in NodePublishVolume without a separate stage step.
+// NodeGetCapabilities advertises EXPAND_VOLUME (the plugin can finish an
+// online zvol expansion by growing the on-device filesystem — it still
+// publishes directly in NodePublishVolume without a separate stage step) and
+// GET_VOLUME_STATS (kubelet can poll NodeGetVolumeStats to populate
+// kubelet_volume_stats_* metrics for Prometheus).
 func (n *NodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: []*csi.NodeServiceCapability{
 			nodeRPCCapability(csi.NodeServiceCapability_RPC_EXPAND_VOLUME),
+			nodeRPCCapability(csi.NodeServiceCapability_RPC_GET_VOLUME_STATS),
 		},
 	}, nil
+}
+
+// NodeGetVolumeStats reports capacity (and, for filesystem volumes, inode)
+// usage for the volume published at req.VolumePath, letting kubelet expose
+// kubelet_volume_stats_* Prometheus metrics without the driver running its own
+// metrics endpoint. It reads directly off the live mount/device rather than the
+// ZfsDataset CR, so no live volume resolution (resolveVolume/resolvePool) is
+// needed here — the only per-volume input is the path kubelet already has.
+func (n *NodeServer) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+	volumeID := req.GetVolumeId()
+	volumePath := req.GetVolumePath()
+	if volumeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume id is required")
+	}
+	if volumePath == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume path is required")
+	}
+
+	stats, err := n.Mounter.VolumeStats(volumePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, status.Errorf(codes.NotFound, "volume path %q does not exist", volumePath)
+		}
+		return nil, status.Errorf(codes.Internal, "stat volume path %q: %v", volumePath, err)
+	}
+
+	usage := []*csi.VolumeUsage{
+		{
+			Unit:      csi.VolumeUsage_BYTES,
+			Available: stats.AvailableBytes,
+			Total:     stats.TotalBytes,
+			Used:      stats.UsedBytes,
+		},
+	}
+	// Raw block volumes have no inode concept; only report bytes for them.
+	if !stats.Block {
+		usage = append(usage, &csi.VolumeUsage{
+			Unit:      csi.VolumeUsage_INODES,
+			Available: stats.AvailableInodes,
+			Total:     stats.TotalInodes,
+			Used:      stats.UsedInodes,
+		})
+	}
+
+	return &csi.NodeGetVolumeStatsResponse{Usage: usage}, nil
 }
 
 // NodePublishVolume mounts the volume at the target path.
