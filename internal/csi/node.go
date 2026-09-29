@@ -309,6 +309,9 @@ func (n *NodeServer) resolveVolume(ctx context.Context, volumeID string) (poolGU
 	if ds.Spec.PoolGUID == "" || ds.Spec.Dataset == "" {
 		return "", "", "", "", status.Errorf(codes.Internal, "ZfsDataset %q has no poolGUID/dataset", volumeID)
 	}
+	if ds.Status.Phase == storagev1alpha1.DatasetPhaseLost {
+		return "", "", "", "", status.Errorf(codes.FailedPrecondition, "ZfsDataset %q is lost: %s", volumeID, ds.Status.Message)
+	}
 	switch ds.Spec.Type {
 	case storagev1alpha1.DatasetTypeFilesystem:
 		protocol = storagev1alpha1.ProtocolNFS

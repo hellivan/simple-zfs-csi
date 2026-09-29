@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1343,5 +1344,172 @@ func TestZfsDatasetReconcile_DeleteRefusesForeignSnapshot(t *testing.T) {
 	}
 	if len(z.destroyed) != 0 {
 		t.Fatalf("nothing should have been destroyed, got %v", z.destroyed)
+	}
+}
+
+func provisionedDatasetFixture(t *testing.T, phase storagev1alpha1.ZfsDatasetPhase, provisioned bool) (client.Client, *ZfsDatasetReconciler, *fakeZFS) {
+	t.Helper()
+	scheme := newTestScheme(t)
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsDatasetFinalizer}},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+		Status:     storagev1alpha1.ZfsDatasetStatus{Phase: phase, ProvisionedAt: provisionedAtFor(provisioned), Path: "/mnt/tank/k8s/pvc-1"},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(onlinePool(), vol).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).Build()
+	z := newFakeZFS()
+	return c, &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}, z
+}
+
+func provisionedAtFor(b bool) *metav1.Time {
+	if !b {
+		return nil
+	}
+	t := metav1.NewTime(time.Unix(1500000000, 0))
+	return &t
+}
+
+func datasetStatus(t *testing.T, c client.Client) storagev1alpha1.ZfsDatasetStatus {
+	t.Helper()
+	var got storagev1alpha1.ZfsDataset
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	return got.Status
+}
+
+// ADR-0037: a Ready dataset that vanished is Lost, never recreated.
+func TestZfsDatasetReconcile_ReadyDatasetGoneBecomesLost(t *testing.T) {
+	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseReady, false)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(z.createdDS) != 0 {
+		t.Fatalf("must not recreate, created %v", z.createdDS)
+	}
+	if st := datasetStatus(t, c); st.Phase != storagev1alpha1.DatasetPhaseLost {
+		t.Errorf("phase = %q, want Lost", st.Phase)
+	}
+}
+
+// The provisioned marker survives a later Error phase, so an Error dataset that
+// once existed is not recreated either.
+func TestZfsDatasetReconcile_ErrorAfterProvisionedIsNotRecreated(t *testing.T) {
+	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseError, true)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(z.createdDS) != 0 {
+		t.Fatalf("must not recreate, created %v", z.createdDS)
+	}
+	if st := datasetStatus(t, c); st.Phase != storagev1alpha1.DatasetPhaseLost {
+		t.Errorf("phase = %q, want Lost", st.Phase)
+	}
+}
+
+// A dataset that never became Ready is still created (including after a failed
+// first attempt).
+func TestZfsDatasetReconcile_NeverProvisionedIsStillCreated(t *testing.T) {
+	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseError, false)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(z.createdDS) != 1 {
+		t.Fatalf("expected creation, got %v", z.createdDS)
+	}
+	if st := datasetStatus(t, c); st.Phase != storagev1alpha1.DatasetPhaseReady || st.ProvisionedAt == nil {
+		t.Errorf("phase = %q provisionedAt = %v, want Ready and set", st.Phase, st.ProvisionedAt)
+	}
+}
+
+// Lost returns to Ready when the original dataset reappears.
+func TestZfsDatasetReconcile_LostRecoversWhenDatasetReturns(t *testing.T) {
+	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseLost, true)
+	z.existing["tank/k8s/pvc-1"] = true
+	z.props["tank/k8s/pvc-1"] = map[string]string{"refquota": "0"}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(z.createdDS) != 0 {
+		t.Fatalf("must not create, got %v", z.createdDS)
+	}
+	if st := datasetStatus(t, c); st.Phase != storagev1alpha1.DatasetPhaseReady {
+		t.Errorf("phase = %q, want Ready", st.Phase)
+	}
+}
+
+// ProvisionedAt is stamped on the first Ready and never touched again, while
+// CreationTime tracks the dataset on disk.
+func TestZfsDatasetReconcile_ProvisionedAtIsWriteOnce(t *testing.T) {
+	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseError, false)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	first := datasetStatus(t, c).ProvisionedAt
+	if first == nil {
+		t.Fatal("provisionedAt not recorded")
+	}
+
+	// A steady-state Ready reconcile does not re-read the creation time.
+	z.props["tank/k8s/pvc-1"]["creation"] = "1800000000"
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	st := datasetStatus(t, c)
+	if st.CreationTime == nil || st.CreationTime.Unix() == 1800000000 {
+		t.Errorf("creationTime = %v, must not be refreshed while staying Ready", st.CreationTime)
+	}
+
+	// Going through Error and back to Ready re-reads it; provisionedAt stays.
+	var cur storagev1alpha1.ZfsDataset
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &cur); err != nil {
+		t.Fatal(err)
+	}
+	cur.Status.Phase = storagev1alpha1.DatasetPhaseError
+	if err := c.Status().Update(context.Background(), &cur); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	st = datasetStatus(t, c)
+	if st.ProvisionedAt == nil || !st.ProvisionedAt.Equal(first) {
+		t.Errorf("provisionedAt changed to %v, want it untouched at %v", st.ProvisionedAt, first)
+	}
+	if st.CreationTime == nil || st.CreationTime.Unix() != 1800000000 {
+		t.Errorf("creationTime = %v, want 1800000000 re-read on the transition into Ready", st.CreationTime)
+	}
+}
+
+// A legacy Ready object (no ProvisionedAt) is backfilled from its Ready
+// condition's transition time, not from the ZFS creation time.
+func TestZfsDatasetReconcile_LegacyReadyIsBackfilled(t *testing.T) {
+	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseReady, false)
+	var cur storagev1alpha1.ZfsDataset
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &cur); err != nil {
+		t.Fatal(err)
+	}
+	since := metav1.NewTime(time.Unix(1650000000, 0))
+	cur.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready", LastTransitionTime: since}}
+	if err := c.Status().Update(context.Background(), &cur); err != nil {
+		t.Fatal(err)
+	}
+	z.existing["tank/k8s/pvc-1"] = true
+	z.props["tank/k8s/pvc-1"] = map[string]string{"creation": "1600000000", "refquota": "0"}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	st := datasetStatus(t, c)
+	if st.ProvisionedAt == nil || st.ProvisionedAt.Unix() != 1650000000 {
+		t.Errorf("provisionedAt = %v, want 1650000000 from the Ready condition", st.ProvisionedAt)
+	}
+	if st.CreationTime == nil || st.CreationTime.Unix() != 1600000000 {
+		t.Errorf("creationTime = %v, want 1600000000 from ZFS", st.CreationTime)
 	}
 }

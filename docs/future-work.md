@@ -67,32 +67,43 @@ already deployed for per-volume snapshots, extending the existing
 `zfs snapshot pool/ds1@x pool/ds2@x ...`) is the preferred target over
 pulling in the csi-addons machinery.
 
-## Gate re-provisioning on `Status.Phase` (fail loud when a dataset disappears)
+Full design written up in
+[volumegroupsnapshot-design.md](volumegroupsnapshot-design.md) and
+[volumegroupsnapshot-vs-snapshot-comparison.md](volumegroupsnapshot-vs-snapshot-comparison.md).
 
-**Why:** `ZfsDatasetReconciler` calls `create()` from the `ErrNotExist` branch of its
-idempotent-create check, with no memory of whether the dataset ever existed. So a
-`ZfsDataset` whose ZFS object has gone missing — destroyed out of band, pool restored
-from a backup predating it, or `spec.dataset` repointed by hand to a path that doesn't
-exist yet — is silently **re-provisioned**. For a clone-sourced dataset that means
-re-cloning from `spec.source`, producing a fresh copy at the *original* vintage and
-silently discarding everything written since; for an empty-source dataset, an empty
-dataset where data used to be.
+## ZFS user properties for CLI-visible k8s identity (not just snapshots)
 
-This matters most for the supported emergency workflow of repointing `spec.dataset` by
-hand. Repointing to a dataset that **already exists** is safe — `Get(type)` succeeds and
-the driver simply adopts it. Repointing to a path that doesn't exist yet triggers the
-silent re-create instead of an error.
+**Why:** every driver-managed object's k8s identity (PVC name/namespace,
+`ZfsSnapshot.Spec.GroupSnapshotID`, source volume id, etc.) lives entirely in
+Kubernetes CR spec fields today — `zfs list`/`zfs get` run directly on a node
+shows only opaque names (`csi-snap-<uuid>`, `pvc-<uid>`) with no way to
+correlate back to a namespace/PVC/group without also querying `kubectl`. This
+came up while designing `VolumeGroupSnapshot`: giving group snapshots a
+distinguishing on-disk name prefix was considered and rejected (see
+[volumegroupsnapshot-design.md](volumegroupsnapshot-design.md)) specifically
+because it would encode identity into a name instead of using an explicit
+field, and would need extra upkeep in `promote.go`'s `driverSnapshotSuffix`
+allow-list and `FindSnapshot`'s uniqueness assumption for zero real benefit
+beyond human CLI readability.
 
-Surfaced during the 2026-08-03 code-review follow-up discussion while confirming that
-`spec.source` is read *only* from that branch (which is what makes a stale
-`spec.source.volume` harmless for a live dataset — see
-[snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §9.3).
+**Candidate approach:** ZFS supports arbitrary user-defined properties
+(`zfs set io.simple-zfs-csi:group-snapshot-id=<id> <dataset>`) — metadata, not
+identity, so it doesn't affect any existing name-matching/allow-list logic at
+all. This generalizes beyond snapshots: the same mechanism could stamp
+`io.simple-zfs-csi:pvc-name`/`pvc-namespace` (or similar) onto every
+driver-managed dataset/zvol (`ZfsDataset`) and clone at creation time, not
+just group snapshot members — making `zfs list -o name,io.simple-zfs-csi:...`
+a direct, kubectl-free way to answer "what k8s object does this ZFS object
+belong to" for any dataset type. Purely additive, no existing behavior
+changes; not scheduled, no design work done yet.
 
-**Candidate approach:** refuse to `create()` when the object has previously reported
-`Ready`, surfacing a hard error instead. Checked against the cases that could plausibly
-break it and none do: pool failover and pool re-import both leave the dataset present, so
-`Get` succeeds and `create()` is never reached. Deliberately kept out of the review
-fix-up work — it is a behaviour change unrelated to the snapshot lifecycle.
+## ~~Gate re-provisioning on `Status.Phase`~~ (done — ADR-0037)
+
+Implemented as ADR-0037 (datasets) and ADR-0034 (snapshots): once a `ZfsDataset` or
+`ZfsSnapshot` has been provisioned (`status.provisionedAt`), a missing ZFS object makes
+it `Lost` instead of being re-created or re-cloned. Repointing `spec.dataset` by hand to
+a path that does not exist yet now reports `Lost` rather than provisioning an empty
+dataset; repointing to one that exists is still adopted.
 
 ## Generate RBAC from the kubebuilder markers
 

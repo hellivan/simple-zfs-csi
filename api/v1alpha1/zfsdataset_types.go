@@ -28,6 +28,10 @@ const (
 	DatasetPhaseReady ZfsDatasetPhase = "Ready"
 	// DatasetPhaseError means the last reconcile attempt failed.
 	DatasetPhaseError ZfsDatasetPhase = "Error"
+	// DatasetPhaseLost means the dataset was provisioned once but is no longer
+	// on disk. It is never recreated automatically (ADR-0037); it returns to
+	// Ready only if the original dataset reappears.
+	DatasetPhaseLost ZfsDatasetPhase = "Lost"
 )
 
 // DeleteBlockedReason is the Status condition reason the node agent records on a
@@ -163,6 +167,19 @@ type ZfsDatasetStatus struct {
 	// Phase is a coarse summary of the current state.
 	// +optional
 	Phase ZfsDatasetPhase `json:"phase,omitempty"`
+
+	// ProvisionedAt is when the dataset was first observed Ready. It is written
+	// once and never changed: non-nil means "this dataset has existed", so it is
+	// never created again — whatever the phase later becomes (ADR-0037).
+	// +optional
+	ProvisionedAt *metav1.Time `json:"provisionedAt,omitempty"`
+
+	// CreationTime is the ZFS `creation` property of the dataset currently on
+	// disk, refreshed on every Ready reconcile. Unlike ProvisionedAt it follows
+	// what is really there: later than ProvisionedAt means the dataset was
+	// replaced after it was first seen; earlier means it was adopted.
+	// +optional
+	CreationTime *metav1.Time `json:"creationTime,omitempty"`
 
 	// Path is the node-local path of the created volume once Ready: the dataset
 	// mountpoint (type=dataset) or the zvol device node (type=zvol). Consumers

@@ -161,11 +161,22 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			"InvalidDataset", err.Error())
 	}
 
-	// Idempotent create: only create when the object is absent.
+	// Create only what has never been provisioned. Once it has been, absence
+	// means Lost and is never repaired by creating an empty dataset (ADR-0037).
 	if _, err := r.ZFS.Get(ctx, full, "type"); err != nil {
 		if !errors.Is(err, zpool.ErrNotExist) {
 			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 				"LookupFailed", err.Error())
+		}
+		if datasetProvisioned(&vol) {
+			if vol.Status.Phase != storagev1alpha1.DatasetPhaseLost {
+				logger.Info("provisioned dataset is missing; not re-creating", "dataset", full)
+				if err := r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseLost, vol.Status.Path,
+					"DatasetLost", fmt.Sprintf("%s no longer exists; a provisioned dataset is never re-created in place", full)); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+			return ctrl.Result{RequeueAfter: lostRecheckInterval}, nil
 		}
 		if err := r.create(ctx, &vol, pool.Status.PoolName, full); err != nil {
 			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
@@ -192,8 +203,25 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			"PathDeriveFailed", err.Error())
 	}
 
-	return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseReady, volPath,
-		"Ready", fmt.Sprintf("provisioned %s on %s", full, r.NodeName))
+	// The ZFS creation time is read only on a transition into Ready (from
+	// Pending, Error or Lost) or when it was never recorded, not on every
+	// reconcile: reconciles run about every 30s per object (pool status churn).
+	var creation *metav1.Time
+	if vol.Status.Phase != storagev1alpha1.DatasetPhaseReady || vol.Status.CreationTime == nil {
+		creation = snapshotCreationTime(ctx, r.ZFS, full)
+	}
+	return ctrl.Result{}, r.setStatusAt(ctx, &vol, storagev1alpha1.DatasetPhaseReady, volPath,
+		"Ready", fmt.Sprintf("provisioned %s on %s", full, r.NodeName), creation)
+}
+
+// datasetProvisioned reports whether the dataset has ever been Ready.
+func datasetProvisioned(vol *storagev1alpha1.ZfsDataset) bool {
+	// The phase checks are the one-off migration for objects that predate
+	// ProvisionedAt; they are backfilled on their next reconcile and the checks
+	// are removed afterwards (TODO.md).
+	return vol.Status.ProvisionedAt != nil ||
+		vol.Status.Phase == storagev1alpha1.DatasetPhaseReady ||
+		vol.Status.Phase == storagev1alpha1.DatasetPhaseLost
 }
 
 // releaseFinalizer removes the agent finalizer, allowing the API server to
@@ -452,11 +480,24 @@ func deriveVolumePath(volType storagev1alpha1.DatasetType, baseMountPath, poolNa
 
 // setStatus patches the volume's status subresource.
 func (r *ZfsDatasetReconciler) setStatus(ctx context.Context, vol *storagev1alpha1.ZfsDataset, phase storagev1alpha1.ZfsDatasetPhase, volPath, reason, message string) error {
+	return r.setStatusAt(ctx, vol, phase, volPath, reason, message, nil)
+}
+
+// setStatusAt is setStatus that also records the on-disk creation time. On the
+// first Ready it stamps ProvisionedAt, which is write-once: an existing value is
+// never touched.
+func (r *ZfsDatasetReconciler) setStatusAt(ctx context.Context, vol *storagev1alpha1.ZfsDataset, phase storagev1alpha1.ZfsDatasetPhase, volPath, reason, message string, creation *metav1.Time) error {
 	patched := vol.DeepCopy()
 	patched.Status.Phase = phase
 	patched.Status.Path = volPath
 	patched.Status.ObservedGeneration = vol.Generation
 	patched.Status.Message = message
+	if creation != nil {
+		patched.Status.CreationTime = creation
+	}
+	if phase == storagev1alpha1.DatasetPhaseReady && patched.Status.ProvisionedAt == nil {
+		patched.Status.ProvisionedAt = firstReadyTime(patched.Status.Conditions)
+	}
 
 	condStatus := metav1.ConditionTrue
 	if phase != storagev1alpha1.DatasetPhaseReady {

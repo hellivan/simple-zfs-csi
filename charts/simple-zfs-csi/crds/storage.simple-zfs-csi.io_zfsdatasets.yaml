@@ -260,6 +260,14 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              creationTime:
+                description: |-
+                  CreationTime is the ZFS `creation` property of the dataset currently on
+                  disk, refreshed on every Ready reconcile. Unlike ProvisionedAt it follows
+                  what is really there: later than ProvisionedAt means the dataset was
+                  replaced after it was first seen; earlier means it was adopted.
+                format: date-time
+                type: string
               fsType:
                 description: |-
                   FSType is the filesystem type actually formatted onto a volume-type
@@ -289,6 +297,13 @@ spec:
                 type: string
               phase:
                 description: Phase is a coarse summary of the current state.
+                type: string
+              provisionedAt:
+                description: |-
+                  ProvisionedAt is when the dataset was first observed Ready. It is written
+                  once and never changed: non-nil means "this dataset has existed", so it is
+                  never created again — whatever the phase later becomes (ADR-0037).
+                format: date-time
                 type: string
             type: object
         type: object

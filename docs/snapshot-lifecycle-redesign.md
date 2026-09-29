@@ -1234,7 +1234,7 @@ later deleting snapshot `t1` fails on "snapshot has dependent clones" and stays 
     the inverted final shape in the live-restore scenario, and the chained-origin state
     after deleting a multi-snapshot source.
 
-### 9.3 Separate follow-up (not part of this work)
+### 9.3 Separate follow-up (not part of this work) — since done, see ADR-0037
 
 Tracked in [future-work.md](future-work.md): gate re-provisioning on `Status.Phase`, so a
 `ZfsDataset` that was previously `Ready` but is now missing from ZFS fails loudly instead

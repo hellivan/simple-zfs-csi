@@ -11,6 +11,347 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0037 — A `ZfsDataset` is created once; after it has been `Ready`, a missing dataset becomes `Lost` and is never silently recreated (supersedes ADR-0026)
+
+**Status:** Accepted and implemented (2026-09-29) · **Supersedes:** ADR-0026 · **Scope:** `internal/controller/zfsdataset_controller.go`, `api/v1alpha1` (dataset phase) · **Related:** ADR-0034 (same rule for snapshots), [runbooks.md](runbooks.md).
+
+### Context
+
+ADR-0026 kept "recreate when absent" for datasets for one reason: destroying a
+dataset on the host was called a supported way to reset a volume, and
+`status.phase == Ready` could not tell a reset from data loss. Re-examined
+alongside ADR-0034:
+
+- The reset capability is not documented as a procedure anywhere except inside
+  ADR-0026 itself (`runbooks.md` and `known-pitfalls.md` never mention it), and
+  deleting and recreating the `ZfsDataset` object with the same spec gives the
+  same empty volume by an explicit, visible route.
+- The cost is a silent empty volume: an accidental `zfs destroy`, a pool restored
+  or replicated only in part, and the rename window ADR-0026 itself records
+  (a reconcile between `zfs rename` and the `spec.dataset` edit creates an empty
+  orphan at the old path). In each case the workload starts on empty storage and
+  nothing reports it.
+- ADR-0034 already adopted the opposite rule for snapshots; keeping two rules
+  for the same kind of primitive is an inconsistency without a remaining reason.
+
+### Decision
+
+- A `ZfsDataset` that has **never** been `Ready` is created from its spec, as today.
+- Once it has been `Ready`, the reconciler **never creates it again**. If the
+  dataset is not found on disk it sets phase `Lost` (`ReadyToUse`-equivalent
+  false, clear message) and stops there.
+- If the dataset reappears (moved back, pool re-imported) it returns to `Ready`.
+  No parent or pool proof is required: nothing is created or destroyed, so a
+  false `Lost` is self-healing (same reasoning as ADR-0034's amendment).
+- Anyone who works on the underlying ZFS primitives owns cleaning up after
+  themselves; the driver does not scan for or repair what it cannot know
+  (trust boundary, `docs/volumegroupsnapshot-design.md`).
+- A deliberate reset is: delete the `ZfsDataset` and create it again.
+
+### Consequences
+
+- The rename window no longer produces an empty orphan; the dataset reads `Lost`
+  until the `spec.dataset` edit lands or the rename is reverted.
+- The ADR-0026 statement "destroying a dataset on the host is a supported reset"
+  no longer holds. `runbooks.md` and known-pitfalls #18 references must be
+  checked for it when implementing.
+- Implementation must audit the paths that assume a Ready dataset exists or can
+  be recreated (zvol format-on-mount, NFS/NVMe export setup, restored and cloned
+  datasets, `applyRootOwnership`), and the CSI `ControllerPublish`/`NodeStage`
+  behaviour for a `Lost` dataset (fail fast, do not wait). Done.
+
+### Implementation notes
+
+- "Was it ever Ready" cannot be read from `status.phase` alone: an `Error` write
+  (e.g. a failed resize, or a refused delete) replaces `Ready` and also blanks
+  `status.path`, so a later reconcile would recreate. A single write-once
+  `status.provisionedAt` — when the object was first observed `Ready` — is the
+  marker: non-nil means provisioned, independent of any later phase, and it is
+  never overwritten. It is deliberately *not* the ZFS creation time: that is a
+  separate `status.creationTime`, re-read on every transition into `Ready` (from `Pending`, `Error` or `Lost`) and never on a steady-state reconcile — reconciles run about every 30s per object because the discovery agent rewrites `ZfsPool.status.lastUpdated` every poll, so a per-reconcile read would be pure added load (already present on `ZfsSnapshot`,
+  added to `ZfsDataset`). A `creationTime` later than `provisionedAt` shows the
+  object was replaced after we first saw it; earlier shows it was adopted.
+  Nothing acts on that comparison yet.
+- Migration: objects that predate the field are recognised by phase
+  (`Ready`/`Lost`) and backfilled on their next reconcile (`provisionedAt` from the Ready condition's `lastTransitionTime`, else now). That phase fallback is
+  temporary and is removed once every object carries `provisionedAt` — see
+  `TODO.md`. The CRD must be applied before the workload is upgraded (README,
+  "CRD management & upgrades"), or the API server prunes the new field.
+- `checkPendingCloneDependents` (D21) no longer waits for a *provisioned*
+  dependent that is missing: it is `Lost`, will never be created, and waiting
+  would block the source's delete forever.
+- The CSI create wait and `NodePublishVolume`/volume-stats resolution fail fast
+  on `Lost`; unpublish/unstage are unaffected so pods can still be cleaned up.
+- Deleting a `Lost` dataset works: `zfs destroy` treats "does not exist" as success.
+
+---
+
+## ADR-0036 — A `ZfsSnapshot`'s reported `creation_time` is read from the raw snapshot itself, not its later backing-clone self-snapshot
+
+**Status:** Accepted (implemented) · **Scope:** `internal/controller/zfssnapshot_controller.go` (`reconcileBackingClone`'s `snapshotCreationTime` call site) · **Related:** ADR-0005/ADR-0008 (snapshot lifecycle), `docs/volumegroupsnapshot-design.md`.
+
+### Context
+
+`reconcileBackingClone` calls `snapshotCreationTime(ctx, r.ZFS, restoreSourceFull)` —
+reading the ZFS `creation` property off the backing clone's `@restore-source`
+self-snapshot, which is taken strictly *after* the raw origin snapshot, at
+whatever later reconcile actually gets around to materializing the backing
+clone. For a standalone `ZfsSnapshot` this reports a technically-wrong (later)
+instant as the snapshot's creation time. For a `ZfsVolumeGroupSnapshot`'s
+members this was previously documented in `volumegroupsnapshot-design.md` as a
+"known, accepted cosmetic nuance," because each member's backing clone (and
+thus its own restore-source timestamp) is created independently, so members'
+*reported* timestamps could visibly differ even though their actual
+data-consistency point — the one shared, atomic raw snapshot — is identical.
+
+Verified directly against OpenZFS (`module/zfs/dsl_dataset.c:1219`, the
+sync-context function that materializes a new dataset object):
+`dsphys->ds_creation_time = gethrestime_sec();` — set once per dataset object,
+at sync time, independently for each snapshot in a batch; it is not copied from
+one shared value. For a single atomic multi-name `zfs snapshot` call (every
+member created within the same txg/sync pass), each member's `gethrestime_sec()`
+call happens microseconds apart, so in every realistic case they read back as
+identical (`creation`'s resolution is whole seconds) — but this is **not** a
+hard, code-enforced guarantee for an arbitrarily large batch or an unusually
+slow sync. The actual, code-enforced same-instant guarantee is the shared txg
+(`ds_creation_txg`), not this wall-clock display property. This is worth
+stating precisely: an earlier note (`vgs-group-controller` todo) described the
+raw snapshot's `creation` value as "provably identical across all members,
+same txg" — that overstates it, and is corrected by this ADR.
+
+### Decision
+
+Change the call site to `snapshotCreationTime(ctx, r.ZFS, rawFull)` (the raw
+origin snapshot, already in scope at that call site) instead of
+`restoreSourceFull`. This is strictly more accurate for the standalone case,
+and fixes the previously-"accepted cosmetic nuance" for group members at the
+source — in the overwhelming common case — without adding any new mechanism,
+since every member already independently reads the correct, shared-txg-derived
+property once this changes. The CSI spec's `creation_time` field remains a
+best-effort, whole-second wall-clock value either way; this fix does not, and
+cannot, turn it into a byte-for-byte cross-member guarantee — only the
+underlying txg carries that guarantee, and nothing CSI-facing reads the txg
+directly.
+
+### Alternatives considered
+
+- **Force group members' `Status.CreationTime` to be copied verbatim from the
+  parent's own captured value**, rather than each member independently reading
+  its own raw snapshot's `creation` property. Rejected: unnecessary complexity
+  — since all members already read the same underlying, already-correct
+  property independently, forcing a copy buys nothing except in the
+  vanishingly rare case of a sync pass straddling a one-second wall-clock
+  boundary, which this display-only field does not warrant defending against.
+
+### Consequences
+
+- One-line change at `reconcileBackingClone`'s call site.
+- `volumegroupsnapshot-design.md`'s "Known, accepted cosmetic nuance" section
+  is superseded — the nuance is fixed at the source rather than merely
+  documented as acceptable, with the txg-vs-wall-clock caveat now stated
+  precisely instead of implied.
+- Applies uniformly to standalone and group-member `ZfsSnapshot`s, since both
+  go through the same `reconcileBackingClone`.
+
+---
+
+## ADR-0035 — The CSI spec's `group_snapshot_id` deletion rule is an RPC-level contract, not a Kubernetes-CRD-level one; the CRD-layer group-liveness guard is deferred
+
+**Status:** Accepted (design phase, not yet implemented) · **Scope:** `internal/controller/zfssnapshot_controller.go` (no change made by this ADR — this is a scope narrowing), `internal/csi/` (RPC-layer rejection only) · **Related:** `docs/volumegroupsnapshot-design.md`, `docs/lifecycle-protection-matrix.md` §5.12/§6.3.
+
+### Context
+
+A correction found during a review pass. `spec@v1.11.0/spec.md:2045-2048`:
+
+> The CO SHALL NOT call this RPC [`DeleteSnapshot`] with a snapshot for which
+> SP provided a non-empty `group_snapshot_id` field at creation time... The SP
+> MAY refuse to delete such snapshots **with this RPC call** and return an
+> error instead. For such snapshots SP MUST delete the entire snapshot group
+> via a `DeleteVolumeGroupSnapshotRequest` call.
+
+This clause is scoped entirely to the `DeleteSnapshot` RPC. The spec has no
+concept of how a plugin represents its own internal state — CRDs, files, a
+database, anything — and says nothing about defending that representation
+against being manipulated directly and out-of-band. A direct
+`kubectl delete zfssnapshot <group-member>`, bypassing our own RPC layer
+entirely, is not something the spec describes or requires us to defend
+against — it is the same category of "internal implementation tampered with
+directly" case already covered by this driver's broader trust-boundary
+decision (`docs/lifecycle-protection-matrix.md` §5.12/§6.3;
+`volumegroupsnapshot-design.md`'s trust-boundary section).
+
+An earlier pass over the VolumeGroupSnapshot design mislabeled a proposed
+CRD-layer guard — `ZfsSnapshotReconciler.reconcileDelete` `Get()`s the parent
+`ZfsVolumeGroupSnapshot` and refuses to proceed if it still exists — as "spec
+conformance," presented alongside the RPC-layer rejection as if both were
+equally mandated. That was wrong; only the RPC-layer rejection is.
+
+### Decision
+
+Implement **only** the RPC-layer rejection in v1:
+`ControllerServer.DeleteSnapshot` rejects (`codes.InvalidArgument`) any
+`ZfsSnapshot` with non-empty `Spec.GroupSnapshotID`. The CRD-layer guard is
+**deferred** — not implemented in v1, left as optional future work. Reasoning:
+
+- It is not required by anything — not the spec, not correctness, not the
+  group's core same-instant guarantee (which is enforced entirely by the one
+  atomic multi-name `zfs snapshot` exec at creation time; nothing about
+  deletion ordering threatens it).
+- Adding it for exactly this one relation (`ZfsSnapshot` → `ZfsVolumeGroupSnapshot`)
+  while leaving every structurally identical relation elsewhere
+  (`ZfsSnapshot` → `ZfsDataset`, `ZfsDataset` → `PersistentVolume`, ...)
+  undefended creates an arbitrary asymmetry — the same "false sense of
+  completeness" argument already used to justify not chasing the
+  `VolumeSnapshotContent`-watch gap applies here too.
+- It only ever matters for a direct, out-of-band `kubectl` bypass — a scenario
+  already explicitly out of scope everywhere else in this driver.
+- Nothing about deferring it forecloses adding it later: it needs no new
+  field (`GroupSnapshotID` already exists for the RPC-layer check) and
+  conflicts with nothing else in this design.
+
+### Alternatives considered
+
+- **Implement both layers now**, as originally drafted. Rejected per the
+  reasoning above.
+- **Implement the guard for every analogous relation**, for full consistency
+  (`ZfsSnapshot`↔`ZfsDataset`, etc.). Rejected as disproportionate scope for a
+  guard that would only protect against something already explicitly outside
+  this driver's defended trust boundary everywhere else.
+
+### Consequences
+
+- `ZfsSnapshotReconciler.reconcileDelete` for a group-member `ZfsSnapshot`
+  remains completely unmodified by the VolumeGroupSnapshot feature — this
+  reinstates the original "fully reused, zero behavior change" claim for that
+  reconciler.
+- A direct `kubectl delete zfssnapshot <group-member>` proceeds and destroys
+  its own primitives exactly like a standalone delete would (the ADR-0034
+  ratchet still applies — that is a separate, unrelated concern), leaving the
+  parent `ZfsVolumeGroupSnapshot` referencing a child it no longer owns. This
+  is accepted, and matches the shape of every other CRD trust-boundary gap
+  already documented.
+
+---
+
+## ADR-0034 — A `ZfsSnapshot` never re-creates its ZFS primitives once `Ready`; a vanished primitive becomes an observed `Lost` phase, not a silent recreate
+
+**Status:** Accepted (implemented; a Lost snapshot fails the CSI create wait) · **Scope:** `internal/controller/zfssnapshot_controller.go` (`Reconcile`, lines ~137-148), `api/v1alpha1/zfssnapshot_types.go` (new phase constant) · **Related:** ADR-0026 (contrast), `docs/volumegroupsnapshot-design.md`.
+
+### Context
+
+Found while re-verifying deletion-protection claims for the VolumeGroupSnapshot
+design, not while looking for it. `ZfsSnapshotReconciler.Reconcile`'s
+"idempotent create" step (lines ~137-148) checks whether the raw ZFS snapshot
+exists and, if not, runs `zfs snapshot` — unconditionally, on every reconcile,
+with no gate on `Status.Phase`. This is the exact same pattern ADR-0026
+deliberately chose for `ZfsDataset` ("a dataset that disappears is
+recreated") — but `ZfsSnapshot` is not a standing declaration of desired
+state the way a dataset is. A snapshot's entire purpose is to be an unchanging
+record of one specific instant. There is no supported "reset" operation for a
+snapshot, unlike a dataset (where destroying it on the host and letting the
+agent rebuild it empty from spec is an intentional, documented capability,
+ADR-0026). Recreating a snapshot after its underlying `zfs snapshot` was
+destroyed — by hand, or lost with the pool and only partially restored, or any
+other drift — does not restore the same data; it silently fabricates a
+brand-new artifact at the *current* txg, under the same object identity, and
+(once the reconciler re-affirms `Ready`) the same apparent status. Any consumer
+that already trusts this snapshot as "data as of time T" — a restored PVC, a
+`VolumeSnapshotContent`, and above all a sibling `ZfsSnapshot` in the same
+`ZfsVolumeGroupSnapshot` whose entire value proposition depends on every
+member having been cut from the identical instant — is left trusting stale
+identity over silently-substituted content.
+
+This is a strictly worse failure mode than the one ADR-0026 accepts for
+datasets. ADR-0026's own reasoning for rejecting a "refuse once Ready" guard
+was that `status.phase == Ready` "is a poor proxy for 'data existed': it is
+equally true in the seconds after a deliberate reset" — i.e. there is a real,
+supported, legitimate operation (a dataset reset) that the guard cannot
+distinguish from actual data loss, so the guard is rejected as removing a
+useful capability. For `ZfsSnapshot` that ambiguity does not exist: there is no
+legitimate "reset a snapshot" operation to protect. Every case where a
+`ZfsSnapshot`'s primitives vanish after `Ready` is drift or tampering, never a
+supported workflow — so ADR-0026's justification for "recreate" does not carry
+over.
+
+### Decision
+
+Once a `ZfsSnapshot` reaches `Status.Phase == Ready`, the reconciler must never
+again attempt to (re-)create the raw ZFS snapshot, the backing clone, or its
+`@restore-source` self-snapshot. On every subsequent reconcile, if any of these
+is found missing, transition to a new terminal phase (placeholder name
+`SnapshotPhaseLost`), set `ReadyToUse: false`, and surface a clear
+message/event identifying which primitive is missing. This is a one-way
+ratchet — the same shape as `SourceType`'s CEL immutability elsewhere in this
+CRD (D24), applied to reconciler behavior instead of a field.
+
+This applies identically, and even more critically, to the new
+`ZfsVolumeGroupSnapshot`'s own group-creation step (tracked under
+`vgs-group-controller`): once the parent's `Status` shows the shared atomic
+`zfs snapshot` exec has succeeded once, the reconciler must never re-issue it —
+even for the subset of members whose raw snapshot has since vanished — because
+re-issuing it for even one member would silently mint a *new* cross-member
+instant that no longer matches the group's other, unaffected members. That is
+exactly the corruption this entire feature exists to prevent, so this
+invariant is non-negotiable for the group case even though it is "merely" a
+correctness hardening for the standalone case.
+
+### Alternatives considered
+
+- **Recreate, matching ADR-0026.** Rejected: explained above — no legitimate
+  "reset" case exists for a point-in-time record, so the ambiguity ADR-0026
+  relies on to justify recreation is absent here.
+- **Detect drift but do nothing (leave `Status` stale, just skip).** Rejected:
+  a silently stale `Status.Phase: Ready` pointing at nothing is worse than an
+  explicit `Lost` phase — an operator, or a restore attempt, needs to be able
+  to discover this without independently auditing ZFS.
+
+### Consequences
+
+- New `SnapshotPhaseLost` phase (exact name TBD at implementation time) added
+  to the CRD's phase enum; `readyToUse` stays `false` once reached.
+- A `ZfsSnapshot` that reaches `Lost` never self-heals; recovery, if any, is an
+  operator decision (recreate the CR, redo the original `CreateSnapshot` call
+  from a still-valid source), never automatic.
+- This is a real fix to existing code
+  (`internal/controller/zfssnapshot_controller.go`'s `Reconcile`), independent
+  of and prerequisite to the VolumeGroupSnapshot feature — it protects every
+  standalone snapshot in the cluster today, not just future group members —
+  queued as its own todo, sequenced before or alongside the group work.
+
+---
+
+### Amendment — `Lost` is an observation, not a terminal state
+
+The first implementation made `Lost` sticky. That was wrong: never *creating*
+anything is what protects the instant; a primitive that reappears (dataset moved
+away and back, pool re-imported) is the original snapshot. The rule is
+therefore just: `@restore-source` missing on disk → `Lost`; present again →
+`Ready`, with `creationTime` re-read from the raw snapshot (kept as-is if a
+promote relocated it and it cannot be found). A `Lost` snapshot is re-observed
+every minute.
+
+No proof that the pool or a parent dataset is present is required. libzfs
+reports a not-imported pool as "dataset does not exist", so an exported pool
+briefly reads as `Lost` — harmless, because nothing is destroyed or re-created
+and it returns to `Ready` on import. Anyone working on the underlying ZFS
+primitives owns the consequences, consistent with the trust boundary in
+`docs/volumegroupsnapshot-design.md`.
+
+### Amendment — `provisionedAt` is the "never recreate" marker
+
+The gate is not the phase (an `Error` write would otherwise let a later reconcile
+recreate) but a write-once `status.provisionedAt`, stamped when the snapshot
+first becomes `Ready`; non-nil means its primitives are never created again.
+`status.creationTime` is separate: the raw snapshot's ZFS creation time, read on
+every transition into `Ready` (first Ready, `Lost` → `Ready`, legacy backfill)
+and never on a steady-state reconcile. `creationTime` later than `provisionedAt`
+means the snapshot was replaced; nothing acts on that yet. Legacy `Ready` /
+`Lost` objects are recognised by phase and backfilled — a temporary fallback
+tracked in `TODO.md`. Same design and rationale as ADR-0037, which has the full
+account. Note: the body above still says the loss phase is "terminal"; the
+amendment above supersedes that.
+
+
 ## ADR-0033 — Local dataset bind-mount needs the source path in-container; prefer a scoped `HostToContainer` volume over enabling `csiNode.hostExec`
 
 **Status:** Accepted, implemented · **Scope:** `charts/simple-zfs-csi/values.yaml` (`csiNode.datasetMountRoot`), `charts/simple-zfs-csi/templates/csi-node-daemonset.yaml`. No Go code changes.
@@ -596,7 +937,7 @@ no-op so classes that named the surviving behaviour keep working.
 
 ## ADR-0026 — A `ZfsDataset` spec is a standing declaration: a dataset that disappears is recreated
 
-**Status:** Accepted (2026-08-05) · **Scope:** `internal/controller/zfsdataset_controller.go` — **no code change**; this records existing behaviour as intentional · **Related:** [runbooks.md](runbooks.md), [known-pitfalls.md](known-pitfalls.md) #18.
+**Status:** Superseded by ADR-0037 (was: Accepted 2026-08-05) · **Scope:** `internal/controller/zfsdataset_controller.go` — **no code change**; this records existing behaviour as intentional · **Related:** [runbooks.md](runbooks.md), [known-pitfalls.md](known-pitfalls.md) #18.
 
 ### Context
 

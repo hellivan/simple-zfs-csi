@@ -173,6 +173,11 @@ func (r *ZfsDatasetReconciler) checkPendingCloneDependents(ctx context.Context, 
 		if !sourceDependsOn(dep, strings.Trim(vol.Spec.Dataset, "/")) {
 			continue
 		}
+		// A dependent that was provisioned once and is now missing is Lost, not
+		// pending: it will never be created, so there is nothing to wait for.
+		if datasetProvisioned(dep) {
+			continue
+		}
 		depFull, err := datasetName(poolName, dep.Spec.Dataset)
 		if err != nil {
 			return err

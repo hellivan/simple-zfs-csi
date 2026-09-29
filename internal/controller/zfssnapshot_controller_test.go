@@ -536,3 +536,163 @@ func TestZfsSnapshotReconcile_ChainedBackingClonesRemainDeletable(t *testing.T) 
 		t.Error("csi-snap-2 lost its @restore-source snapshot")
 	}
 }
+
+func settledSnapshotFixture(t *testing.T, phase storagev1alpha1.ZfsSnapshotPhase) (client.Client, *ZfsSnapshotReconciler, *fakeZFS) {
+	t.Helper()
+	scheme := newTestScheme(t)
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	snap := &storagev1alpha1.ZfsSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-1", Finalizers: []string{zfsSnapshotFinalizer}},
+		Spec: storagev1alpha1.ZfsSnapshotSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "csi-snap-1",
+			SourceVolume: "pvc-1", SourceType: storagev1alpha1.DatasetTypeFilesystem,
+		},
+		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: phase, ReadyToUse: phase == storagev1alpha1.SnapshotPhaseReady},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(onlinePool(), src, snap).
+		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsDataset{}).
+		Build()
+	z := newFakeZFS()
+	return c, &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}, z
+}
+
+// A Ready snapshot whose primitives vanished must become Lost, and nothing may
+// be re-created (ADR-0034).
+func TestZfsSnapshotReconcile_ReadyWithVanishedPrimitivesBecomesLost(t *testing.T) {
+	c, r, z := settledSnapshotFixture(t, storagev1alpha1.SnapshotPhaseReady)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatalf("reconcile %d: %v", i+1, err)
+		}
+	}
+	if len(z.createdDS) != 0 || len(z.cloned) != 0 {
+		t.Fatalf("nothing may be re-created, got snapshots %v clones %v", z.createdDS, z.cloned)
+	}
+	var got storagev1alpha1.ZfsSnapshot
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != storagev1alpha1.SnapshotPhaseLost || got.Status.ReadyToUse {
+		t.Errorf("phase = %q readyToUse = %v, want Lost/false", got.Status.Phase, got.Status.ReadyToUse)
+	}
+}
+
+// A healthy Ready snapshot stays Ready and untouched.
+func TestZfsSnapshotReconcile_ReadyWithIntactPrimitivesIsLeftAlone(t *testing.T) {
+	c, r, z := settledSnapshotFixture(t, storagev1alpha1.SnapshotPhaseReady)
+	z.existing["tank/k8s/csi-snap-1@restore-source"] = true
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	var got storagev1alpha1.ZfsSnapshot
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != storagev1alpha1.SnapshotPhaseReady || len(z.createdDS) != 0 {
+		t.Errorf("phase = %q, created = %v; want Ready and nothing created", got.Status.Phase, z.createdDS)
+	}
+}
+
+// Lost recovers when the original restore source reappears (dataset moved away
+// and back), and is otherwise never healed by re-creation.
+func TestZfsSnapshotReconcile_LostRecoversWhenPrimitiveReturns(t *testing.T) {
+	c, r, z := settledSnapshotFixture(t, storagev1alpha1.SnapshotPhaseLost)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
+	phase := func() storagev1alpha1.ZfsSnapshotPhase {
+		var got storagev1alpha1.ZfsSnapshot
+		if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.Status.Phase
+	}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if phase() != storagev1alpha1.SnapshotPhaseLost || len(z.createdDS) != 0 {
+		t.Fatalf("still absent: phase = %q created = %v, want Lost and nothing created", phase(), z.createdDS)
+	}
+
+	z.existing["tank/k8s/csi-snap-1@restore-source"] = true
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if phase() != storagev1alpha1.SnapshotPhaseReady || len(z.createdDS) != 0 {
+		t.Errorf("phase = %q created = %v, want Ready and nothing created", phase(), z.createdDS)
+	}
+}
+
+// The reported creation time comes from the raw snapshot, not the later
+// @restore-source self-snapshot (ADR-0036).
+func TestZfsSnapshotReconcile_CreationTimeComesFromRawSnapshot(t *testing.T) {
+	scheme := newTestScheme(t)
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	snap := &storagev1alpha1.ZfsSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
+		Spec: storagev1alpha1.ZfsSnapshotSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "csi-snap-1",
+			SourceVolume: "pvc-1", SourceType: storagev1alpha1.DatasetTypeFilesystem,
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(onlinePool(), src, snap).
+		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsDataset{}).Build()
+	z := newFakeZFS()
+	r := &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
+
+	// Pre-existing raw snapshot with a distinctive time; the fake stamps every
+	// snapshot it creates itself (incl. @restore-source) with 1700000000.
+	z.existing["tank/k8s/pvc-1@csi-snap-1"] = true
+	z.props["tank/k8s/pvc-1@csi-snap-1"] = map[string]string{"creation": "1600000000", "referenced": "1048576"}
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got storagev1alpha1.ZfsSnapshot
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.CreationTime == nil || got.Status.CreationTime.Unix() != 1600000000 {
+		t.Errorf("creation time = %v, want unix 1600000000 from the raw snapshot", got.Status.CreationTime)
+	}
+}
+
+// A legacy Ready snapshot (no ProvisionedAt) is backfilled; CreationTime is
+// read from the raw snapshot.
+func TestZfsSnapshotReconcile_LegacyReadyIsBackfilled(t *testing.T) {
+	c, r, z := settledSnapshotFixture(t, storagev1alpha1.SnapshotPhaseReady)
+	z.existing["tank/k8s/csi-snap-1@restore-source"] = true
+	z.existing["tank/k8s/pvc-1@csi-snap-1"] = true
+	z.seedSnapshot("tank/k8s/pvc-1", "csi-snap-1")
+	z.props["tank/k8s/pvc-1@csi-snap-1"] = map[string]string{"creation": "1600000000"}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	var got storagev1alpha1.ZfsSnapshot
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.ProvisionedAt == nil {
+		t.Errorf("provisionedAt not backfilled")
+	}
+	if got.Status.CreationTime == nil || got.Status.CreationTime.Unix() != 1600000000 {
+		t.Errorf("creationTime = %v, want 1600000000 from the raw snapshot", got.Status.CreationTime)
+	}
+	if got.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
+		t.Errorf("phase = %q, want Ready", got.Status.Phase)
+	}
+}

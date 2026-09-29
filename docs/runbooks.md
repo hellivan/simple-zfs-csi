@@ -74,24 +74,13 @@ changes.
 
 ### Pitfalls
 
-- **Do not edit the CR before renaming.** The reconciler creates the dataset
-  whenever `spec.dataset` names an object that does not exist, so a reconcile in
-  that window provisions an *empty* dataset at the new path — and the `zfs
-  rename` in step 2 then fails with "dataset already exists".
-
-- **Do not leave a long gap after renaming either.** In that order, a reconcile
-  landing between steps 2 and 3 recreates an empty dataset at the *old* path —
-  intended behaviour, not a defect: the CR still declares that a dataset must
-  exist there (ADR-0026). It is orphaned — the finalizer only ever destroys the
-  path currently in `spec.dataset` — so remove it by hand once you have
-  confirmed it is empty:
-
-  ```sh
-  nsenter -t 1 -m -- zfs list -o name,used tank/k8s/<old>
-  nsenter -t 1 -m -- zfs destroy tank/k8s/<old>
-  ```
-
-  Keeping steps 2 and 3 back to back shrinks this window to nothing in practice.
+- **A dataset the driver has provisioned is never re-created (ADR-0037).**
+  Whichever order you rename and edit in, a reconcile that lands between the
+  `zfs rename` and the `spec.dataset` edit finds nothing at the path the CR
+  names and marks the `ZfsDataset` `Lost` — it does not create an empty dataset.
+  Once both steps are done the object returns to `Ready` (re-checked every
+  minute). While it is `Lost`, publishes of the volume fail fast. Do not delete
+  the object to "fix" it.
 
 - **Changing the parent prefix affects future clones and restores.** Both reject
   a source whose parent differs from the target StorageClass's `datasetPrefix`

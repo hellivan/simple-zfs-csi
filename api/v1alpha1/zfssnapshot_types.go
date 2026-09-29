@@ -15,6 +15,11 @@ const (
 	SnapshotPhaseReady ZfsSnapshotPhase = "Ready"
 	// SnapshotPhaseError means the last reconcile attempt failed.
 	SnapshotPhaseError ZfsSnapshotPhase = "Error"
+	// SnapshotPhaseLost means the snapshot was Ready once but the ZFS primitive
+	// it restores from has since disappeared. A snapshot is a record of one
+	// instant, so it is never re-created in place (ADR-0034); it returns to
+	// Ready only if the original primitive reappears.
+	SnapshotPhaseLost ZfsSnapshotPhase = "Lost"
 )
 
 // ZfsSnapshotSpec is the desired point-in-time snapshot of a source dataset/zvol
@@ -102,6 +107,15 @@ type ZfsSnapshotSpec struct {
 
 // ZfsSnapshotStatus reports the observed snapshot state on the node.
 type ZfsSnapshotStatus struct {
+	// ProvisionedAt is when the snapshot first became Ready. It is written once
+	// and never changed: non-nil means "this snapshot has existed", so its
+	// primitives are never created again (ADR-0034). CreationTime, by contrast,
+	// follows the raw snapshot on disk and is refreshed if a Lost snapshot
+	// reappears; a CreationTime later than ProvisionedAt reveals a replaced
+	// snapshot.
+	// +optional
+	ProvisionedAt *metav1.Time `json:"provisionedAt,omitempty"`
+
 	// Phase is a coarse summary of the current state.
 	// +optional
 	Phase ZfsSnapshotPhase `json:"phase,omitempty"`

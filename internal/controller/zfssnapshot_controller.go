@@ -128,6 +128,14 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// A snapshot that has been Ready is never (re-)created (ADR-0034). The phase
+	// checks are the one-off migration for objects that predate ProvisionedAt;
+	// reconcileSettled backfills them and the checks are removed afterwards
+	// (TODO.md).
+	if snap.Status.ProvisionedAt != nil || snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady || snap.Status.Phase == storagev1alpha1.SnapshotPhaseLost {
+		return r.reconcileSettled(ctx, &snap, &pool, datasetPath)
+	}
+
 	full, err := snapshotFullName(pool.Status.PoolName, datasetPath, snap.Spec.SnapshotName)
 	if err != nil {
 		return ctrl.Result{}, r.setSnapshotStatus(ctx, &snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
@@ -272,6 +280,75 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	return ctrl.Result{}, r.releaseSnapshotFinalizer(ctx, snap)
 }
 
+// reconcileSettled handles a snapshot that already reached Ready (or Lost).
+//
+// Unlike a ZfsDataset (ADR-0026), a snapshot is not a standing declaration: it
+// records one instant, and there is no supported way to reset it. If its
+// primitives vanish, re-creating them would fabricate a different instant under
+// the same identity — and, for a group member, silently break the guarantee
+// that every member was cut at the same time. So this only observes and records
+// (ADR-0034): it never creates anything. Missing on disk means Lost; present
+// again means Ready, with the creation time re-read from the snapshot.
+//
+// Only the backing clone's @restore-source is checked: it is what restores
+// use, and it keeps the raw snapshot alive as its origin.
+func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool, datasetPath string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	backingDataset := path.Join(path.Dir(strings.Trim(datasetPath, "/")), snap.Spec.SnapshotName)
+	backingFull, err := datasetName(pool.Status.PoolName, backingDataset)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	restoreSourceFull := backingFull + "@" + restoreSourceSnapshotName
+
+	present, err := r.exists(ctx, restoreSourceFull)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	switch {
+	case present && snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady && snap.Status.ProvisionedAt != nil:
+		return ctrl.Result{}, nil
+	case present:
+		logger.Info("lost snapshot's restore source is back", "snapshot", restoreSourceFull)
+		// The raw snapshot may have been relocated by a promote; if it cannot be
+		// found the recorded creation time is kept rather than guessing.
+		var creation *metav1.Time
+		if raw, err := r.ZFS.FindSnapshot(ctx, pool.Status.PoolName, snap.Spec.SnapshotName); err == nil && raw != "" {
+			creation = snapshotCreationTime(ctx, r.ZFS, raw)
+		}
+		message := fmt.Sprintf("restore source %s is present again", restoreSourceFull)
+		if snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady {
+			message = snap.Status.Message // backfilling ProvisionedAt only
+		}
+		return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseReady, true, creation, nil,
+			"Ready", message)
+	case snap.Status.Phase == storagev1alpha1.SnapshotPhaseLost:
+		return ctrl.Result{RequeueAfter: lostRecheckInterval}, nil
+	}
+
+	logger.Info("ready snapshot lost its restore source; not re-creating", "snapshot", restoreSourceFull)
+	if err := r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseLost, false, nil, nil,
+		"PrimitivesLost", fmt.Sprintf("%s no longer exists; a snapshot is never re-created in place", restoreSourceFull)); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: lostRecheckInterval}, nil
+}
+
+// lostRecheckInterval is how often a Lost snapshot is re-observed, so a
+// primitive that comes back (e.g. a dataset moved back) is noticed.
+const lostRecheckInterval = time.Minute
+
+func (r *ZfsSnapshotReconciler) exists(ctx context.Context, name string) (bool, error) {
+	if _, err := r.ZFS.Get(ctx, name, "type"); err != nil {
+		if errors.Is(err, zpool.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // reconcileBackingClone clones the raw snapshot into a flat sibling of the
 // source dataset named after Spec.SnapshotName, then takes its fixed-name
 // "@restore-source" self-snapshot (D5).
@@ -322,7 +399,9 @@ func (r *ZfsSnapshotReconciler) reconcileBackingClone(ctx context.Context, snap 
 		logger.Info("created backing-clone self-snapshot", "snapshot", restoreSourceFull)
 	}
 
-	creation := snapshotCreationTime(ctx, r.ZFS, restoreSourceFull)
+	// The raw snapshot carries the real instant; @restore-source is taken later
+	// and, for group members, at a different moment per member (ADR-0036).
+	creation := snapshotCreationTime(ctx, r.ZFS, rawFull)
 	restore := snapshotRestoreSize(ctx, r.ZFS, restoreSourceFull)
 	return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseReady, true, creation, restore,
 		"Ready", fmt.Sprintf("snapshot %s ready on %s (backing clone %s)", rawFull, r.NodeName, backingFull))
@@ -392,6 +471,9 @@ func (r *ZfsSnapshotReconciler) setSnapshotStatus(ctx context.Context, snap *sto
 	if creation != nil {
 		patched.Status.CreationTime = creation
 	}
+	if phase == storagev1alpha1.SnapshotPhaseReady && patched.Status.ProvisionedAt == nil {
+		patched.Status.ProvisionedAt = firstReadyTime(patched.Status.Conditions)
+	}
 	if restore != nil {
 		patched.Status.RestoreSize = restore
 	}
@@ -449,4 +531,17 @@ func (r *ZfsSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("zfssnapshot").
 		Complete(r)
+}
+
+// firstReadyTime is the value for a new ProvisionedAt. An object that is Ready
+// but predates the field is backfilled from its Ready condition's transition
+// time, which for a continuously Ready object is the real first-Ready time; in
+// every other case it is now.
+func firstReadyTime(conds []metav1.Condition) *metav1.Time {
+	if c := meta.FindStatusCondition(conds, "Ready"); c != nil && c.Status == metav1.ConditionTrue && !c.LastTransitionTime.IsZero() {
+		t := c.LastTransitionTime
+		return &t
+	}
+	now := metav1.Now()
+	return &now
 }

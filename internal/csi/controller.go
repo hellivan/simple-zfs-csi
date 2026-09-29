@@ -612,7 +612,7 @@ func (c *ControllerServer) waitVolumeReady(ctx context.Context, name string, min
 		switch {
 		case observed && vol.Status.Phase == storagev1alpha1.DatasetPhaseReady:
 			return vol, nil
-		case observed && vol.Status.Phase == storagev1alpha1.DatasetPhaseError:
+		case observed && (vol.Status.Phase == storagev1alpha1.DatasetPhaseError || vol.Status.Phase == storagev1alpha1.DatasetPhaseLost):
 			return nil, status.Errorf(codes.Internal, "volume %q provisioning failed: %s", name, vol.Status.Message)
 		}
 		select {

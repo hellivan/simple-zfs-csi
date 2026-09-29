@@ -238,6 +238,16 @@ spec:
               phase:
                 description: Phase is a coarse summary of the current state.
                 type: string
+              provisionedAt:
+                description: |-
+                  ProvisionedAt is when the snapshot first became Ready. It is written once
+                  and never changed: non-nil means "this snapshot has existed", so its
+                  primitives are never created again (ADR-0034). CreationTime, by contrast,
+                  follows the raw snapshot on disk and is refreshed if a Lost snapshot
+                  reappears; a CreationTime later than ProvisionedAt reveals a replaced
+                  snapshot.
+                format: date-time
+                type: string
               readyToUse:
                 description: |-
                   ReadyToUse is true once the snapshot exists and can be restored/cloned. It

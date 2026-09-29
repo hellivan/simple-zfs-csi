@@ -232,7 +232,7 @@ func (c *ControllerServer) waitSnapshotReady(ctx context.Context, name string) (
 		switch {
 		case snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady && snap.Status.ReadyToUse:
 			return snap, nil
-		case snap.Status.Phase == storagev1alpha1.SnapshotPhaseError:
+		case snap.Status.Phase == storagev1alpha1.SnapshotPhaseError, snap.Status.Phase == storagev1alpha1.SnapshotPhaseLost:
 			return nil, status.Errorf(codes.Internal, "snapshot %q failed: %s", name, snap.Status.Message)
 		}
 		select {
