@@ -765,9 +765,11 @@ vs. per-child `reconcileBackingClone`).
 - **`DeleteSnapshot` RPC for a group member:** refused with `INVALID_ARGUMENT` when the
   `ZfsSnapshot` CR has `Spec.GroupSnapshotID` (spec error table, `spec.md:2073`); missing CR = OK.
   Direct CR deletion stays allowed. Upstream never sends it for members.
-- **Known limitation:** between the atomic exec and the child CR creation the raw snapshots
-  have no CR. Deleting the source PVC then can let dataset cleanup destroy them. Short window,
-  loud and safe failure (never provisioned); accepted.
+- **Known limitation (accepted, no deletion guard):** between the atomic exec and the child CR
+  creation the raw snapshots have no CR. Deleting the source PVC then destroys them, or (if a
+  newer standalone snapshot exists) a promote relocates them onto that snapshot's backing
+  clone where the group never finds them. Short window, loud and safe failure (never
+  provisioned). Details and the rejected guard: ADR-0039.
 
 ## New surface area (net)
 

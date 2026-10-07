@@ -205,13 +205,24 @@ authoritative child list; delete loads that record, deletes the stored children,
 deletes the record. The shared lesson: keep one authoritative member list and delete
 from it, rather than discovering children by a lookup.
 
-### Known limitation
+### Known limitation (accepted, no guard)
 
-Between the atomic exec and the creation of the child CRs the raw snapshots exist
-without a `ZfsSnapshot` CR. Deleting a source PVC in that window passes the D3 check
-and the dataset cleanup can destroy those snapshots as unclaimed driver artifacts.
-The window is short and the result is a loud, safe failure (the group is never
-provisioned), so it is accepted. Not run on a cluster.
+Between the atomic exec and the creation of the child CRs the raw snapshots exist without
+a `ZfsSnapshot` CR. If the source PVC is deleted in that window, `checkSnapshotDependents`
+(D3) passes, because no snapshot CR depends on it yet. What happens to the raw snapshot
+`G` depends on the order of the source's snapshots:
+
+- A standalone snapshot older than `G`: promoting its backing clone leaves `G` on the
+  source, and the leftover cleanup destroys it as an unclaimed `csi-snap-*` artifact.
+- A standalone snapshot newer than `G`: promoting that clone moves `G` (older) onto the
+  clone as `<backing clone>@G`. The group reconciler looks for it on the vanished source
+  and never finds it; nothing promotes it back, and it is destroyed as a leftover when
+  that standalone snapshot is later deleted.
+
+Either way the group is never provisioned (loud, safe). Considered and rejected: making
+the volume delete wait while a `ZfsGroupSnapshot` with that source is not yet provisioned.
+Decision: no deletion guard; the window is very short, and a user who removes a source
+volume mid-snapshot owns the result (ADR-0038, ADR-0040). Not run on a cluster.
 
 ### Consequences
 
