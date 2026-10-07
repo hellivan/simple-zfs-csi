@@ -35,6 +35,56 @@ revised note at the top). The SQL `vgs-*` todos carry the breakdown. Open detail
 - Optional later: record `createtxg` (see FUTURE_OPTMIZATIONS.md) and `snapshotTakenAt`
   (the real on-disk timestamp).
 
+### `ZfsGroupSnapshot` implementation checklist (authoritative; design in ADR-0038/0039/0040)
+
+Order: 1 -> 9. Each item lists what must be true when it is done.
+
+1. **Variadic `ZFS.Snapshot(ctx, names ...string)`** (`internal/zpool/zfs.go`): one `zfs snapshot`
+   exec with all names; all exist = no-op; some exist = distinct error (never fill the gap).
+   Update every fake `ZFS` and call site.
+2. **`ZfsGroupSnapshot` CRD** (cluster-scoped, finalizer, no `ownerReference`). Spec: `poolGUID`,
+   `members[]` fixed at creation (`sourceVolume`, `dataset`, `sourceType`, `sourceFSType`,
+   `sourceVolblocksize`, `sourceProperties`, `snapshotName` = own random `csi-snap-<uuid>`,
+   `childSnapshotName` = own random, equals the CSI `snapshot_id`, persisted once). Status:
+   `phase` Ready/Pending/Error/Lost (derived), `creationTime` (once), `provisionedAt`
+   (write-once, first all-Ready), `readyToUse`, `message`, `conditions`. Regenerate CRD and deepcopy.
+3. **`ZfsSnapshot.Spec.GroupSnapshotID`** (immutable). `snapshotMessage` sets `group_snapshot_id`.
+   A child with it never runs `zfs snapshot`. If its raw snapshot or source dataset cannot be
+   found it sets `phase=Error` with a clear message ("raw snapshot X not found; group snapshots
+   are never re-taken"), never staying silently Pending; the group derives Error from it.
+   `ControllerServer.DeleteSnapshot` returns `INVALID_ARGUMENT` for a member (missing CR = OK).
+   No CRD-layer deletion guard.
+4. **`ZfsGroupSnapshotReconciler`** (per node, gated like `ZfsSnapshotReconciler`; extract
+   `resolveDatasetPath` from `sourceDatasetPath`). Order: three-way check of the raw snapshots
+   (all exist: adopt; none: one variadic exec; some: `Error`) -> read `creationTime` once ->
+   create children (only after the exec succeeded; comment at both call sites) -> `provisionedAt`
+   at the first all-Ready. Before `provisionedAt` a missing child may be recreated; after it
+   nothing is created. Refuse the exec if a source volume is `Terminating`. Status derived from
+   `Spec.Members` children (cache, no ZFS). Finalizer: delete each child from `Spec.Members`
+   (NotFound = done), wait until all are gone, release. Before `provisionedAt`, destroy the raw
+   snapshot of any member with no child CR. A `Terminating` group creates nothing.
+5. **`GroupControllerServer`** (`internal/csi/groupcontroller.go`): the Create/Delete/Get tables in
+   ADR-0039. Cross-pool = `FAILED_PRECONDITION`; Get with a lost member = `FAILED_PRECONDITION`;
+   `snapshot_ids` mismatch (set comparison against `Spec.Members`) = `INVALID_ARGUMENT`.
+6. **Wiring:** `GROUP_CONTROLLER_SERVICE` in `Identity.GetPluginCapabilities`,
+   `GroupControllerGetCapabilities` advertising `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`, optional
+   group server in `csi.Serve`, constructed in the controller Deployment entrypoint only.
+7. **Helm/RBAC:** agent gets `create;delete` on `zfssnapshots` and get/list/watch/update/patch on
+   `zfsgroupsnapshots` (+ `/status`, `/finalizers`); controller gets get/list/watch/create/delete on
+   `zfsgroupsnapshots`; csi-snapshotter `--enable-volume-group-snapshots`; document the
+   `groupsnapshot.storage.k8s.io` CRDs and snapshot-controller flag; CRD install (Helm never
+   upgrades `crds/`).
+8. **Tests:** variadic exec (single process, mixed existence); reconciler (gating, atomic create
+   with all raw snapshots before any child, `creationTime` once, `provisionedAt` once and never
+   again, nothing recreated after it, Lost derivation, finalizer waits and orphan raw-snapshot
+   cleanup, Terminating creates nothing, pool takeover); child never snapshots and fails loud;
+   RPC tables (Create codes, set comparison and reorder, Terminating `ABORTED`, Delete mismatch,
+   Get decision table, `DeleteSnapshot` refusal).
+9. **End-to-end** (k8s with group snapshot CRDs, csi-snapshotter v7+): one exec with both dataset
+   names in the agent log, restore both members, delete tears down cleanly, cross-pool group gets
+   `FAILED_PRECONDITION`, deleting one member `VolumeSnapshot` is blocked by upstream while the
+   group exists, a member restore still works after another member is deleted.
+
 ## Remove the `provisionedAt` migration fallback
 
 `status.provisionedAt` (ADR-0034 snapshots, ADR-0037 datasets) is the single
