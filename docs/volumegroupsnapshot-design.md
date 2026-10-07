@@ -766,9 +766,8 @@ vs. per-child `reconcileBackingClone`).
   `ZfsSnapshot` CR has `Spec.GroupSnapshotID` (spec error table, `spec.md:2073`); missing CR = OK.
   Direct CR deletion stays allowed. Upstream never sends it for members.
 - **Known limitation (accepted, no deletion guard):** between the atomic exec and the child CR
-  creation the raw snapshots have no CR. Deleting the source PVC then destroys them, or (if a
-  newer standalone snapshot exists) a promote relocates them onto that snapshot's backing
-  clone where the group never finds them. Short window, loud and safe failure (never
+  creation the raw snapshots have no CR. Deleting the source PVC then destroys them (nothing waits: D3 is
+  dropped, ADR-0041; upstream adds no source-PVC protection for group snapshots). Short window, loud and safe failure (never
   provisioned). Details and the rejected guard: ADR-0039.
 
 ## New surface area (net)

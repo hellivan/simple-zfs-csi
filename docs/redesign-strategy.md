@@ -1,5 +1,11 @@
 # Redesign strategy: dependency guards (`checkSnapshotDependents`, `checkPendingCloneDependents`)
 
+> **SUPERSEDED in part (ADR-0041, 2026-10-08):** D3 (`checkSnapshotDependents`), D21
+> (`checkPendingCloneDependents`) and the live-CR clause of `assertDriverSnapshot` are being
+> dropped. A snapshot, restore or group snapshot is complete only when Ready; deleting its source
+> earlier is the user's risk. Text below that says to keep them is historical.
+
+
 Status: **discussion baseline**, not a decision.
 
 This document captures the current decision frame so we can continue later

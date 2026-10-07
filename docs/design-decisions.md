@@ -26,6 +26,18 @@ any driver-driven sequence. Both read CR state inside the ZFS delete path. Meanw
 can relocate an unclaimed raw snapshot (for example a group snapshot between the atomic exec
 and the child CRs) onto another snapshot's backing clone, where nothing finds it.
 
+### What Kubernetes already protects (verified)
+
+- Standalone `VolumeSnapshot`: external-snapshotter puts `pvc-as-source-protection` on the
+  source PVC until the snapshot is Ready (`createSnapshotContent` -> `ensurePVCFinalizer`;
+  `lifecycle-protection-matrix.md` §5.2). D3 was redundant for CO-driven flows.
+- PVC clone: external-provisioner puts `cloning-protection` on the source PVC
+  (matrix §5.1). D21 only added direct-CR-deletion and crash-window protection (matrix §6.3).
+- **Group snapshots: nothing.** In kubernetes-csi/external-snapshotter at `7c90fdd`
+  (2026-10-08) `ensurePVCFinalizer` is called only from the standalone `createSnapshotContent`;
+  `groupsnapshot_controller_helper.go` never adds `pvc-as-source-protection`. A source PVC can
+  be deleted while a group snapshot is in flight. Accepted under the principle below.
+
 ### Principle
 
 A snapshot, a restore (clone PVC) or a group snapshot is complete only when it is Ready.
@@ -38,8 +50,9 @@ and risk (ADR-0040). The volume delete does not wait for work that is not finish
    with a clone cannot be destroyed (the clone is promoted away), and a snapshot without one has
    nothing to preserve.
 2. **Drop the CR-claim clause of `assertDriverSnapshot`.** The name allow-list (D18) stays.
-3. **Order:** in each round, first destroy every driver-named snapshot of the dataset that has
-   no clones, then promote the clones of what remains. No phantom snapshot is promoted onto a
+3. **Order:** in each round, first check every snapshot of the dataset against the name
+   allow-list (D18; a foreign snapshot refuses the delete, exactly as today), then destroy every
+   driver-named snapshot that has no clones, then promote the clones of what remains. No phantom snapshot is promoted onto a
    clone that does not own it.
 4. A `ZfsSnapshot` or `ZfsGroupSnapshot` whose raw snapshot or source dataset vanished mid-way
    fails loudly (`phase=Error`, clear message) and is never re-taken (ADR-0038, ADR-0039).
@@ -258,18 +271,13 @@ from it, rather than discovering children by a lookup.
 ### Known limitation (accepted, no guard)
 
 Between the atomic exec and the creation of the child CRs the raw snapshots exist without
-a `ZfsSnapshot` CR. If the source PVC is deleted in that window, `checkSnapshotDependents`
-(D3) passes, because no snapshot CR depends on it yet. What happens to the raw snapshot
-`G` depends on the order of the source's snapshots:
+a `ZfsSnapshot` CR. If the source PVC is deleted in that window nothing waits for it (D3 is
+dropped, ADR-0041, and upstream adds no `pvc-as-source-protection` for group snapshots). The
+delete destroys the unclaimed, clone-free raw snapshot `G` on the source before promoting
+anything (ADR-0041), whatever the order of the source's standalone snapshots, so `G` is never
+relocated onto another snapshot's backing clone.
 
-- A standalone snapshot older than `G`: promoting its backing clone leaves `G` on the
-  source, and the leftover cleanup destroys it as an unclaimed `csi-snap-*` artifact.
-- A standalone snapshot newer than `G`: promoting that clone moves `G` (older) onto the
-  clone as `<backing clone>@G`. The group reconciler looks for it on the vanished source
-  and never finds it; nothing promotes it back, and it is destroyed as a leftover when
-  that standalone snapshot is later deleted.
-
-Either way the group is never provisioned (loud, safe). Considered and rejected: making
+The group is never provisioned (loud, safe). Before ADR-0041 a newer standalone snapshot's promote could instead strand `G` on a backing clone. Considered and rejected: making
 the volume delete wait while a `ZfsGroupSnapshot` with that source is not yet provisioned.
 Decision: no deletion guard (ADR-0041 also drops D3 and orders the cleanup so the raw snapshot is destroyed on the source in both cases); the window is very short, and a user who removes a source
 volume mid-snapshot owns the result (ADR-0038, ADR-0040). Not run on a cluster.

@@ -96,6 +96,9 @@ Order: 1 -> 9. Each item lists what must be true when it is done.
   destroyed; snapshot of a non-Ready or `Error` `ZfsSnapshot` no longer blocks the volume delete;
   foreign snapshot still refused. Update docs that cite D3 (`snapshot-lifecycle-redesign.md` is
   historical; update `lifecycle-protection-matrix.md` and `runbooks.md` if they describe the wait).
+- Update the comments that cite D3/D21/the claim check: `promote.go` (~70, 123-170, 350-373) and
+  `zfsdataset_controller.go:111`; update `csi-technical-reference.md` tables (89-94, 124) and
+  mark `redesign-strategy.md` as decided. Group snapshots: upstream adds no source-PVC protection.
 - Remove `checkPendingCloneDependents` (D21) and its call too, with its tests; a pending
   restore whose source is gone fails loudly instead of the source delete waiting.
   Check `ZfsDatasetReconciler` for the error a clone reports when its source is missing and make
