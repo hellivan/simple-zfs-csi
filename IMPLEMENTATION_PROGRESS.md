@@ -68,6 +68,17 @@ Callers: `reconcileSettled` (every ~30s per object, observation only) and `recon
 - [ ] E5. Optional: user-property tag on snapshots (verify it moves with a promote first).
 - [ ] E6. Decide: drop or slow down the periodic settled check (leaning: drop; FUTURE_OPTMIZATIONS.md item 5).
 
+## Phase F: API-server load (measured 2026-10-08 on `admin@kube-sl-home`, one-minute sample)
+
+The driver issues about 855 of about 2870 API requests per minute. Cause: every 30s `ZfsPool.status.lastUpdated`
+changes and each controller re-reconciles every object (56 attach requests, 91 datasets, 54 snapshots, 37 shares).
+
+- [ ] F1. Add a predicate to the `ZfsPool` watches (dataset, snapshot, share, attach request) that ignores updates where only `lastUpdated` changed.
+- [ ] F2. Attach request local-only path (`zfsshareattachrequest_controller.go` ~245, ~288): stop the uncached `Delete` of a non-existent `ZfsShare` on every reconcile (about 108 DELETE 404/min); read from cache first, delete only if it exists.
+- [ ] F3. Stop the uncached `ZfsPool` GET (`gateReader()`, about 112/min) and the live attach-request LIST (about 154/min) on every settled reconcile; use them only where a stale read is dangerous (teardown).
+- [ ] F4. Skip status patches when nothing changed (about 180 dataset, 112 attach request, 108 snapshot, 74 share patches/min).
+- [ ] F5. Re-measure afterwards (`apiserver_request_total`, 60s sample).
+
 ## Log
 
 | Date | Item | Commit | Note |
