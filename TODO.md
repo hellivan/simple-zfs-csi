@@ -1,5 +1,40 @@
 # TODO
 
+## Implement ADR-0038 in the existing code (decided 2026-10-07, not yet done)
+
+`provisionedAt` now means "provisioning finished; nothing is created, rebuilt or
+re-read afterwards". The committed code still does a few things the rule drops:
+
+- `zfsdataset_controller.go` `setStatusAt`: stop re-reading `creationTime` on a
+  transition into Ready; record it once when the object first becomes Ready.
+- `zfssnapshot_controller.go` `reconcileSettled`: same, and make sure it never
+  creates anything. It keeps observing Ready/Lost (status only).
+- The fixed-path check of `<backing clone>@restore-source` can report a false `Lost`
+  after a promote relocates it (the restored PVC's promote takes `@restore-source`
+  and older snapshots). With ADR-0038 this is only a status inaccuracy. Fix it by
+  following `origin` pointers, see [FUTURE_OPTMIZATIONS.md](FUTURE_OPTMIZATIONS.md).
+- Update tests that cover the Lost to Ready `creationTime` re-read.
+
+## Implement `ZfsGroupSnapshot` (ADR-0039)
+
+See [docs/volumegroupsnapshot-design.md](docs/volumegroupsnapshot-design.md) (the
+revised note at the top). The SQL `vgs-*` todos carry the breakdown. Open details:
+
+- Rename note: the doc and todos used `ZfsVolumeGroupSnapshot`; the kind is now
+  `ZfsGroupSnapshot`.
+- `Spec.GroupSnapshotID` on `ZfsSnapshot`: a child with it set never runs
+  `zfs snapshot`; it adopts the raw snapshot.
+- Group finalizer + explicit child deletion from `Spec.Members`; no `ownerReference`.
+- `GetVolumeGroupSnapshot` / `DeleteVolumeGroupSnapshot` compare `snapshot_ids` with
+  `Spec.Members`.
+- RPC error codes: see the ADR-0039 tables (cross-pool Create is `FAILED_PRECONDITION`;
+  `DeleteSnapshot` on a member and any `snapshot_ids` mismatch are `INVALID_ARGUMENT`;
+  Get with a lost member is `FAILED_PRECONDITION`).
+- Finalizer deleting before `provisionedAt`: destroy the raw snapshot of any member
+  that has no child CR.
+- Optional later: record `createtxg` (see FUTURE_OPTMIZATIONS.md) and `snapshotTakenAt`
+  (the real on-disk timestamp).
+
 ## Remove the `provisionedAt` migration fallback
 
 `status.provisionedAt` (ADR-0034 snapshots, ADR-0037 datasets) is the single

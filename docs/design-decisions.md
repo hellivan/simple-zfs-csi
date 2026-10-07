@@ -11,9 +11,273 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0040 — Two layers: the CRs are an operator system with their own rules; the CSI driver is a client of them
+
+**Status:** Accepted · **Scope:** project-wide principle · **Related:** ADR-0035, ADR-0038, ADR-0039.
+
+**Principle.** The project has two separate layers with separate responsibilities:
+
+1. **The CR layer (operator pattern).** `ZfsDataset`, `ZfsSnapshot`, `ZfsGroupSnapshot` and
+   the rest are declarative resources. Someone declares one and the controllers try to
+   fulfil it, with eventual consistency. The CRs have their own lifecycle rules
+   (ADR-0038: `provisionedAt` freezes provisioning; Ready/Lost is only observed; a missing
+   source leaves a resource unfulfilled until it returns). The CR layer knows nothing
+   about CSI.
+2. **The CSI layer.** The driver translates CSI RPCs into CR operations (create a CR, wait,
+   delete a CR). It uses the CRs but is not the CRs. It must follow the CSI spec and
+   Kubernetes' rules for the RPCs it serves.
+
+**Consequences.**
+- A rule from the CSI spec is enforced in the CSI layer, not pushed down into the CRs.
+  Example (ADR-0035/0039): the spec's "a group member can't be deleted stand-alone" binds
+  the `DeleteSnapshot` RPC, so the RPC refuses (`INVALID_ARGUMENT`) when
+  `Spec.GroupSnapshotID` is set. Deleting the `ZfsSnapshot` CR directly is a CR-layer
+  action and stays allowed; the normal delete path runs and the group's status reflects it.
+- Conversely, CR-layer behaviour does not bend to CSI convenience. The CRs stay valid
+  without the driver, and the CR layer carries no RPC-specific guards.
+- When a design question arises, first decide which layer it belongs to. Spec conformance
+  and error codes go in the CSI layer. Provisioning, freezing, observation and cleanup go
+  in the controllers.
+- Manual edits to the underlying primitives or to CRs outside the CSI path are the
+  user's responsibility (ADR-0038); the CR layer does not defend against them.
+
+---
+
+## ADR-0039 — `ZfsGroupSnapshot`: a plain resource that takes one atomic snapshot, creates the child `ZfsSnapshot`s, and cascades deletion through a finalizer
+
+**Status:** Accepted (design; not yet implemented) · **Scope:** future `ZfsGroupSnapshot` CRD and reconciler, `ZfsSnapshot.Spec.GroupSnapshotID`, CSI `GroupController` · **Related:** ADR-0038 (the freeze rule this builds on), ADR-0035 (partly superseded, see below), [volumegroupsnapshot-design.md](volumegroupsnapshot-design.md).
+
+### Context
+
+The design for Kubernetes `VolumeGroupSnapshot` support went through several rounds
+(ownerReference cascade with no parent finalizer; a Job-style resource that stops
+mattering once complete; a guard on child deletion). The CSI spec does not know our
+CRs, so every one of those was our own choice. This ADR records the final one.
+
+### Decision
+
+1. **Name and kind.** `ZfsGroupSnapshot` (cluster-scoped). Not `...Job`: it is an
+   ordinary resource that happens to do its work once.
+2. **Members are recorded first.** `Spec.Members` (source volume, dataset, raw
+   snapshot name, child CR name, ...) is fixed at creation, before anything is
+   touched. It is the group's authoritative member list.
+3. **Provisioning order.** On the node hosting the pool the group reconciler
+   (a) runs one atomic multi-name `zfs snapshot` for all members, (b) reads
+   `status.creationTime` once from a raw snapshot, (c) creates the child
+   `ZfsSnapshot`s with `Spec.GroupSnapshotID` set. A child never runs
+   `zfs snapshot` itself; it adopts the raw snapshot and builds the backing clone and
+   `@restore-source` like any standalone snapshot.
+4. **`provisionedAt`** is stamped when all children have been Ready for the first
+   time (the same meaning as on every other kind, ADR-0038). From then on the group
+   creates nothing again.
+5. **Before `provisionedAt`** the group may recreate a missing child and may retry.
+   The exec is guarded by the three-way check already in the design (all raw
+   snapshots exist: adopt; none exist: exec; some exist: `Error`, never fill the
+   gap). A raw snapshot destroyed by hand between the exec and `provisionedAt`
+   leaves that child unfulfilled; nothing outside has seen the instant, and that is
+   the same outcome as any source going missing during provisioning (eventual
+   consistency). No separate "exec happened" marker is kept (`snapshotTakenAt` is a
+   possible later addition that would hold the real on-disk timestamp).
+6. **Status is derived.** The group's Ready/Lost is computed from the child objects
+   named in `Spec.Members` (do they exist, what is their phase). It is read from the
+   API cache with no ZFS call, is informational, and never creates anything.
+7. **Deletion.** The group has a finalizer. On deletion it deletes each child named
+   in `Spec.Members` directly (NotFound means already gone), waits until all of them
+   are gone, then releases the finalizer. There is **no `ownerReference`**: one
+   mechanism, explicit and easy to reason about, instead of two.
+   If the group is deleted before `provisionedAt`, a member whose child CR does not
+   exist (never created, or not yet) may still have its raw `csi-snap-*` snapshot from
+   the atomic exec. For such members the finalizer destroys that raw snapshot if it
+   exists (it has no clone yet, so this is safe); after `provisionedAt` a missing child
+   means the child already cleaned up and the group touches no ZFS object. A group in
+   `Terminating` never creates or recreates a child.
+8. **Children are never blocked from deleting.** `GroupSnapshotID` is a loose
+   reference. Deleting one child is allowed at the CR level; it can show up in the
+   group's derived status and does nothing else. The CRD-layer group-liveness guard
+   that ADR-0035 deferred is dropped for good.
+9. **A retried create while the group is `Terminating`.** Kubernetes already refuses
+   a second object with the same name, but our `CreateVolumeGroupSnapshot` handler
+   must turn "found it, and it is being deleted" into `Aborted` so the sidecar
+   retries, and must not treat it as an existing healthy group.
+
+### CSI contract (read from the vendored spec v1.11.0)
+
+- `GetVolumeGroupSnapshot` is mandatory when we advertise
+  `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT` (`spec.md:3091`). It returns the group
+  with `group_snapshot_id`, `snapshots`, `creation_time` and `ready_to_use` (all
+  REQUIRED), or `NOT_FOUND` if the group "does not exist any more".
+- `snapshot_ids` on Get and Delete is REQUIRED; an SP that can detect a mismatch
+  SHOULD report it as `INVALID_ARGUMENT`. We compare it with **`Spec.Members`, not
+  with the live children**: the list the CO sends is the one we returned at create
+  time and never changes, while a child may have been deleted since. Comparing
+  against live children would make a group with one deleted member undeletable.
+- `creation_time` is REQUIRED on every Get. It is `status.creationTime`, recorded
+  once (it is not `provisionedAt`, which is the first-Ready time), so Get keeps
+  working after a child is deleted.
+- `ready_to_use` MUST be false if any listed snapshot is not ready and SHOULD be
+  true if all are. The contract does not define a group that has lost a member while
+  the group object still exists. We fail the call, as the reference
+  drivers do (Ceph-CSI `group/group_snapshot.go:52-116` fails the whole Get if a member
+  can't be resolved, with `Internal`/`Aborted`; csi-driver-host-path
+  `groupcontrollerserver.go:224-276` does the same): `FAILED_PRECONDITION` naming the
+  lost member (the spec lists no code for this case, so this is our choice). No partial
+  list and no placeholder. `NOT_FOUND` only once the group object is gone. The
+  `ZfsGroupSnapshot` CR still shows the true state.
+
+  **Get decision table** (request `snapshot_ids` vs `Spec.Members`, then members vs live
+  children; compared as sets, order ignored):
+
+  | Situation | Ceph-CSI | csi-driver-host-path | Ours |
+  |---|---|---|---|
+  | `snapshot_ids` equals `Spec.Members`, all children exist | full group | full group | full group; `ready_to_use` false while any child is not ready |
+  | `snapshot_ids` shorter than members | request ignored | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
+  | `snapshot_ids` longer than members | request ignored | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
+  | same length, different IDs | request ignored | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
+  | IDs match but a member's CR is gone | whole call fails (`Internal`/`Aborted`) | lookup error returned | `FAILED_PRECONDITION` naming the member |
+  | group object gone | `NOT_FOUND` | `NOT_FOUND` | `NOT_FOUND` |
+
+  Sources (read from clones, 2026-10-07): Ceph-CSI `internal/rbd/group_controllerserver.go:322-366`
+  (never reads the request's `snapshot_ids`) and `internal/rbd/group/group_snapshot.go:52-116`
+  (resolves every journal member, any failure fails the call); csi-driver-host-path
+  `pkg/hostpath/groupcontrollerserver.go:224-276` and `pkg/state/state.go:347-367`
+  (`MatchesSnapshotIDs`: sorted set comparison, any difference is `INVALID_ARGUMENT`). The
+  spec says an SP that can detect a mismatch SHOULD return `INVALID_ARGUMENT`
+  (`spec.md:3096-3101`, error table `:3115`). We follow host-path's strict check; Ceph skips it.
+  Normal operation never mismatches (both lists come from our own create response); the
+  realistic cause is a hand-written pre-provisioned `VolumeGroupSnapshotContent`.
+- `DeleteVolumeGroupSnapshot` must be idempotent and delete the group and all member
+  snapshots (`spec.md:3036-3043`).
+- `DeleteSnapshot` for a group member: the spec says the CO SHALL NOT call it and
+  that the SP MAY refuse (`spec.md:2045-2048`). We refuse it at the RPC layer:
+  the controller looks up the `ZfsSnapshot` CR and, if `Spec.GroupSnapshotID` is set,
+  returns `INVALID_ARGUMENT` (the spec's error table row "Snapshot is part of a group",
+  `spec.md:2073`); a missing CR still returns OK. Deleting the CR directly (kubectl or
+  the group finalizer) is not blocked. The upstream external-snapshotter never issues
+  the RPC for members, so this only catches a non-conforming caller.
+
+### Create and Delete RPC contract (CSI layer, ADR-0040)
+
+`CreateVolumeGroupSnapshot` (error table `spec.md:3030-3034`; polling pattern of the
+standalone `CreateSnapshot`/`waitSnapshotReady`, `internal/csi/snapshot.go`):
+
+| Situation | Code |
+|---|---|
+| empty `name`, empty or duplicated `source_volume_ids` | `INVALID_ARGUMENT` |
+| a source volume has no `ZfsDataset` | `NOT_FOUND` (as standalone) |
+| source volumes span more than one pool | `FAILED_PRECONDITION`, nothing created (spec row "Cannot snapshot multiple volumes together") |
+| group exists, different pool or different set of source volumes | `ALREADY_EXISTS` (set comparison, order ignored) |
+| group exists and is `Terminating` | `ABORTED` |
+| group exists in `Error` or `Lost` | `INTERNAL` with the group's message (as standalone) |
+| not Ready before `CreateTimeout` | `DEADLINE_EXCEEDED` (sidecar retries) |
+| success | members in `Spec.Members` order via `snapshotMessage` with `group_snapshot_id` set; `creation_time` = `status.creationTime`; `ready_to_use` true |
+
+`DeleteVolumeGroupSnapshot`: `snapshot_ids` compared with `Spec.Members` as sets
+(`INVALID_ARGUMENT` on a mismatch), then delete the `ZfsGroupSnapshot` object; `NotFound` is
+OK; fire-and-forget like the standalone `DeleteSnapshot` (`snapshot.go:87`), the finalizer does
+the work. `FAILED_PRECONDITION` ("in use") is never returned: nothing blocks a delete here
+(promote handles dependents).
+
+`GroupControllerGetCapabilities` advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`;
+`Identity.GetPluginCapabilities` advertises `GROUP_CONTROLLER_SERVICE`.
+
+Out of scope for v1: pre-provisioned (static) group snapshots. `Create` leaves its CR in place
+on a timeout, exactly like standalone `CreateSnapshot`; if the user abandons the request
+before it ever succeeds, that CR is not cleaned up by the CO (not verified against the
+upstream sidecar; same behaviour class as standalone).
+
+### What upstream does on deletion (read from kubernetes-csi/external-snapshotter, 2026-10)
+
+- Common controller, on deleting a `VolumeGroupSnapshot`: waits while any member
+  `VolumeSnapshot` is used to restore a PVC; deletes the `VolumeGroupSnapshotContent`
+  (policy `Delete`); deletes every member `VolumeSnapshot` directly; then removes its
+  own finalizer. A member `VolumeSnapshot` cannot itself be deleted while its group
+  exists.
+- Sidecar: calls `DeleteVolumeGroupSnapshot` once with the group handle and the
+  snapshot IDs from `status.volumeSnapshotInfoList` (the list returned at create).
+  Member contents carry a group handle, so the sidecar does **not** call
+  `DeleteSnapshot` for them.
+
+### What Ceph-CSI does (read from ceph/ceph-csi, 2026-10)
+
+No Kubernetes parent object. It removes its temporary RBD group snapshot right after
+the child snapshots exist and keeps a journal record whose `VolumeMap` is the
+authoritative child list; delete loads that record, deletes the stored children, then
+deletes the record. The shared lesson: keep one authoritative member list and delete
+from it, rather than discovering children by a lookup.
+
+### Known limitation
+
+Between the atomic exec and the creation of the child CRs the raw snapshots exist
+without a `ZfsSnapshot` CR. Deleting a source PVC in that window passes the D3 check
+and the dataset cleanup can destroy those snapshots as unclaimed driver artifacts.
+The window is short and the result is a loud, safe failure (the group is never
+provisioned), so it is accepted. Not run on a cluster.
+
+### Consequences
+
+- The earlier text about a parent with no finalizer, `SetControllerReference`
+  cascade, a "Job"-style resource, `snapshotTakenAt`, and a child-deletion guard is
+  superseded.
+- ADR-0035's RPC-layer rejection of `DeleteSnapshot` for members stands (ADR-0039,
+  revised 2026-10-07): RPC-layer refusal with `INVALID_ARGUMENT`; only the CRD-layer
+  guard is dropped.
+- "Never re-take" for a group is the same rule as for standalone snapshots:
+  before `provisionedAt` a retry is harmless, after it nothing is created.
+
+---
+
+## ADR-0038 — `provisionedAt` freezes provisioning; Ready/Lost is observed but never acts (amends ADR-0034, ADR-0036, ADR-0037)
+
+**Status:** Accepted (rule decided 2026-10-07; code to follow, see TODO.md) · **Scope:** `ZfsDataset`, `ZfsSnapshot`, and the future `ZfsGroupSnapshot` · **Amends:** ADR-0034 (rebuild proposal, `creationTime` re-read), ADR-0036, ADR-0037 (`creationTime` re-read on a transition into Ready).
+
+### Context
+
+ADR-0034 and ADR-0037 established "never recreate once provisioned". They still
+left some reactions to a vanished primitive: `creationTime` was re-read whenever an
+object went back to Ready, and a proposal existed to rebuild a missing backing
+clone and `@restore-source` from the raw snapshot. Each of these needs a lookup of
+the underlying primitive (and a promote can relocate snapshots, so a fixed path can
+be wrong). Facts recorded once do not need a lookup.
+
+### Decision
+
+1. **`provisionedAt` has one general meaning:** the provisioning of this object has
+   finished. Once it is set, the reconciler creates nothing, recreates nothing,
+   rebuilds nothing, and re-reads no recorded fact (`creationTime`, group ID,
+   context, ...). They were recorded once, and that is final.
+2. **Changing the underlying ZFS primitives afterwards is not tolerated.** If a user
+   renames, destroys or replaces them, the inconsistency is theirs to resolve by
+   hand, including editing the recorded values if that matters to them. The driver
+   does not try to repair it.
+3. **Standalone snapshot:** a `@restore-source` that is missing after `provisionedAt`
+   is never taken again. The rebuild-from-raw idea is dropped.
+4. **`creationTime` is recorded once** when the object first becomes Ready. It is not
+   re-read on a later transition into Ready (this supersedes the rule in ADR-0037 and
+   the ADR-0034 amendment).
+5. **Ready/Lost is still observed on every reconcile** and affects only
+   `status.phase` and conditions. It never triggers a create, a rebuild, or a
+   re-read. Observation of a missing primitive may flip Ready to Lost and back.
+6. **Deletion is exempt.** Finalizer and delete paths always run, on provisioned
+   objects too. "Does nothing" applies to provisioning only.
+7. **Sources that go missing before `provisionedAt`** leave the object unfulfilled
+   (`Error`/not Ready) until the source returns, then it can complete. This is plain
+   eventual consistency, the same as a Pod that cannot be scheduled.
+
+### Consequences
+
+- The committed `reconcileSettled` still re-reads `creationTime` on a Lost to Ready
+  transition and checks a fixed path for `@restore-source`. Both need changing
+  (tracked in TODO.md). The fixed-path check can report a false `Lost` after a
+  promote relocates `@restore-source`; with this rule that is a status inaccuracy
+  only, because nothing acts on it. The cheap, correct way to locate the primitives
+  is in [FUTURE_OPTMIZATIONS.md](../FUTURE_OPTMIZATIONS.md) (follow `origin` pointers).
+- Per-object cost: no lookup of recorded facts, only the existence observation.
+
+---
+
 ## ADR-0037 — A `ZfsDataset` is created once; after it has been `Ready`, a missing dataset becomes `Lost` and is never silently recreated (supersedes ADR-0026)
 
-**Status:** Accepted and implemented (2026-09-29) · **Supersedes:** ADR-0026 · **Scope:** `internal/controller/zfsdataset_controller.go`, `api/v1alpha1` (dataset phase) · **Related:** ADR-0034 (same rule for snapshots), [runbooks.md](runbooks.md).
+**Status:** Accepted and implemented (2026-09-29) · **Supersedes:** ADR-0026 · **Scope:** `internal/controller/zfsdataset_controller.go`, `api/v1alpha1` (dataset phase) · **Related:** ADR-0034 (same rule for snapshots), [runbooks.md](runbooks.md). · **Amended by ADR-0038: `creationTime` is recorded once, not re-read on a later transition into Ready**
 
 ### Context
 
@@ -88,7 +352,7 @@ alongside ADR-0034:
 
 ## ADR-0036 — A `ZfsSnapshot`'s reported `creation_time` is read from the raw snapshot itself, not its later backing-clone self-snapshot
 
-**Status:** Accepted (implemented) · **Scope:** `internal/controller/zfssnapshot_controller.go` (`reconcileBackingClone`'s `snapshotCreationTime` call site) · **Related:** ADR-0005/ADR-0008 (snapshot lifecycle), `docs/volumegroupsnapshot-design.md`.
+**Status:** Accepted (implemented) · **Scope:** `internal/controller/zfssnapshot_controller.go` (`reconcileBackingClone`'s `snapshotCreationTime` call site) · **Related:** ADR-0005/ADR-0008 (snapshot lifecycle), `docs/volumegroupsnapshot-design.md`. · **Amended by ADR-0038: recorded once, never re-read**
 
 ### Context
 
@@ -97,7 +361,7 @@ reading the ZFS `creation` property off the backing clone's `@restore-source`
 self-snapshot, which is taken strictly *after* the raw origin snapshot, at
 whatever later reconcile actually gets around to materializing the backing
 clone. For a standalone `ZfsSnapshot` this reports a technically-wrong (later)
-instant as the snapshot's creation time. For a `ZfsVolumeGroupSnapshot`'s
+instant as the snapshot's creation time. For a `ZfsGroupSnapshot`'s
 members this was previously documented in `volumegroupsnapshot-design.md` as a
 "known, accepted cosmetic nuance," because each member's backing clone (and
 thus its own restore-source timestamp) is created independently, so members'
@@ -157,7 +421,7 @@ directly.
 
 ## ADR-0035 — The CSI spec's `group_snapshot_id` deletion rule is an RPC-level contract, not a Kubernetes-CRD-level one; the CRD-layer group-liveness guard is deferred
 
-**Status:** Accepted (design phase, not yet implemented) · **Scope:** `internal/controller/zfssnapshot_controller.go` (no change made by this ADR — this is a scope narrowing), `internal/csi/` (RPC-layer rejection only) · **Related:** `docs/volumegroupsnapshot-design.md`, `docs/lifecycle-protection-matrix.md` §5.12/§6.3.
+**Status:** Accepted (design phase, not yet implemented) · **Scope:** `internal/controller/zfssnapshot_controller.go` (no change made by this ADR — this is a scope narrowing), `internal/csi/` (RPC-layer rejection only) · **Related:** `docs/volumegroupsnapshot-design.md`, `docs/lifecycle-protection-matrix.md` §5.12/§6.3. · **Partly superseded by ADR-0039: the CRD-layer guard is dropped, not just deferred; the `DeleteSnapshot` RPC still refuses group members (INVALID_ARGUMENT)**
 
 ### Context
 
@@ -182,7 +446,7 @@ decision (`docs/lifecycle-protection-matrix.md` §5.12/§6.3;
 
 An earlier pass over the VolumeGroupSnapshot design mislabeled a proposed
 CRD-layer guard — `ZfsSnapshotReconciler.reconcileDelete` `Get()`s the parent
-`ZfsVolumeGroupSnapshot` and refuses to proceed if it still exists — as "spec
+`ZfsGroupSnapshot` and refuses to proceed if it still exists — as "spec
 conformance," presented alongside the RPC-layer rejection as if both were
 equally mandated. That was wrong; only the RPC-layer rejection is.
 
@@ -197,7 +461,7 @@ Implement **only** the RPC-layer rejection in v1:
   group's core same-instant guarantee (which is enforced entirely by the one
   atomic multi-name `zfs snapshot` exec at creation time; nothing about
   deletion ordering threatens it).
-- Adding it for exactly this one relation (`ZfsSnapshot` → `ZfsVolumeGroupSnapshot`)
+- Adding it for exactly this one relation (`ZfsSnapshot` → `ZfsGroupSnapshot`)
   while leaving every structurally identical relation elsewhere
   (`ZfsSnapshot` → `ZfsDataset`, `ZfsDataset` → `PersistentVolume`, ...)
   undefended creates an arbitrary asymmetry — the same "false sense of
@@ -227,7 +491,7 @@ Implement **only** the RPC-layer rejection in v1:
 - A direct `kubectl delete zfssnapshot <group-member>` proceeds and destroys
   its own primitives exactly like a standalone delete would (the ADR-0034
   ratchet still applies — that is a separate, unrelated concern), leaving the
-  parent `ZfsVolumeGroupSnapshot` referencing a child it no longer owns. This
+  parent `ZfsGroupSnapshot` referencing a child it no longer owns. This
   is accepted, and matches the shape of every other CRD trust-boundary gap
   already documented.
 
@@ -235,7 +499,7 @@ Implement **only** the RPC-layer rejection in v1:
 
 ## ADR-0034 — A `ZfsSnapshot` never re-creates its ZFS primitives once `Ready`; a vanished primitive becomes an observed `Lost` phase, not a silent recreate
 
-**Status:** Accepted (implemented; a Lost snapshot fails the CSI create wait) · **Scope:** `internal/controller/zfssnapshot_controller.go` (`Reconcile`, lines ~137-148), `api/v1alpha1/zfssnapshot_types.go` (new phase constant) · **Related:** ADR-0026 (contrast), `docs/volumegroupsnapshot-design.md`.
+**Status:** Accepted (implemented; a Lost snapshot fails the CSI create wait) · **Scope:** `internal/controller/zfssnapshot_controller.go` (`Reconcile`, lines ~137-148), `api/v1alpha1/zfssnapshot_types.go` (new phase constant) · **Related:** ADR-0026 (contrast), `docs/volumegroupsnapshot-design.md`. · **Amended by ADR-0038: no rebuild of `@restore-source` and no `creationTime` re-read after provisioning; Lost is observed only**
 
 ### Context
 
@@ -257,7 +521,7 @@ brand-new artifact at the *current* txg, under the same object identity, and
 (once the reconciler re-affirms `Ready`) the same apparent status. Any consumer
 that already trusts this snapshot as "data as of time T" — a restored PVC, a
 `VolumeSnapshotContent`, and above all a sibling `ZfsSnapshot` in the same
-`ZfsVolumeGroupSnapshot` whose entire value proposition depends on every
+`ZfsGroupSnapshot` whose entire value proposition depends on every
 member having been cut from the identical instant — is left trusting stale
 identity over silently-substituted content.
 
@@ -285,7 +549,7 @@ ratchet — the same shape as `SourceType`'s CEL immutability elsewhere in this
 CRD (D24), applied to reconciler behavior instead of a field.
 
 This applies identically, and even more critically, to the new
-`ZfsVolumeGroupSnapshot`'s own group-creation step (tracked under
+`ZfsGroupSnapshot`'s own group-creation step (tracked under
 `vgs-group-controller`): once the parent's `Status` shows the shared atomic
 `zfs snapshot` exec has succeeded once, the reconciler must never re-issue it —
 even for the subset of members whose raw snapshot has since vanished — because
