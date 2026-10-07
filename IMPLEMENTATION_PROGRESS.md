@@ -1,0 +1,62 @@
+# Implementation progress: group snapshots (ADR-0038 / 0039 / 0040 / 0041)
+
+Persistent progress file. Tick `[x]` only when the item is done **and** its tests pass.
+Details per item live in [TODO.md](TODO.md); decisions live in
+[docs/design-decisions.md](docs/design-decisions.md). Nothing here has been run on a real
+cluster or ZFS pool until the e2e phase is ticked.
+
+Rules for every item: run the targeted tests, run `go build ./...` and `go vet ./...`,
+commit once the item is done (one commit per item or small group), tick it here in the same commit.
+
+## Plan (order matters)
+
+1. Phase A: ADR-0038 freeze rule (existing code), so group children can rely on it.
+2. Phase B: ADR-0041 delete path (existing code), independent of the group feature.
+3. Phase C: `ZfsGroupSnapshot` feature (TODO.md checklist 1 to 9).
+4. Phase D: cleanup and open decisions.
+
+## Phase A: ADR-0038 (`provisionedAt` freezes everything)
+
+- [ ] A1. `zfsdataset_controller.go` `setStatusAt`: record `creationTime` once at the first Ready, never re-read.
+- [ ] A2. `zfssnapshot_controller.go` `reconcileSettled`: same; observes Ready/Lost only, never creates anything.
+- [ ] A3. Fix the false `Lost` for `<backing clone>@restore-source` after a promote (follow `origin` pointers, see FUTURE_OPTMIZATIONS.md).
+- [ ] A4. Update/add tests (no `creationTime` re-read on Lost to Ready; no recreate after `provisionedAt`; no false Lost after promote).
+
+## Phase B: ADR-0041 (volume delete looks only at ZFS)
+
+- [ ] B1. Remove `checkSnapshotDependents` (D3) and its call in the `ZfsDatasetReconciler` delete path.
+- [ ] B2. Remove `checkPendingCloneDependents` (D21) and its call (`promote.go`), with its tests.
+- [ ] B3. Remove the live-CR claim clause from `assertDriverSnapshot` (keep the name allow-list, D18).
+- [ ] B4. New round order in `detachAndCleanSnapshots`: allow-list check of all snapshots, destroy clone-free driver snapshots, then promote the clones of the rest.
+- [ ] B5. Verify a clone whose source vanished shows a clear `Error`, not a silent endless retry.
+- [ ] B6. Tests: clone-free `csi-snap-*` destroyed before promote; cloned snapshot promoted not destroyed; non-Ready/Error `ZfsSnapshot` no longer blocks delete; foreign snapshot still refused.
+- [ ] B7. Update comments citing D3/D21/claim check (`promote.go` ~70, 123-170, 350-373; `zfsdataset_controller.go` ~111).
+- [ ] B8. Update docs: `lifecycle-protection-matrix.md` (incl. §6.3), `csi-technical-reference.md` tables, `runbooks.md`, `redesign-strategy.md`.
+
+## Phase C: `ZfsGroupSnapshot` (ADR-0039, checklist in TODO.md)
+
+- [ ] C1. Variadic `ZFS.Snapshot(ctx, names ...string)`; all exist = no-op, some exist = distinct error; update fakes and call sites.
+- [ ] C2. `ZfsGroupSnapshot` CRD (cluster-scoped, finalizer, no ownerReference); regenerate CRD and deepcopy.
+- [ ] C3. `ZfsSnapshot.Spec.GroupSnapshotID` (immutable); child never runs `zfs snapshot` and fails loud (`phase=Error`) if raw snapshot/dataset is missing; `snapshotMessage` sets `group_snapshot_id`; `DeleteSnapshot` on a member = `INVALID_ARGUMENT` (missing CR = OK).
+- [ ] C4. `ZfsGroupSnapshotReconciler`: three-way raw check, one atomic exec, `creationTime` once, create children, `provisionedAt` once, derived status, finalizer (delete children, wait, destroy orphan raw snapshots before `provisionedAt`), Terminating creates nothing; extract `resolveDatasetPath`.
+- [ ] C5. `GroupControllerServer` (`internal/csi/groupcontroller.go`): Create/Delete/Get per ADR-0039 tables and error codes.
+- [ ] C6. Wiring: `GROUP_CONTROLLER_SERVICE` plugin capability, `GroupControllerGetCapabilities`, optional group server in `csi.Serve`, controller entrypoint only.
+- [ ] C7. Helm/RBAC, csi-snapshotter `--enable-volume-group-snapshots`, docs for the `groupsnapshot.storage.k8s.io` CRDs and flags, CRD install note.
+- [ ] C8. Unit tests per TODO.md item 8 (variadic exec, reconciler, child fail-loud, RPC tables).
+- [ ] C9. End-to-end per TODO.md item 9 (single exec with both datasets, restore both, clean delete, cross-pool `FAILED_PRECONDITION`, member restore after another member deleted).
+- [ ] C10. Verify Helm chart's csi-snapshotter version supports the group snapshot flag.
+- [ ] C11. Check upstream behavior when a group Create never succeeds (does it clean up the group CR?).
+
+## Phase D: cleanup and open decisions
+
+- [ ] D1. Remove the `provisionedAt` migration fallback after verifying all objects (TODO.md).
+- [ ] D2. Remove the legacy `mode` parameter (`cleanup-remove-legacy-mode-param`).
+- [ ] D3. Decide: act on a `provisionedAt` vs `creationTime` mismatch.
+- [ ] D4. Decide: adoption of an already-existing dataset.
+- [ ] D5. Optional: record `createtxg` and `snapshotTakenAt` on group snapshots.
+
+## Log
+
+| Date | Item | Commit | Note |
+|------|------|--------|------|
+| 2026-10-08 | design docs | `96efe13` and earlier | all ADRs written, no code yet |

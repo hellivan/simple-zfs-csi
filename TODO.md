@@ -1,5 +1,7 @@
 # TODO
 
+> Progress tracking for the group snapshot work: [IMPLEMENTATION_PROGRESS.md](IMPLEMENTATION_PROGRESS.md).
+
 ## Implement ADR-0038 in the existing code (decided 2026-10-07, not yet done)
 
 `provisionedAt` now means "provisioning finished; nothing is created, rebuilt or
