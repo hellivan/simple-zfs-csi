@@ -85,6 +85,23 @@ Order: 1 -> 9. Each item lists what must be true when it is done.
    `FAILED_PRECONDITION`, deleting one member `VolumeSnapshot` is blocked by upstream while the
    group exists, a member restore still works after another member is deleted.
 
+## Delete path: drop unclaimed, clone-free snapshots before promoting (small, optional)
+
+`detachAndCleanSnapshots` (`internal/controller/promote.go`) promotes clones first and
+destroys leftover driver snapshots only when nothing is cloned any more. A raw
+`csi-snap-*` snapshot with no live `ZfsSnapshot` CR (for example a group snapshot between
+the atomic exec and the child CRs) can therefore be relocated by a promote onto another
+snapshot's backing clone, where nobody finds it, instead of being destroyed on the source.
+
+Change: in each round, first destroy every snapshot of the dataset that (a) has no clones,
+(b) passes `assertDriverSnapshot` (name allow-list, and no live `ZfsSnapshot` with that
+`Spec.SnapshotName` that is not being deleted), then promote the clones of what remains.
+
+- Never touch a snapshot with clones (it needs the promote) or one a live CR claims.
+- Only affects the rare window above; the group still never provisions (loud failure).
+- Edits the delicate delete path (D11/D18/D22): needs tests for an unclaimed clone-free
+  snapshot (destroyed before the promote), a claimed one (kept), a cloned one (kept).
+
 ## Remove the `provisionedAt` migration fallback
 
 `status.provisionedAt` (ADR-0034 snapshots, ADR-0037 datasets) is the single
