@@ -14,6 +14,7 @@ commit once the item is done (one commit per item or small group), tick it here 
 2. Phase B: ADR-0041 delete path (existing code), independent of the group feature.
 3. Phase C: `ZfsGroupSnapshot` feature (TODO.md checklist 1 to 9).
 4. Phase D: cleanup and open decisions.
+5. Phase E: `FindSnapshot` optimization (E2 together with A3; E3 with C3/C4).
 
 ## Phase A: ADR-0038 (`provisionedAt` freezes everything)
 
@@ -54,6 +55,18 @@ commit once the item is done (one commit per item or small group), tick it here 
 - [ ] D3. Decide: act on a `provisionedAt` vs `creationTime` mismatch.
 - [ ] D4. Decide: adoption of an already-existing dataset.
 - [ ] D5. Optional: record `createtxg` and `snapshotTakenAt` on group snapshots.
+
+## Phase E: `FindSnapshot` optimization (details: [FUTURE_OPTMIZATIONS.md](FUTURE_OPTMIZATIONS.md))
+
+Today `FindSnapshot` runs `zfs list -t snapshot -r <pool>` and suffix-matches; it follows no `origin` pointers.
+Callers: `reconcileSettled` (every ~30s per object, observation only) and `reconcileDelete`.
+
+- [ ] E1. Narrow the listing to `-r <pool>/<prefix>` (one-line change, already blessed by ADR-0028).
+- [ ] E2. Follow `origin` pointers (backing clone `origin` -> raw snapshot; promoted clone: `<clone>@<raw>`); pool scan only as fallback. This is also the A3 fix, so do A3 and E2 together.
+- [ ] E3. Group children adopt the raw snapshot at the recorded path via direct `zfs get`; `FindSnapshot` only on a miss (needed by C3/C4).
+- [ ] E4. Optional: one snapshot scan per pool per cycle shared by all objects.
+- [ ] E5. Optional: user-property tag on snapshots (verify it moves with a promote first).
+- [ ] E6. Decide: drop or slow down the periodic settled check (leaning: drop; FUTURE_OPTMIZATIONS.md item 5).
 
 ## Log
 
