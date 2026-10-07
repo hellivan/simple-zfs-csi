@@ -13,7 +13,7 @@ in [runbooks.md](runbooks.md).
 
 ## ADR-0041 — Volume deletion looks only at ZFS: drop D3 (wait for in-flight snapshots) and the CR-claim check; destroy clone-free driver snapshots before promoting
 
-**Status:** Accepted (decided 2026-10-08; code to follow, see TODO.md) · **Scope:** `internal/controller/promote.go` (`checkSnapshotDependents`, `detachAndCleanSnapshots`, `assertDriverSnapshot`), `ZfsDatasetReconciler` delete path · **Amends:** D3 in `snapshot-lifecycle-redesign.md` · **Related:** ADR-0038, ADR-0039, ADR-0040.
+**Status:** Accepted (decided 2026-10-08; code to follow, see TODO.md) · **Scope:** `internal/controller/promote.go` (`checkSnapshotDependents`, `checkPendingCloneDependents`, `detachAndCleanSnapshots`, `assertDriverSnapshot`), `ZfsDatasetReconciler` delete path · **Amends:** D3 and D21 in `snapshot-lifecycle-redesign.md` · **Related:** ADR-0038, ADR-0039, ADR-0040.
 
 ### Context
 
@@ -26,6 +26,12 @@ any driver-driven sequence. Both read CR state inside the ZFS delete path. Meanw
 can relocate an unclaimed raw snapshot (for example a group snapshot between the atomic exec
 and the child CRs) onto another snapshot's backing clone, where nothing finds it.
 
+### Principle
+
+A snapshot, a restore (clone PVC) or a group snapshot is complete only when it is Ready.
+Until then nobody can rely on it, so deleting its source before that is the user's choice
+and risk (ADR-0040). The volume delete does not wait for work that is not finished.
+
 ### Decision
 
 1. **Drop D3.** A volume delete never waits for snapshot CRs. ZFS is the failsafe: a snapshot
@@ -37,15 +43,19 @@ and the child CRs) onto another snapshot's backing clone, where nothing finds it
    clone that does not own it.
 4. A `ZfsSnapshot` or `ZfsGroupSnapshot` whose raw snapshot or source dataset vanished mid-way
    fails loudly (`phase=Error`, clear message) and is never re-taken (ADR-0038, ADR-0039).
-5. D21 (`checkPendingCloneDependents`, a restore whose clone has not run yet) is a different
-   case and is unchanged by this ADR.
+5. **Drop D21 too** (`checkPendingCloneDependents`: block while a `ZfsDataset` declares this
+   volume as its source but its own dataset does not exist yet). It is the same situation as
+   D3 for a restore or direct clone and follows from the same principle. A pending restore
+   whose source is destroyed fails loudly ("source not found"). A pending restore of a snapshot
+   can be retried; a pending direct PVC clone cannot, because its source data is gone. Accepted.
 
 ### Consequences
 
 - Deleting a PVC while its snapshot is still being taken loses that snapshot; the user sees a
   loud `Error` and retries. Accepted: the user owns it (ADR-0040).
 - No stuck source deletes caused by `Error` snapshots.
-- The volume delete reads ZFS state only, apart from `assertKnownDatasets` and D21.
+- The volume delete reads ZFS state only, apart from `assertKnownDatasets` (which lists CRs
+  only to recognise datasets the driver owns, not to block).
 - The "known limitation" in ADR-0039 gets a simpler outcome: the raw group snapshot is destroyed
   on the source in both orderings of standalone snapshots.
 
