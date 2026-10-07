@@ -85,22 +85,17 @@ Order: 1 -> 9. Each item lists what must be true when it is done.
    `FAILED_PRECONDITION`, deleting one member `VolumeSnapshot` is blocked by upstream while the
    group exists, a member restore still works after another member is deleted.
 
-## Delete path: drop unclaimed, clone-free snapshots before promoting (small, optional)
+## Implement ADR-0041: the volume delete looks only at ZFS
 
-`detachAndCleanSnapshots` (`internal/controller/promote.go`) promotes clones first and
-destroys leftover driver snapshots only when nothing is cloned any more. A raw
-`csi-snap-*` snapshot with no live `ZfsSnapshot` CR (for example a group snapshot between
-the atomic exec and the child CRs) can therefore be relocated by a promote onto another
-snapshot's backing clone, where nobody finds it, instead of being destroyed on the source.
-
-Change: in each round, first destroy every snapshot of the dataset that (a) has no clones,
-(b) passes `assertDriverSnapshot` (name allow-list, and no live `ZfsSnapshot` with that
-`Spec.SnapshotName` that is not being deleted), then promote the clones of what remains.
-
-- Never touch a snapshot with clones (it needs the promote) or one a live CR claims.
-- Only affects the rare window above; the group still never provisions (loud failure).
-- Edits the delicate delete path (D11/D18/D22): needs tests for an unclaimed clone-free
-  snapshot (destroyed before the promote), a claimed one (kept), a cloned one (kept).
+- Remove `checkSnapshotDependents` (D3) and its call in the `ZfsDatasetReconciler` delete path.
+- Remove the live-CR clause from `assertDriverSnapshot` (keep the name allow-list, D18).
+- In `detachAndCleanSnapshots`, each round: first destroy every driver-named snapshot with
+  no clones (still passing the allow-list), then promote the clones of what remains.
+- Tests: clone-free `csi-snap-*` destroyed before the promote; cloned snapshot promoted, not
+  destroyed; snapshot of a non-Ready or `Error` `ZfsSnapshot` no longer blocks the volume delete;
+  foreign snapshot still refused. Update docs that cite D3 (`snapshot-lifecycle-redesign.md` is
+  historical; update `lifecycle-protection-matrix.md` and `runbooks.md` if they describe the wait).
+- Keep D21 (`checkPendingCloneDependents`) unchanged.
 
 ## Remove the `provisionedAt` migration fallback
 
