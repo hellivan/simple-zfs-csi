@@ -18,10 +18,10 @@ commit once the item is done (one commit per item or small group), tick it here 
 
 ## Phase A: ADR-0038 (`provisionedAt` freezes everything)
 
-- [ ] A1. `zfsdataset_controller.go` `setStatusAt`: record `creationTime` once at the first Ready, never re-read.
-- [ ] A2. `zfssnapshot_controller.go` `reconcileSettled`: same; observes Ready/Lost only, never creates anything.
-- [ ] A3. Fix the false `Lost` for `<backing clone>@restore-source` after a promote (follow `origin` pointers, see FUTURE_OPTMIZATIONS.md).
-- [ ] A4. Update/add tests (no `creationTime` re-read on Lost to Ready; no recreate after `provisionedAt`; no false Lost after promote).
+- [x] A1. `zfsdataset_controller.go` `setStatusAt`: record `creationTime` once at the first Ready, never re-read.
+- [x] A2. `zfssnapshot_controller.go` `reconcileSettled`: same; observes Ready/Lost only, never creates anything.
+- [x] A3. Fix the false `Lost` for `<backing clone>@restore-source` after a promote (follow `origin` pointers, see FUTURE_OPTMIZATIONS.md).
+- [x] A4. Update/add tests (no `creationTime` re-read on Lost to Ready; no recreate after `provisionedAt`; no false Lost after promote).
 
 ## Phase B: ADR-0041 (volume delete looks only at ZFS)
 
@@ -84,3 +84,4 @@ changes and each controller re-reconciles every object (56 attach requests, 91 d
 | Date | Item | Commit | Note |
 |------|------|--------|------|
 | 2026-10-08 | design docs | `96efe13` and earlier | all ADRs written, no code yet |
+| 2026-10-08 | A1-A4 | (this commit) | creationTime recorded once; restore-source located via origin (A3 done; E2 only for FindSnapshot remains) |

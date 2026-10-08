@@ -203,11 +203,10 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			"PathDeriveFailed", err.Error())
 	}
 
-	// The ZFS creation time is read only on a transition into Ready (from
-	// Pending, Error or Lost) or when it was never recorded, not on every
-	// reconcile: reconciles run about every 30s per object (pool status churn).
+	// The ZFS creation time is recorded once, at the first Ready, and never
+	// re-read (ADR-0038).
 	var creation *metav1.Time
-	if vol.Status.Phase != storagev1alpha1.DatasetPhaseReady || vol.Status.CreationTime == nil {
+	if vol.Status.CreationTime == nil {
 		creation = snapshotCreationTime(ctx, r.ZFS, full)
 	}
 	return ctrl.Result{}, r.setStatusAt(ctx, &vol, storagev1alpha1.DatasetPhaseReady, volPath,

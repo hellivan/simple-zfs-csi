@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -694,5 +695,51 @@ func TestZfsSnapshotReconcile_LegacyReadyIsBackfilled(t *testing.T) {
 	}
 	if got.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
 		t.Errorf("phase = %q, want Ready", got.Status.Phase)
+	}
+}
+
+// Promoting a restored PVC moves @restore-source onto it and makes the backing
+// clone its clone: the snapshot must stay Ready, not become Lost (ADR-0038).
+func TestZfsSnapshotReconcile_RelocatedRestoreSourceIsNotLost(t *testing.T) {
+	c, r, z := settledSnapshotFixture(t, storagev1alpha1.SnapshotPhaseReady)
+	z.existing["tank/k8s/csi-snap-1"] = true
+	z.existing["tank/k8s/pvc-2@restore-source"] = true
+	z.origin["tank/k8s/csi-snap-1"] = "tank/k8s/pvc-2@restore-source"
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	var got storagev1alpha1.ZfsSnapshot
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
+		t.Errorf("phase = %q, want Ready (restore source relocated, not lost)", got.Status.Phase)
+	}
+}
+
+// A Lost snapshot that returns to Ready keeps its recorded creationTime.
+func TestZfsSnapshotReconcile_RecoveryKeepsCreationTime(t *testing.T) {
+	c, r, z := settledSnapshotFixture(t, storagev1alpha1.SnapshotPhaseLost)
+	var cur storagev1alpha1.ZfsSnapshot
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &cur); err != nil {
+		t.Fatal(err)
+	}
+	first := metav1.NewTime(time.Unix(1500000000, 0).UTC())
+	cur.Status.CreationTime = &first
+	if err := c.Status().Update(context.Background(), &cur); err != nil {
+		t.Fatal(err)
+	}
+	z.existing["tank/k8s/csi-snap-1@restore-source"] = true
+	z.existing["tank/k8s/pvc-1@csi-snap-1"] = true
+	z.props["tank/k8s/pvc-1@csi-snap-1"] = map[string]string{"creation": "1600000000"}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	var got storagev1alpha1.ZfsSnapshot
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != storagev1alpha1.SnapshotPhaseReady || got.Status.CreationTime.Unix() != 1500000000 {
+		t.Errorf("phase = %q creationTime = %v, want Ready and unchanged 1500000000", got.Status.Phase, got.Status.CreationTime)
 	}
 }

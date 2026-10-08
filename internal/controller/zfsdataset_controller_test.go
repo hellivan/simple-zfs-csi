@@ -1465,7 +1465,7 @@ func TestZfsDatasetReconcile_ProvisionedAtIsWriteOnce(t *testing.T) {
 		t.Errorf("creationTime = %v, must not be refreshed while staying Ready", st.CreationTime)
 	}
 
-	// Going through Error and back to Ready re-reads it; provisionedAt stays.
+	// Going through Error and back to Ready re-reads nothing (ADR-0038).
 	var cur storagev1alpha1.ZfsDataset
 	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &cur); err != nil {
 		t.Fatal(err)
@@ -1481,8 +1481,8 @@ func TestZfsDatasetReconcile_ProvisionedAtIsWriteOnce(t *testing.T) {
 	if st.ProvisionedAt == nil || !st.ProvisionedAt.Equal(first) {
 		t.Errorf("provisionedAt changed to %v, want it untouched at %v", st.ProvisionedAt, first)
 	}
-	if st.CreationTime == nil || st.CreationTime.Unix() != 1800000000 {
-		t.Errorf("creationTime = %v, want 1800000000 re-read on the transition into Ready", st.CreationTime)
+	if st.CreationTime == nil || st.CreationTime.Unix() == 1800000000 {
+		t.Errorf("creationTime = %v, must stay as first recorded across Error and back to Ready", st.CreationTime)
 	}
 }
 

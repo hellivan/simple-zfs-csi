@@ -288,7 +288,7 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 // the same identity — and, for a group member, silently break the guarantee
 // that every member was cut at the same time. So this only observes and records
 // (ADR-0034): it never creates anything. Missing on disk means Lost; present
-// again means Ready, with the creation time re-read from the snapshot.
+// again means Ready. The recorded creation time is kept (ADR-0038).
 //
 // Only the backing clone's @restore-source is checked: it is what restores
 // use, and it keeps the raw snapshot alive as its origin.
@@ -302,7 +302,7 @@ func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *stor
 	}
 	restoreSourceFull := backingFull + "@" + restoreSourceSnapshotName
 
-	present, err := r.exists(ctx, restoreSourceFull)
+	present, err := r.restoreSourcePresent(ctx, backingFull)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -311,11 +311,14 @@ func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *stor
 		return ctrl.Result{}, nil
 	case present:
 		logger.Info("lost snapshot's restore source is back", "snapshot", restoreSourceFull)
-		// The raw snapshot may have been relocated by a promote; if it cannot be
-		// found the recorded creation time is kept rather than guessing.
+		// creationTime is recorded once (ADR-0038) and never re-read. Only an
+		// object that never recorded one (legacy) reads it now, from the raw
+		// snapshot wherever a promote left it.
 		var creation *metav1.Time
-		if raw, err := r.ZFS.FindSnapshot(ctx, pool.Status.PoolName, snap.Spec.SnapshotName); err == nil && raw != "" {
-			creation = snapshotCreationTime(ctx, r.ZFS, raw)
+		if snap.Status.CreationTime == nil {
+			if raw, err := r.ZFS.FindSnapshot(ctx, pool.Status.PoolName, snap.Spec.SnapshotName); err == nil && raw != "" {
+				creation = snapshotCreationTime(ctx, r.ZFS, raw)
+			}
 		}
 		message := fmt.Sprintf("restore source %s is present again", restoreSourceFull)
 		if snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady {
@@ -338,6 +341,26 @@ func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *stor
 // lostRecheckInterval is how often a Lost snapshot is re-observed, so a
 // primitive that comes back (e.g. a dataset moved back) is noticed.
 const lostRecheckInterval = time.Minute
+
+// restoreSourcePresent reports whether the backing clone's @restore-source
+// still exists, wherever a promote left it. Promoting a restored PVC moves
+// @restore-source onto that PVC and makes the backing clone a clone of it, so
+// the fixed path alone would report a false Lost. ZFS keeps the backing
+// clone's `origin` pointing at the relocated snapshot, so follow it.
+func (r *ZfsSnapshotReconciler) restoreSourcePresent(ctx context.Context, backingFull string) (bool, error) {
+	ok, err := r.exists(ctx, backingFull+"@"+restoreSourceSnapshotName)
+	if err != nil || ok {
+		return ok, err
+	}
+	origin, err := r.ZFS.Get(ctx, backingFull, "origin")
+	if err != nil {
+		if errors.Is(err, zpool.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.HasSuffix(strings.TrimSpace(origin), "@"+restoreSourceSnapshotName), nil
+}
 
 func (r *ZfsSnapshotReconciler) exists(ctx context.Context, name string) (bool, error) {
 	if _, err := r.ZFS.Get(ctx, name, "type"); err != nil {

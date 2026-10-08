@@ -2,20 +2,7 @@
 
 > Progress tracking for the group snapshot work: [IMPLEMENTATION_PROGRESS.md](IMPLEMENTATION_PROGRESS.md).
 
-## Implement ADR-0038 in the existing code (decided 2026-10-07, not yet done)
-
-`provisionedAt` now means "provisioning finished; nothing is created, rebuilt or
-re-read afterwards". The committed code still does a few things the rule drops:
-
-- `zfsdataset_controller.go` `setStatusAt`: stop re-reading `creationTime` on a
-  transition into Ready; record it once when the object first becomes Ready.
-- `zfssnapshot_controller.go` `reconcileSettled`: same, and make sure it never
-  creates anything. It keeps observing Ready/Lost (status only).
-- The fixed-path check of `<backing clone>@restore-source` can report a false `Lost`
-  after a promote relocates it (the restored PVC's promote takes `@restore-source`
-  and older snapshots). With ADR-0038 this is only a status inaccuracy. Fix it by
-  following `origin` pointers, see [FUTURE_OPTMIZATIONS.md](FUTURE_OPTMIZATIONS.md).
-- Update tests that cover the Lost to Ready `creationTime` re-read.
+## Implement ADR-0038 in the existing code: DONE (see IMPLEMENTATION_PROGRESS.md Phase A)
 
 ## Implement `ZfsGroupSnapshot` (ADR-0039)
 
