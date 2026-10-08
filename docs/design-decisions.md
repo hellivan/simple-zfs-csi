@@ -187,6 +187,30 @@ CRs, so every one of those was our own choice. This ADR records the final one.
   list and no placeholder. `NOT_FOUND` only once the group object is gone. The
   `ZfsGroupSnapshot` CR still shows the true state.
 
+  **Group provisioning flow and what Get answers at each step** (agent, `provision` in
+  `zfsgroupsnapshot_controller.go`; Get in `groupcontroller.go`):
+
+  1. `Create` RPC makes the `ZfsGroupSnapshot` (members fixed, `status` empty). Get: `ABORTED`
+     (`creationTime` is unset: "has not been taken yet").
+  2. The agent runs ONE atomic `zfs snapshot` for all members' raw snapshots (same txg).
+     Nothing is visible in Kubernetes yet. Get: `ABORTED`.
+  3. The agent writes `status.creationTime` (read once from the first raw snapshot). Get:
+     passes the `creationTime` check but the member `ZfsSnapshot`s do not exist yet, and
+     `provisionedAt` is unset: `ABORTED` ("still being provisioned"). This is the short window
+     in which an earlier version wrongly answered `FAILED_PRECONDITION` "member no longer
+     exists".
+  4. The agent creates the member `ZfsSnapshot`s (`ensureChildren`; each adopts its raw
+     snapshot and builds its backing clone). Get: members that exist are listed; a member not
+     created yet still gives `ABORTED`; `ready_to_use` is false until all members are ready.
+  5. All members Ready: the group becomes Ready and `provisionedAt` is stamped once. Get: full
+     group, `ready_to_use` true.
+  6. From `provisionedAt` on the group is frozen: nothing is created again. A member that
+     vanishes now is really lost: Get returns `FAILED_PRECONDITION` naming it (the group goes
+     `Lost`).
+
+  The only discriminator between "not created yet" (`ABORTED`, retry) and "lost"
+  (`FAILED_PRECONDITION`) is `status.provisionedAt`. `Create` is unaffected: it waits for Ready.
+
   **Get decision table** (request `snapshot_ids` vs `Spec.Members`, then members vs live
   children; compared as sets, order ignored):
 
@@ -196,7 +220,8 @@ CRs, so every one of those was our own choice. This ADR records the final one.
   | `snapshot_ids` shorter than members | request ignored | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
   | `snapshot_ids` longer than members | request ignored | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
   | same length, different IDs | request ignored | `INVALID_ARGUMENT` | `INVALID_ARGUMENT` |
-  | IDs match but a member's CR is gone | whole call fails (`Internal`/`Aborted`) | lookup error returned | `FAILED_PRECONDITION` naming the member |
+  | IDs match but a member's CR is gone, group not yet `provisionedAt` | whole call fails (`Internal`/`Aborted`) | lookup error returned | `ABORTED` ("still being provisioned"; retry) |
+  | IDs match but a member's CR is gone, group has `provisionedAt` | whole call fails (`Internal`/`Aborted`) | lookup error returned | `FAILED_PRECONDITION` naming the member |
   | group object gone | `NOT_FOUND` | `NOT_FOUND` | `NOT_FOUND` |
 
   Sources (read from clones, 2026-10-07): Ceph-CSI `internal/rbd/group_controllerserver.go:322-366`

@@ -165,7 +165,15 @@ func TestGetGroup_DecisionTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = gs.GetVolumeGroupSnapshot(ctx, &csi.GetVolumeGroupSnapshotRequest{GroupSnapshotId: "g", SnapshotIds: ids})
-	wantCode(t, err, codes.FailedPrecondition) // member gone
+	wantCode(t, err, codes.Aborted) // taken, members not created yet: still provisioning
+
+	_ = cl.Get(ctx, client.ObjectKey{Name: "g"}, g)
+	g.Status.ProvisionedAt = &now
+	if err := cl.Status().Update(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	_, err = gs.GetVolumeGroupSnapshot(ctx, &csi.GetVolumeGroupSnapshotRequest{GroupSnapshotId: "g", SnapshotIds: ids})
+	wantCode(t, err, codes.FailedPrecondition) // frozen group, member gone: really lost
 }
 
 func TestDeleteSnapshot_RefusesGroupMember(t *testing.T) {

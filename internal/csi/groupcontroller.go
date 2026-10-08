@@ -251,6 +251,13 @@ func (g *GroupControllerServer) groupMessage(ctx context.Context, grp *storagev1
 		child := &storagev1alpha1.ZfsSnapshot{}
 		if err := g.Client.Get(ctx, client.ObjectKey{Name: m.ChildSnapshotName}, child); err != nil {
 			if apierrors.IsNotFound(err) {
+				// Before provisionedAt the agent is still creating the members one after
+				// the other (creationTime is written first): the member is not lost, it
+				// does not exist yet.
+				if grp.Status.ProvisionedAt == nil {
+					return nil, status.Errorf(codes.Aborted,
+						"group snapshot %q is still being provisioned: member snapshot %q (source volume %q) has not been created yet", grp.Name, m.ChildSnapshotName, m.SourceVolume)
+				}
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"member snapshot %q (source volume %q) of group snapshot %q no longer exists", m.ChildSnapshotName, m.SourceVolume, grp.Name)
 			}
