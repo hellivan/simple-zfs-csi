@@ -942,9 +942,11 @@ func TestZfsDatasetReconcile_DeleteDestroysAndReleases(t *testing.T) {
 	}
 }
 
-// TestZfsDatasetReconcile_DeleteBlocksOnPendingSnapshot verifies D3: a volume
-// with an in-flight (not yet Ready) dependent snapshot must not be destroyed.
-func TestZfsDatasetReconcile_DeleteBlocksOnPendingSnapshot(t *testing.T) {
+// TestZfsDatasetReconcile_DeleteIgnoresPendingSnapshot verifies ADR-0041: a
+// snapshot that is not Ready is the user's risk, so the volume delete does not
+// wait for it. Its raw snapshot has no clone, so it is destroyed with the volume
+// and the ZfsSnapshot fails loudly on its own.
+func TestZfsDatasetReconcile_DeleteIgnoresPendingSnapshot(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
 	vol := &storagev1alpha1.ZfsDataset{
@@ -966,24 +968,23 @@ func TestZfsDatasetReconcile_DeleteBlocksOnPendingSnapshot(t *testing.T) {
 		Build()
 
 	z := newFakeZFS("tank/k8s/pvc-1")
+	z.seedSnapshot("tank/k8s/pvc-1", "csi-snap-x")
 	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}})
-	if err == nil {
-		t.Fatal("expected reconcile to block/error while a dependent snapshot is still in-flight")
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
-	if len(z.destroyed) != 0 {
-		t.Fatalf("volume should not be destroyed while a dependent snapshot is in-flight, got %v", z.destroyed)
+	want := []string{"tank/k8s/pvc-1@csi-snap-x", "tank/k8s/pvc-1"}
+	if !reflect.DeepEqual(z.destroyed, want) {
+		t.Fatalf("destroyed = %v, want %v", z.destroyed, want)
 	}
 }
 
-// TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader pins ADR-0023: the
-// delete-path gates must never be satisfied by a lagging informer. The
-// ZfsSnapshot that blocks this destroy is authored by the CSI controller (a
-// different process, using an uncached client) and is a different kind than the
-// ZfsDataset that triggered the reconcile, so no watch ordering relates the two
-// — modelled here by a cached client that cannot see the snapshot and an
-// APIReader that can. Reading the gate from the cache would fail *open* and
-// destroy the source of an in-flight snapshot.
+// TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader pins ADR-0023 for
+// what is left of the delete-path gates: whether a clone is a driver backing
+// clone (and so may be promoted) must never be decided by a lagging informer.
+// The ZfsSnapshot is authored by the CSI controller through an uncached client —
+// modelled here by a cached client that cannot see it and an APIReader that
+// can. Reading it from the cache would fail closed and refuse a valid delete.
 func TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
@@ -997,10 +998,8 @@ func TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader(t *testing.T) {
 			PoolGUID: "999", Dataset: "k8s/pvc-1", SnapshotName: "csi-snap-x",
 			SourceVolume: "pvc-1",
 		},
-		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhasePending},
+		Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 	}
-
-	// The informer has not delivered the snapshot yet; the API server has it.
 	cached := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(onlinePool(), vol).
@@ -1013,13 +1012,13 @@ func TestZfsDatasetReconcile_DeleteGateReadsThroughAPIReader(t *testing.T) {
 		Build()
 
 	z := newFakeZFS("tank/k8s/pvc-1")
+	z.seedClone("tank/k8s/pvc-1", "csi-snap-x", "tank/k8s/csi-snap-x")
 	r := &ZfsDatasetReconciler{Client: cached, Scheme: scheme, NodeName: "node-a", ZFS: z, APIReader: api}
-	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}})
-	if err == nil {
-		t.Fatal("expected the destroy to block on the snapshot the API server can see")
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
-	if len(z.destroyed) != 0 {
-		t.Fatalf("volume must not be destroyed on the strength of a stale cache, got %v", z.destroyed)
+	if !reflect.DeepEqual(z.promoted, []string{"tank/k8s/csi-snap-x"}) {
+		t.Fatalf("promoted = %v, want the backing clone recognised through the API reader", z.promoted)
 	}
 }
 
@@ -1185,10 +1184,11 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 	if o, want := z.origin["tank/k8s/pvc-r2"], "tank/k8s/pvc-r1@"+restoreSourceSnapshotName; o != want {
 		t.Errorf("pvc-r2 origin = %q, want %q (sibling re-parented onto pvc-r1)", o, want)
 	}
-	// Both of the backing clone's snapshots relocated onto pvc-r1, so it owns no
-	// snapshots by the time destroy runs and no artifact cleanup is needed.
-	if !reflect.DeepEqual(z.destroyed, []string{"tank/k8s/csi-snap-x"}) {
-		t.Fatalf("destroyed = %v, want exactly [tank/k8s/csi-snap-x]", z.destroyed)
+	// The raw snapshot has no clone, so it is destroyed first (ADR-0041); the
+	// promote then relocates @restore-source onto pvc-r1, leaving the backing
+	// clone with no snapshots when it is destroyed.
+	if !reflect.DeepEqual(z.destroyed, []string{"tank/k8s/csi-snap-x@csi-snap-x", "tank/k8s/csi-snap-x"}) {
+		t.Fatalf("destroyed = %v, want the raw snapshot, then the backing clone", z.destroyed)
 	}
 
 	// Both restored PVCs survive and stay deletable in either order — that is
@@ -1277,11 +1277,11 @@ func TestZfsDatasetReconcile_DirectCloneRemainsDeletableAfterSourceDeleted(t *te
 	}
 }
 
-// TestZfsDatasetReconcile_DeleteBlocksOnUnprovisionedDependent verifies D21: a
-// restore whose ZfsDataset object exists but whose `zfs clone` has not run yet
-// is invisible in the ZFS clone graph, so the delete path must block on spec
-// rather than destroy the source out from under it.
-func TestZfsDatasetReconcile_DeleteBlocksOnUnprovisionedDependent(t *testing.T) {
+// TestZfsDatasetReconcile_DeleteDoesNotWaitForUnprovisionedClone verifies
+// ADR-0041 (D21 removed): a direct clone whose `zfs clone` has not run yet is
+// the user's risk. The source delete proceeds; the pending clone then fails
+// loudly because its source is gone.
+func TestZfsDatasetReconcile_DeleteDoesNotWaitForUnprovisionedClone(t *testing.T) {
 	scheme := newTestScheme(t)
 	now := metav1.Now()
 	src := &storagev1alpha1.ZfsDataset{
@@ -1301,16 +1301,13 @@ func TestZfsDatasetReconcile_DeleteBlocksOnUnprovisionedDependent(t *testing.T) 
 		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).
 		Build()
 
-	// Only the source exists on disk; pvc-clone has not been cloned yet.
 	z := newFakeZFS("tank/k8s/pvc-src")
-
 	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-src"}})
-	if err == nil {
-		t.Fatal("expected the delete to block while a declared dependent is not provisioned yet")
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-src"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
-	if len(z.destroyed) != 0 {
-		t.Fatalf("nothing should have been destroyed, got %v", z.destroyed)
+	if !reflect.DeepEqual(z.destroyed, []string{"tank/k8s/pvc-src"}) {
+		t.Fatalf("destroyed = %v, want the source destroyed without waiting", z.destroyed)
 	}
 }
 
@@ -1344,6 +1341,30 @@ func TestZfsDatasetReconcile_DeleteRefusesForeignSnapshot(t *testing.T) {
 	}
 	if len(z.destroyed) != 0 {
 		t.Fatalf("nothing should have been destroyed, got %v", z.destroyed)
+	}
+}
+
+// A foreign snapshot refuses the delete before any driver snapshot is destroyed
+// (ADR-0041: the allow-list check comes first).
+func TestZfsDatasetReconcile_DeleteChecksAllowListBeforeDestroyingAnything(t *testing.T) {
+	scheme := newTestScheme(t)
+	now := metav1.Now()
+	vol := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
+		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-1", Type: storagev1alpha1.DatasetTypeFilesystem},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(onlinePool(), vol).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}).Build()
+	z := newFakeZFS("tank/k8s/pvc-1")
+	z.seedSnapshot("tank/k8s/pvc-1", "csi-snap-x")
+	z.seedSnapshot("tank/k8s/pvc-1", "sanoid_daily")
+
+	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}); err == nil {
+		t.Fatal("expected the delete to refuse the foreign snapshot")
+	}
+	if len(z.destroyed) != 0 {
+		t.Fatalf("nothing may be destroyed before the allow-list passes, got %v", z.destroyed)
 	}
 }
 

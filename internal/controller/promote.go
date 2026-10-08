@@ -67,8 +67,7 @@ const maxDetachRounds = 100
 // dataset was put there from outside the driver, and the delete path refuses to
 // touch it rather than guessing. The "clone-" and "csi-snap-" arms match on
 // prefix rather than a fixed shape because both suffixes are reserved for the
-// driver by design (D1a); assertDriverSnapshot additionally refuses any
-// "csi-snap-" snapshot that a live ZfsSnapshot still claims.
+// driver by design (D1a).
 var driverSnapshotSuffix = regexp.MustCompile(`^(restore-source|clone-.+|csi-snap-.+)$`)
 
 // splitSnapshot splits a full ZFS snapshot name into its dataset and short
@@ -87,122 +86,28 @@ func datasetPathOf(poolName, full string) string {
 	return strings.Trim(strings.TrimPrefix(strings.TrimPrefix(full, poolName), "/"), "/")
 }
 
-// sourceDependsOn reports whether dep's clone source lives on the dataset at
-// datasetPath — either a snapshot of it (a restore, or a snapshot's backing
-// clone) or the dataset itself (direct PVC-to-PVC clone, ADR-0009).
-func sourceDependsOn(dep *storagev1alpha1.ZfsDataset, datasetPath string) bool {
-	src := dep.Spec.Source
-	if src == nil || datasetPath == "" {
-		return false
-	}
-	if src.Volume != "" && strings.Trim(src.Volume, "/") == datasetPath {
-		return true
-	}
-	if src.Snapshot != "" {
-		ds, _ := splitSnapshot(src.Snapshot)
-		return strings.Trim(ds, "/") == datasetPath
-	}
-	return false
-}
-
 // beforeDestroy prepares vol for a non-recursive `zfs destroy` (D11/D22).
 //
-// It first applies the policies ZFS cannot express — all reads of Kubernetes
-// *desired* state, never of derived bookkeeping — and then detaches whatever
-// ZFS actually reports as depending on vol.
+// It looks only at ZFS (ADR-0041): detach whatever ZFS reports as depending on
+// vol and destroy the driver snapshots nothing clones. A snapshot, restore or
+// group snapshot is complete only when it is Ready; deleting its source earlier
+// is the caller's responsibility, so nothing here waits for unfinished work.
 func (r *ZfsDatasetReconciler) beforeDestroy(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, full string) error {
-	if err := r.checkSnapshotDependents(ctx, vol); err != nil {
-		return err
-	}
-	if err := r.checkPendingCloneDependents(ctx, vol, poolName); err != nil {
-		return err
-	}
 	return detachAndCleanSnapshots(ctx, r.gateReader(), r.ZFS, vol.Spec.PoolGUID, poolName, full)
-}
-
-// checkSnapshotDependents implements D3/§3.2: a volume's deletion must block
-// while one of its snapshots is still being taken.
-//
-// A dependent ZfsSnapshot that is not Ready may not have its backing clone yet,
-// so there is nothing to promote away and destroying the volume now would take
-// the snapshot's only copy of the data with it. Once every dependent is Ready,
-// each owns a backing clone and detachAndCleanSnapshots can promote them all
-// away, so deletion proceeds.
-//
-// This used to have a second clause refusing outright while a live
-// integrated-mode snapshot existed. That mode was removed (§11): every snapshot
-// is now backed by its own clone, which puts us in the CSI spec's "supports
-// deleting a volume without affecting its existing snapshots" branch, so there
-// is no longer any case where a volume delete must be refused permanently.
-func (r *ZfsDatasetReconciler) checkSnapshotDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset) error {
-	var snaps storagev1alpha1.ZfsSnapshotList
-	if err := r.gateReader().List(ctx, &snaps); err != nil {
-		return err
-	}
-	for i := range snaps.Items {
-		snap := &snaps.Items[i]
-		if snap.Spec.SourceVolume != vol.Name || !snap.DeletionTimestamp.IsZero() {
-			continue
-		}
-		if snap.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
-			return fmt.Errorf("volume %q has snapshot %q still in phase %q; requeue", vol.Name, snap.Name, snap.Status.Phase)
-		}
-	}
-	return nil
-}
-
-// checkPendingCloneDependents implements D21: block while some ZfsDataset has
-// declared vol as its clone source but its own ZFS dataset does not exist yet.
-//
-// Such a dependent is invisible in the ZFS clone graph — the object is created
-// by the CSI controller before the agent runs `zfs clone` — so without this
-// check the detach below would find nothing, destroy vol, and leave the pending
-// restore permanently unable to complete. Spec is desired state, written once
-// at creation and never recomputed, so reading it here does not reintroduce the
-// mirror D17 removed.
-func (r *ZfsDatasetReconciler) checkPendingCloneDependents(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName string) error {
-	var list storagev1alpha1.ZfsDatasetList
-	if err := r.gateReader().List(ctx, &list); err != nil {
-		return err
-	}
-	for i := range list.Items {
-		dep := &list.Items[i]
-		if dep.Name == vol.Name || dep.Spec.PoolGUID != vol.Spec.PoolGUID || !dep.DeletionTimestamp.IsZero() {
-			continue
-		}
-		if !sourceDependsOn(dep, strings.Trim(vol.Spec.Dataset, "/")) {
-			continue
-		}
-		// A dependent that was provisioned once and is now missing is Lost, not
-		// pending: it will never be created, so there is nothing to wait for.
-		if datasetProvisioned(dep) {
-			continue
-		}
-		depFull, err := datasetName(poolName, dep.Spec.Dataset)
-		if err != nil {
-			return err
-		}
-		if _, err := r.ZFS.Get(ctx, depFull, "type"); err != nil {
-			if errors.Is(err, zpool.ErrNotExist) {
-				return fmt.Errorf("volume %q is the clone source of %q, which has not been provisioned yet; "+
-					"waiting for it before destroying (delete %q instead if it is stuck)", vol.Name, dep.Name, dep.Name)
-			}
-			return err
-		}
-	}
-	return nil
 }
 
 // detachAndCleanSnapshots leaves `full` with zero snapshots of its own, which
 // is exactly the precondition a non-recursive `zfs destroy` needs (D11/D22).
 //
 // Each round asks ZFS which snapshots `full` still owns and which datasets
-// clone them. If any snapshot is still cloned, that clone is promoted away —
-// which relocates the snapshot, and every snapshot older than it, onto the
-// clone — and the round restarts from freshly read state, because one promote
-// can move several snapshots and re-parent several clones at once. Once nothing
-// clones anything any more, whatever remains is leftover driver artifacts that
-// an earlier promote relocated here, and they are destroyed directly.
+// clone them. Every snapshot is first checked against the driver name
+// allow-list (D18); a foreign one refuses the whole delete. Every snapshot that
+// nothing clones is then destroyed (ADR-0041: with no clone it is free to go,
+// and a ZfsSnapshot that still wanted it fails loudly). If any snapshot is
+// still cloned, that clone is promoted away — which relocates the snapshot, and
+// every snapshot older than it, onto the clone — and the round restarts from
+// freshly read state, because one promote can move several snapshots and
+// re-parent several clones at once.
 //
 // For the overwhelmingly common case of a dataset with no snapshots at all this
 // is a single `zfs list` and done.
@@ -220,7 +125,17 @@ func detachAndCleanSnapshots(ctx context.Context, c client.Reader, z zpool.ZFS, 
 			return nil
 		}
 
-		promoted := false
+		// Verify every snapshot is ours (D18) before touching anything: failing
+		// loud leaves the object visibly Terminating, which is strictly better
+		// than deleting data the driver did not create.
+		for _, snap := range snaps {
+			if err := assertDriverSnapshot(snap); err != nil {
+				return err
+			}
+		}
+
+		cloned := map[string][]string{}
+		var order []string
 		for _, snap := range snaps {
 			clones, err := z.Clones(ctx, snap)
 			if err != nil {
@@ -230,42 +145,31 @@ func detachAndCleanSnapshots(ctx context.Context, c client.Reader, z zpool.ZFS, 
 				return err
 			}
 			if len(clones) == 0 {
+				if err := z.Destroy(ctx, snap, false); err != nil {
+					return fmt.Errorf("destroy snapshot %q: %w", snap, err)
+				}
+				logger.Info("destroyed snapshot with no clones", "snapshot", snap, "destroying", full)
 				continue
 			}
-			if err := assertKnownDatasets(ctx, c, poolGUID, poolName, snap, clones); err != nil {
-				return err
-			}
-			// Promoting any one clone detaches the snapshot from all of them:
-			// ZFS re-parents the siblings onto the promoted clone as part of the
-			// same operation. The next round picks up whatever is left.
-			if err := z.Promote(ctx, clones[0]); err != nil {
-				return fmt.Errorf("promote %q away from %q: %w", clones[0], snap, err)
-			}
-			logger.Info("promoted dependent away", "dependent", clones[0], "detachedFrom", snap, "destroying", full)
-			promoted = true
-			break
+			cloned[snap] = clones
+			order = append(order, snap)
 		}
-		if promoted {
-			continue
+		if len(order) == 0 {
+			return nil
 		}
 
-		// Nothing clones any of the remaining snapshots, so they are leftover
-		// driver artifacts relocated here by an earlier promote. Verify every one
-		// of them is ours (D18) before destroying anything: failing loud leaves
-		// the object visibly Terminating, which is strictly better than deleting
-		// data the driver did not create.
-		for _, snap := range snaps {
-			if err := assertDriverSnapshot(ctx, c, snap); err != nil {
-				return err
-			}
+		snap := order[0]
+		clones := cloned[snap]
+		if err := assertKnownDatasets(ctx, c, poolGUID, poolName, snap, clones); err != nil {
+			return err
 		}
-		for _, snap := range snaps {
-			if err := z.Destroy(ctx, snap, false); err != nil {
-				return fmt.Errorf("destroy leftover snapshot %q: %w", snap, err)
-			}
-			logger.Info("destroyed leftover snapshot artifact", "snapshot", snap, "destroying", full)
+		// Promoting any one clone detaches the snapshot from all of them:
+		// ZFS re-parents the siblings onto the promoted clone as part of the
+		// same operation. The next round picks up whatever is left.
+		if err := z.Promote(ctx, clones[0]); err != nil {
+			return fmt.Errorf("promote %q away from %q: %w", clones[0], snap, err)
 		}
-		return nil
+		logger.Info("promoted dependent away", "dependent", clones[0], "detachedFrom", snap, "destroying", full)
 	}
 	return fmt.Errorf("detaching dependents of %q did not converge after %d rounds", full, maxDetachRounds)
 }
@@ -348,30 +252,13 @@ func assertKnownDatasets(ctx context.Context, c client.Reader, poolGUID, poolNam
 }
 
 // assertDriverSnapshot refuses to destroy a snapshot the driver did not create
-// (D18), and — for a CSI-visible raw snapshot — refuses to destroy one whose
-// ZfsSnapshot object is still live.
-//
-// The second check cannot fail through any driver-driven sequence, because a
-// raw snapshot only ever relocates onto a dataset whose own deletion is already
-// under way. It is kept as a cheap assertion that the allow-list can never be
-// turned against real snapshot data.
-func assertDriverSnapshot(ctx context.Context, c client.Reader, full string) error {
+// (D18). It is a pure name allow-list: whether a ZfsSnapshot still wants the
+// snapshot is not asked (ADR-0041), because that object fails loudly on its own
+// when its snapshot is gone.
+func assertDriverSnapshot(full string) error {
 	_, suffix := splitSnapshot(full)
 	if !driverSnapshotSuffix.MatchString(suffix) {
 		return fmt.Errorf("snapshot %q was not created by this driver; refusing to destroy it — remove it manually to continue", full)
-	}
-	if !strings.HasPrefix(suffix, "csi-snap-") {
-		return nil
-	}
-	var snaps storagev1alpha1.ZfsSnapshotList
-	if err := c.List(ctx, &snaps); err != nil {
-		return err
-	}
-	for i := range snaps.Items {
-		s := &snaps.Items[i]
-		if s.Spec.SnapshotName == suffix && s.DeletionTimestamp.IsZero() {
-			return fmt.Errorf("refusing to destroy snapshot %q: ZfsSnapshot %q still claims it", full, s.Name)
-		}
 	}
 	return nil
 }

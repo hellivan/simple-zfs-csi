@@ -108,11 +108,11 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			// D3/D17/D18/D21: apply the Kubernetes-level policy blocks, then
-			// detach whatever ZFS reports as depending on this dataset and clean
-			// up its leftover driver-owned snapshot artifacts, so the dataset is
-			// guaranteed to have zero snapshots of its own left — which is what
-			// makes the non-recursive destroy below always safe (D11/D22).
+			// D17/D18, ADR-0041: look only at ZFS. Detach whatever it reports as
+			// depending on this dataset and destroy the driver-owned snapshots
+			// nothing clones, so the dataset is guaranteed to have zero snapshots
+			// of its own left — which is what makes the non-recursive destroy
+			// below always safe (D11/D22).
 			if err := r.beforeDestroy(ctx, &vol, pool.Status.PoolName, full); err != nil {
 				// Publish *why* the destroy was refused. Some of these refusals are
 				// permanent until a human intervenes — a snapshot this driver did

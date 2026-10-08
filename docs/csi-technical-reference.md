@@ -1,8 +1,8 @@
 # CSI technical reference (runtime flow + protection mechanisms)
 
-> **SUPERSEDED in part (ADR-0041, 2026-10-08):** D3 (`checkSnapshotDependents`), D21
-> (`checkPendingCloneDependents`) and the live-CR clause of `assertDriverSnapshot` are being
-> dropped. A snapshot, restore or group snapshot is complete only when Ready; deleting its source
+> **SUPERSEDED in part (ADR-0041, implemented 2026-10-08):** D3 (`checkSnapshotDependents`), D21
+> (`checkPendingCloneDependents`) and the live-CR clause of `assertDriverSnapshot` were
+> removed from the code. A snapshot, restore or group snapshot is complete only when Ready; deleting its source
 > earlier is the user's risk. Text below that says to keep them is historical.
 
 
@@ -92,14 +92,13 @@ These are plain function calls in delete preparation logic, not metadata keys.
 
 | Guard | Type | Where used | Purpose |
 | --- | --- | --- | --- |
-| `checkSnapshotDependents` | function | `beforeDestroy` (`ZfsDataset`) | Block volume teardown while dependent snapshots are not yet `Ready` |
-| `checkPendingCloneDependents` | function | `beforeDestroy` (`ZfsDataset`) | Block volume teardown while a clone dependent is declared but not yet materialized in ZFS |
-| `assertDriverSnapshot` | function | promote/detach path | Refuse to destroy non-driver snapshots |
+| `assertDriverSnapshot` | function | promote/detach path | Refuse to destroy non-driver snapshots (name allow-list only, ADR-0041) |
 | `assertKnownDatasets` | function | promote/detach path | Refuse to promote foreign/unmanaged clone datasets |
 
-Important: `checkSnapshotDependents` and `checkPendingCloneDependents` are
-**not finalizers**; they are runtime guard checks that return an error (requeue)
-when unsafe conditions are present.
+Important: these are **not finalizers**; they are runtime guard checks that
+return an error (requeue) when unsafe conditions are present. The former
+`checkSnapshotDependents` and `checkPendingCloneDependents` were removed
+(ADR-0041): the volume delete looks only at ZFS.
 
 ---
 
@@ -127,7 +126,7 @@ See:
   Only if it is a string in `metadata.finalizers` on an object.
 
 - **“Is this protection a finalizer or a guard?”**  
-  `checkSnapshotDependents` and `checkPendingCloneDependents` are guards
+  `assertDriverSnapshot` and `assertKnownDatasets` are guards
   (functions), not finalizers.
 
 - **“Do we regenerate share config from all attach requests each time?”**  

@@ -74,24 +74,7 @@ Order: 1 -> 9. Each item lists what must be true when it is done.
    `FAILED_PRECONDITION`, deleting one member `VolumeSnapshot` is blocked by upstream while the
    group exists, a member restore still works after another member is deleted.
 
-## Implement ADR-0041: the volume delete looks only at ZFS
-
-- Principle: Ready means complete; the volume delete never waits for unfinished work.
-- Remove `checkSnapshotDependents` (D3) and its call in the `ZfsDatasetReconciler` delete path.
-- Remove the live-CR clause from `assertDriverSnapshot` (keep the name allow-list, D18).
-- In `detachAndCleanSnapshots`, each round: first destroy every driver-named snapshot with
-  no clones (still passing the allow-list), then promote the clones of what remains.
-- Tests: clone-free `csi-snap-*` destroyed before the promote; cloned snapshot promoted, not
-  destroyed; snapshot of a non-Ready or `Error` `ZfsSnapshot` no longer blocks the volume delete;
-  foreign snapshot still refused. Update docs that cite D3 (`snapshot-lifecycle-redesign.md` is
-  historical; update `lifecycle-protection-matrix.md` and `runbooks.md` if they describe the wait).
-- Update the comments that cite D3/D21/the claim check: `promote.go` (~70, 123-170, 350-373) and
-  `zfsdataset_controller.go:111`; update `csi-technical-reference.md` tables (89-94, 124) and
-  mark `redesign-strategy.md` as decided. Group snapshots: upstream adds no source-PVC protection.
-- Remove `checkPendingCloneDependents` (D21) and its call too, with its tests; a pending
-  restore whose source is gone fails loudly instead of the source delete waiting.
-  Check `ZfsDatasetReconciler` for the error a clone reports when its source is missing and make
-  sure it is a clear `Error`, not an endless silent retry.
+## Implement ADR-0041: DONE (see IMPLEMENTATION_PROGRESS.md Phase B)
 
 ## Remove the `provisionedAt` migration fallback
 

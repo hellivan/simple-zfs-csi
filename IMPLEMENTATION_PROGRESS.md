@@ -25,14 +25,14 @@ commit once the item is done (one commit per item or small group), tick it here 
 
 ## Phase B: ADR-0041 (volume delete looks only at ZFS)
 
-- [ ] B1. Remove `checkSnapshotDependents` (D3) and its call in the `ZfsDatasetReconciler` delete path.
-- [ ] B2. Remove `checkPendingCloneDependents` (D21) and its call (`promote.go`), with its tests.
-- [ ] B3. Remove the live-CR claim clause from `assertDriverSnapshot` (keep the name allow-list, D18).
-- [ ] B4. New round order in `detachAndCleanSnapshots`: allow-list check of all snapshots, destroy clone-free driver snapshots, then promote the clones of the rest.
-- [ ] B5. Verify a clone whose source vanished shows a clear `Error`, not a silent endless retry.
-- [ ] B6. Tests: clone-free `csi-snap-*` destroyed before promote; cloned snapshot promoted not destroyed; non-Ready/Error `ZfsSnapshot` no longer blocks delete; foreign snapshot still refused.
-- [ ] B7. Update comments citing D3/D21/claim check (`promote.go` ~70, 123-170, 350-373; `zfsdataset_controller.go` ~111).
-- [ ] B8. Update docs: `lifecycle-protection-matrix.md` (incl. §6.3), `csi-technical-reference.md` tables, `runbooks.md`, `redesign-strategy.md`.
+- [x] B1. Remove `checkSnapshotDependents` (D3) and its call in the `ZfsDatasetReconciler` delete path.
+- [x] B2. Remove `checkPendingCloneDependents` (D21) and its call (`promote.go`), with its tests.
+- [x] B3. Remove the live-CR claim clause from `assertDriverSnapshot` (keep the name allow-list, D18).
+- [x] B4. New round order in `detachAndCleanSnapshots`: allow-list check of all snapshots, destroy clone-free driver snapshots, then promote the clones of the rest.
+- [x] B5. Verified by reading: a clone whose source vanished fails `zfs snapshot`/`zfs clone` and the dataset reports `Error` `CreateFailed` with the ZFS message on every retry (not silent). Real-ZFS confirmation is part of C9.
+- [x] B6. Tests: clone-free `csi-snap-*` destroyed before promote; cloned snapshot promoted not destroyed; non-Ready/Error `ZfsSnapshot` no longer blocks delete; foreign snapshot still refused.
+- [x] B7. Update comments citing D3/D21/claim check (`promote.go` ~70, 123-170, 350-373; `zfsdataset_controller.go` ~111).
+- [x] B8. Update docs: `lifecycle-protection-matrix.md` (incl. §6.3), `csi-technical-reference.md` tables, `runbooks.md`, `redesign-strategy.md`.
 
 ## Phase C: `ZfsGroupSnapshot` (ADR-0039, checklist in TODO.md)
 
@@ -84,4 +84,5 @@ changes and each controller re-reconciles every object (56 attach requests, 91 d
 | Date | Item | Commit | Note |
 |------|------|--------|------|
 | 2026-10-08 | design docs | `96efe13` and earlier | all ADRs written, no code yet |
-| 2026-10-08 | A1-A4 | (this commit) | creationTime recorded once; restore-source located via origin (A3 done; E2 only for FindSnapshot remains) |
+| 2026-10-08 | A1-A4 | 293823b | creationTime recorded once; restore-source located via origin (A3 done; E2 only for FindSnapshot remains) |
+| 2026-10-08 | B1-B8 | (this commit) | ADR-0041 delete path: D3, D21, claim clause removed; new round order |
