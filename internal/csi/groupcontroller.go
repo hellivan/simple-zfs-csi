@@ -97,7 +97,7 @@ func (g *GroupControllerServer) CreateVolumeGroupSnapshot(ctx context.Context, r
 			return nil, status.Errorf(codes.AlreadyExists, "group snapshot %q already exists for a different set of source volumes", name)
 		}
 	case apierrors.IsNotFound(err):
-		spec, serr := g.buildSpec(ctx, ids)
+		spec, serr := g.buildSpec(ctx, name, ids)
 		if serr != nil {
 			return nil, serr
 		}
@@ -126,7 +126,7 @@ func (g *GroupControllerServer) CreateVolumeGroupSnapshot(ctx context.Context, r
 
 // buildSpec resolves every source volume and records the members. All volumes
 // must live on one pool: one `zfs snapshot` call is atomic only within a pool.
-func (g *GroupControllerServer) buildSpec(ctx context.Context, ids []string) (storagev1alpha1.ZfsGroupSnapshotSpec, error) {
+func (g *GroupControllerServer) buildSpec(ctx context.Context, groupName string, ids []string) (storagev1alpha1.ZfsGroupSnapshotSpec, error) {
 	var spec storagev1alpha1.ZfsGroupSnapshotSpec
 	pools := map[string]bool{}
 	for _, id := range ids {
@@ -142,7 +142,7 @@ func (g *GroupControllerServer) buildSpec(ctx context.Context, ids []string) (st
 			SourceVolume:   id,
 			Dataset:        src.Spec.Dataset,
 			SnapshotName:   "csi-snap-" + uuid.New().String(),
-			ZfsSnapshotRef: "csi-gsnap-" + uuid.New().String(),
+			ZfsSnapshotRef: memberRefName(groupName),
 			SourceType:     src.Spec.Type,
 			SourceFSType:   src.Status.FSType,
 		}
@@ -325,4 +325,14 @@ func (g *GroupControllerServer) DeleteVolumeGroupSnapshot(ctx context.Context, r
 	}
 	g.Log.Info("deleted group snapshot", "name", id)
 	return &csi.DeleteVolumeGroupSnapshotResponse{}, nil
+}
+
+// memberRefName is "<group request name>-<uuid>". The prefix is cut when needed
+// so the result stays a valid object name (max 253 characters).
+func memberRefName(groupName string) string {
+	id := uuid.New().String()
+	if max := 253 - len(id) - 1; len(groupName) > max {
+		groupName = strings.TrimRight(groupName[:max], "-.")
+	}
+	return groupName + "-" + id
 }

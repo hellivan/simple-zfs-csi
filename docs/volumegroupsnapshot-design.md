@@ -215,14 +215,14 @@ spec:
       sourceFSType: ext4                    # D25 capture, same as standalone
       sourceProperties: {recordsize: "128K"} # D25 capture, same as standalone
       snapshotName: csi-snap-<uuid-A>        # independently random, own suffix
-      zfsSnapshotRef: groupsnapshot-<uid>-<uuid-A2>  # own random CR name
+      zfsSnapshotRef: groupsnapshot-<uid>-<uuid-A2>  # <group request name>-<uuid>
     - sourceVolume: pvc-222...
       dataset: k8s/pg-wal
       sourceType: filesystem
       sourceFSType: ext4                     # D25 capture, same as standalone
       sourceProperties: {recordsize: "8K"}   # D25 capture, same as standalone
       snapshotName: csi-snap-<uuid-B>        # independently random, own suffix
-      zfsSnapshotRef: groupsnapshot-<uid>-<uuid-B2>  # own random CR name
+      zfsSnapshotRef: groupsnapshot-<uid>-<uuid-B2>  # <group request name>-<uuid>
 status:
   phase: Ready | Pending | Error | Lost   # derived from the children (ADR-0039)
   provisionedAt: ...   # first time all children were Ready; write-once (ADR-0038)

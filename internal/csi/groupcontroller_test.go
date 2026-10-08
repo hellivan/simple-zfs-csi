@@ -2,6 +2,7 @@ package csi
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,5 +187,14 @@ func TestDeleteSnapshot_RefusesGroupMember(t *testing.T) {
 	wantCode(t, err, codes.InvalidArgument)
 	if _, err := cs.DeleteSnapshot(context.Background(), &csi.DeleteSnapshotRequest{SnapshotId: "gone"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMemberRefNameLength(t *testing.T) {
+	if got := memberRefName("groupsnapshot-abc"); !strings.HasPrefix(got, "groupsnapshot-abc-") || len(got) != len("groupsnapshot-abc-")+36 {
+		t.Fatalf("unexpected name %q", got)
+	}
+	if got := memberRefName(strings.Repeat("a", 253)); len(got) > 253 {
+		t.Fatalf("name too long: %d", len(got))
 	}
 }
