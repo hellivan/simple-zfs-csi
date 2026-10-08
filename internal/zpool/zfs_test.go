@@ -62,6 +62,14 @@ func TestCreateZvol_RejectsNonPositiveSize(t *testing.T) {
 	}
 }
 
+func TestDestroy_IdempotentOnRelocatedSnapshot(t *testing.T) {
+	f := &fakeRunner{err: errors.New("exit status 1: could not find any snapshots to destroy; check snapshot names.")}
+	z := &CLI{Run: f.run}
+	if err := z.Destroy(context.Background(), "tank/x@s", false); err != nil {
+		t.Fatalf("Destroy should ignore a snapshot that is gone, got %v", err)
+	}
+}
+
 func TestDestroy_IdempotentOnMissing(t *testing.T) {
 	f := &fakeRunner{err: errors.New("cannot destroy 'tank/x': dataset does not exist")}
 	z := &CLI{Run: f.run}

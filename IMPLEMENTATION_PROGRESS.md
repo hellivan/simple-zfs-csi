@@ -100,3 +100,5 @@ F1 stopped the 30s `ZfsPool.status.lastUpdated` heartbeat from re-reconciling ev
 | 2026-10-08 | C7 | `dfc1690` | chart: agent/controller RBAC, opt-in `groupSnapshots.enabled` (feature gate + RBAC); flag name corrected from upstream source |
 | 2026-10-08 | D2, E3, F1, F2 | (this commit) | pool-watch predicate ignoring `lastUpdated`; cache-first ZfsShare delete; direct raw lookup; mode param removed. Note: the 30s pool heartbeat no longer triggers periodic re-reconciles (relevant to E6) |
 | 2026-10-08 | review fixes | (this commit) | cache audit: group provision re-reads the group directly (no re-provision/creation from a stale view), delete reads `provisionedAt` directly, child confirms the source path directly before a decisive snapshot/GroupRawSnapshotMissing; transient ZFS errors retry with backoff instead of setting `Error` |
+
+- Found on the cluster 2026-10-09 (C9 restore test): deleting a snapshot/group whose restore was promoted hung forever, because `zfs destroy ds@snap` answers "could not find any snapshots to destroy" (not "does not exist") once the snapshot was relocated. `Destroy` now treats it as already gone.

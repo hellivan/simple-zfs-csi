@@ -514,7 +514,10 @@ func propArgs(props map[string]string) []string {
 
 // isNotExist reports whether a CLI error is a ZFS "does not exist" failure.
 func isNotExist(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "does not exist")
+	return err != nil && (strings.Contains(err.Error(), "does not exist") ||
+		// `zfs destroy pool/ds@snap` says this, not "does not exist", when the
+		// dataset is there but the snapshot is not (e.g. relocated by a promote).
+		strings.Contains(err.Error(), "could not find any snapshots to destroy"))
 }
 
 // isExists reports whether a CLI error is a ZFS "already exists" failure, letting
