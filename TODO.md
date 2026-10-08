@@ -34,7 +34,7 @@ Order: 1 -> 9. Each item lists what must be true when it is done.
 2. **`ZfsGroupSnapshot` CRD** (cluster-scoped, finalizer, no `ownerReference`). Spec: `poolGUID`,
    `members[]` fixed at creation (`sourceVolume`, `dataset`, `sourceType`, `sourceFSType`,
    `sourceVolblocksize`, `sourceProperties`, `snapshotName` = own random `csi-snap-<uuid>`,
-   `childSnapshotName` = own random, equals the CSI `snapshot_id`, persisted once). Status:
+   `zfsSnapshotRef` = own random, equals the CSI `snapshot_id`, persisted once). Status:
    `phase` Ready/Pending/Error/Lost (derived), `creationTime` (once), `provisionedAt`
    (write-once, first all-Ready), `readyToUse`, `message`, `conditions`. Regenerate CRD and deepcopy.
 3. **`ZfsSnapshot.Spec.GroupSnapshotID`** (immutable). `snapshotMessage` sets `group_snapshot_id`.

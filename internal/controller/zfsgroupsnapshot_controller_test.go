@@ -32,8 +32,8 @@ func groupFixture(t *testing.T, extra ...client.Object) (client.Client, *ZfsGrou
 		Spec: storagev1alpha1.ZfsGroupSnapshotSpec{
 			PoolGUID: "999",
 			Members: []storagev1alpha1.ZfsGroupSnapshotMember{
-				{SourceVolume: "data", Dataset: "k8s/data", SnapshotName: "raw-data", ChildSnapshotName: "child-data", SourceType: storagev1alpha1.DatasetTypeFilesystem},
-				{SourceVolume: "wal", Dataset: "k8s/wal", SnapshotName: "raw-wal", ChildSnapshotName: "child-wal", SourceType: storagev1alpha1.DatasetTypeFilesystem},
+				{SourceVolume: "data", Dataset: "k8s/data", SnapshotName: "raw-data", ZfsSnapshotRef: "child-data", SourceType: storagev1alpha1.DatasetTypeFilesystem},
+				{SourceVolume: "wal", Dataset: "k8s/wal", SnapshotName: "raw-wal", ZfsSnapshotRef: "child-wal", SourceType: storagev1alpha1.DatasetTypeFilesystem},
 			},
 		},
 	}

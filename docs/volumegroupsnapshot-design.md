@@ -215,14 +215,14 @@ spec:
       sourceFSType: ext4                    # D25 capture, same as standalone
       sourceProperties: {recordsize: "128K"} # D25 capture, same as standalone
       snapshotName: csi-snap-<uuid-A>        # independently random, own suffix
-      childSnapshotName: groupsnapshot-<uid>-<uuid-A2>  # own random CR name
+      zfsSnapshotRef: groupsnapshot-<uid>-<uuid-A2>  # own random CR name
     - sourceVolume: pvc-222...
       dataset: k8s/pg-wal
       sourceType: filesystem
       sourceFSType: ext4                     # D25 capture, same as standalone
       sourceProperties: {recordsize: "8K"}   # D25 capture, same as standalone
       snapshotName: csi-snap-<uuid-B>        # independently random, own suffix
-      childSnapshotName: groupsnapshot-<uid>-<uuid-B2>  # own random CR name
+      zfsSnapshotRef: groupsnapshot-<uid>-<uuid-B2>  # own random CR name
 status:
   phase: Ready | Pending | Error | Lost   # derived from the children (ADR-0039)
   provisionedAt: ...   # first time all children were Ready; write-once (ADR-0038)
@@ -236,7 +236,7 @@ status:
 ```
 
 Note there is deliberately no `groupSnapshotName`/shared short-name field.
-`snapshotName` and `childSnapshotName` per member are generated **exactly**
+`snapshotName` and `zfsSnapshotRef` per member are generated **exactly**
 like a standalone `ZfsSnapshot`'s `Spec.SnapshotName` (`"csi-snap-" +
 uuid.New().String()`, `independent-resource-naming-redesign.md`) — no new
 naming scheme, no `csi-groupsnap-` prefix, no positional suffix. Each member
@@ -297,7 +297,7 @@ disappears. Same pattern as `ZfsShare`→`NetworkExport`. The parent CRD does
 declarative record of group membership plus a status rollup.
 
 **Why this went back and forth:** an earlier draft of this doc had each
-child's on-disk `SnapshotName` **and** its CR name (`ChildSnapshotName`)
+child's on-disk `SnapshotName` **and** its CR name (`ZfsSnapshotRef`)
 *deterministically* derived from the parent's own name
 (`<group-name>-0`, `<group-name>-1`) — reusing one shared raw ZFS snapshot
 short name across all members. That draft *did* need a parent finalizer: the
@@ -314,7 +314,7 @@ That deterministic-naming draft was itself wrong for an independent,
 verified reason (see next section): sharing one short name across multiple
 datasets on the same pool breaks `FindSnapshot`'s documented "at most one
 match" invariant. Fixing *that* bug — giving every member its own
-independently random `SnapshotName` and `ChildSnapshotName`, exactly like a
+independently random `SnapshotName` and `ZfsSnapshotRef`, exactly like a
 standalone snapshot — also happens to remove the collision race the parent
 finalizer was added for: a retried `Create` now always mints **fresh** random
 names, which can never collide with a still-`Terminating` prior incarnation's
@@ -558,7 +558,7 @@ Full reasoning below.
    direct `kubectl delete zfssnapshot` — a normal group deletion (step 5
    above) always clears the parent first, so this check is a no-op on every
    legitimate path.
-7. Because every member's on-disk `SnapshotName` and CR `ChildSnapshotName`
+7. Because every member's on-disk `SnapshotName` and CR `ZfsSnapshotRef`
    are independently random (never derived from the parent's name), a
    same-name retried `CreateVolumeGroupSnapshot` can never collide with a
    still-`Terminating` child from a previous incarnation — it always mints

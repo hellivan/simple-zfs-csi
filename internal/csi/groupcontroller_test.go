@@ -66,7 +66,7 @@ func TestCreateGroup_ReadyAndIdempotent(t *testing.T) {
 			if cl.Get(ctx, client.ObjectKey{Name: "g"}, g) == nil {
 				for _, m := range g.Spec.Members {
 					_ = cl.Create(ctx, &storagev1alpha1.ZfsSnapshot{
-						ObjectMeta: metav1.ObjectMeta{Name: m.ChildSnapshotName},
+						ObjectMeta: metav1.ObjectMeta{Name: m.ZfsSnapshotRef},
 						Spec:       storagev1alpha1.ZfsSnapshotSpec{SourceVolume: m.SourceVolume, GroupSnapshotID: "g"},
 						Status:     storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
 					})
@@ -146,7 +146,7 @@ func TestGetGroup_DecisionTable(t *testing.T) {
 	now := metav1.Now()
 	grp := &storagev1alpha1.ZfsGroupSnapshot{
 		ObjectMeta: metav1.ObjectMeta{Name: "g"},
-		Spec:       storagev1alpha1.ZfsGroupSnapshotSpec{PoolGUID: "1", Members: []storagev1alpha1.ZfsGroupSnapshotMember{{SourceVolume: "a", ChildSnapshotName: "c-a"}}},
+		Spec:       storagev1alpha1.ZfsGroupSnapshotSpec{PoolGUID: "1", Members: []storagev1alpha1.ZfsGroupSnapshotMember{{SourceVolume: "a", ZfsSnapshotRef: "c-a"}}},
 	}
 	cl := newTestClient(t, grp)
 	gs := newGroupServer(cl)

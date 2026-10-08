@@ -33,15 +33,16 @@ type ZfsGroupSnapshotMember struct {
 	// +kubebuilder:validation:MinLength=1
 	Dataset string `json:"dataset"`
 
-	// SnapshotName is this member's raw ZFS snapshot short name
-	// ("csi-snap-<uuid>"), unique per member.
+	// SnapshotName is the short name of this member's ZFS snapshot on disk
+	// ("csi-snap-<uuid>"), unique per member. Same meaning as
+	// ZfsSnapshot.spec.snapshotName.
 	// +kubebuilder:validation:MinLength=1
 	SnapshotName string `json:"snapshotName"`
 
-	// ChildSnapshotName is the metadata.name of the member's ZfsSnapshot, which
-	// is also its CSI snapshot_id.
+	// ZfsSnapshotRef is the metadata.name of this member's child ZfsSnapshot object,
+	// which is also its CSI snapshot_id (not the ZFS snapshot name).
 	// +kubebuilder:validation:MinLength=1
-	ChildSnapshotName string `json:"childSnapshotName"`
+	ZfsSnapshotRef string `json:"zfsSnapshotRef"`
 
 	// SourceType, SourceFSType, SourceVolblocksize and SourceProperties are copied
 	// to the child ZfsSnapshot; see the fields of the same name there.

@@ -44,7 +44,7 @@ commit once the item is done (one commit per item or small group), tick it here 
 - [x] C6. Wiring: `GROUP_CONTROLLER_SERVICE` plugin capability, `GroupControllerGetCapabilities`, optional group server in `csi.Serve`, controller entrypoint only.
 - [x] C7. Helm/RBAC, csi-snapshotter `--feature-gates=CSIVolumeGroupSnapshot=true` (verified in external-snapshotter v8.2.0 main.go; opt-in via `csiController.snapshotter.groupSnapshots.enabled`), docs for the `groupsnapshot.storage.k8s.io` CRDs and flags, CRD install note.
 - [x] C8. Unit tests per TODO.md item 8 (variadic exec, reconciler, child fail-loud, RPC tables).
-- [ ] C9. End-to-end per TODO.md item 9 (single exec with both datasets, restore both, clean delete, cross-pool `FAILED_PRECONDITION`, member restore after another member deleted).
+- [ ] C9 (partly done 2026-10-09 on the cluster: joplin postgres data+WAL group Ready in ~25s, raw snapshots share createtxg 6811584, delete left no leftovers; still open: restore both, cross-pool FAILED_PRECONDITION, member restore after another member deleted). End-to-end per TODO.md item 9 (single exec with both datasets, restore both, clean delete, cross-pool `FAILED_PRECONDITION`, member restore after another member deleted).
 - [ ] C10. Verify Helm chart's csi-snapshotter version supports the group snapshot flag.
 - [ ] C11. Check upstream behavior when a group Create never succeeds (does it clean up the group CR?).
 

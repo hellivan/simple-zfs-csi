@@ -253,7 +253,7 @@ func (r *ZfsGroupSnapshotReconciler) ensureChildren(ctx context.Context, grp *st
 	for i := range grp.Spec.Members {
 		m := &grp.Spec.Members[i]
 		child := &storagev1alpha1.ZfsSnapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: m.ChildSnapshotName},
+			ObjectMeta: metav1.ObjectMeta{Name: m.ZfsSnapshotRef},
 			Spec: storagev1alpha1.ZfsSnapshotSpec{
 				PoolGUID:           grp.Spec.PoolGUID,
 				Dataset:            m.Dataset,
@@ -267,7 +267,7 @@ func (r *ZfsGroupSnapshotReconciler) ensureChildren(ctx context.Context, grp *st
 			},
 		}
 		if err := r.Create(ctx, child); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create member ZfsSnapshot %q: %w", m.ChildSnapshotName, err)
+			return fmt.Errorf("create member ZfsSnapshot %q: %w", m.ZfsSnapshotRef, err)
 		}
 	}
 	return nil
@@ -283,9 +283,9 @@ func (r *ZfsGroupSnapshotReconciler) derive(ctx context.Context, grp *storagev1a
 	var missing, notReady, failed []string
 	for _, m := range grp.Spec.Members {
 		child := &storagev1alpha1.ZfsSnapshot{}
-		if err := r.Get(ctx, client.ObjectKey{Name: m.ChildSnapshotName}, child); err != nil {
+		if err := r.Get(ctx, client.ObjectKey{Name: m.ZfsSnapshotRef}, child); err != nil {
 			if apierrors.IsNotFound(err) {
-				missing = append(missing, m.ChildSnapshotName)
+				missing = append(missing, m.ZfsSnapshotRef)
 				continue
 			}
 			return ctrl.Result{}, err
@@ -330,7 +330,7 @@ func (r *ZfsGroupSnapshotReconciler) reconcileDelete(ctx context.Context, grp *s
 	for i := range grp.Spec.Members {
 		m := &grp.Spec.Members[i]
 		child := &storagev1alpha1.ZfsSnapshot{}
-		err := r.gateReader().Get(ctx, client.ObjectKey{Name: m.ChildSnapshotName}, child)
+		err := r.gateReader().Get(ctx, client.ObjectKey{Name: m.ZfsSnapshotRef}, child)
 		switch {
 		case err == nil:
 			remaining++

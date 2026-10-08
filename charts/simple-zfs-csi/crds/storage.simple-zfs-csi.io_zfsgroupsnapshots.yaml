@@ -69,12 +69,6 @@ spec:
                     anything is touched (ADR-0039). It carries what the standalone ZfsSnapshot
                     would record, plus the two names this member will use.
                   properties:
-                    childSnapshotName:
-                      description: |-
-                        ChildSnapshotName is the metadata.name of the member's ZfsSnapshot, which
-                        is also its CSI snapshot_id.
-                      minLength: 1
-                      type: string
                     dataset:
                       description: Dataset is the source dataset's logical path relative
                         to the pool root.
@@ -82,8 +76,9 @@ spec:
                       type: string
                     snapshotName:
                       description: |-
-                        SnapshotName is this member's raw ZFS snapshot short name
-                        ("csi-snap-<uuid>"), unique per member.
+                        SnapshotName is the short name of this member's ZFS snapshot on disk
+                        ("csi-snap-<uuid>"), unique per member. Same meaning as
+                        ZfsSnapshot.spec.snapshotName.
                       minLength: 1
                       type: string
                     sourceFSType:
@@ -107,11 +102,17 @@ spec:
                         (the CSI volume id).
                       minLength: 1
                       type: string
+                    zfsSnapshotRef:
+                      description: |-
+                        ZfsSnapshotRef is the metadata.name of this member's child ZfsSnapshot object,
+                        which is also its CSI snapshot_id (not the ZFS snapshot name).
+                      minLength: 1
+                      type: string
                   required:
-                  - childSnapshotName
                   - dataset
                   - snapshotName
                   - sourceVolume
+                  - zfsSnapshotRef
                   type: object
                 minItems: 1
                 type: array

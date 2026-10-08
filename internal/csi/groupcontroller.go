@@ -139,12 +139,12 @@ func (g *GroupControllerServer) buildSpec(ctx context.Context, ids []string) (st
 		}
 		pools[src.Spec.PoolGUID] = true
 		m := storagev1alpha1.ZfsGroupSnapshotMember{
-			SourceVolume:      id,
-			Dataset:           src.Spec.Dataset,
-			SnapshotName:      "csi-snap-" + uuid.New().String(),
-			ChildSnapshotName: "csi-gsnap-" + uuid.New().String(),
-			SourceType:        src.Spec.Type,
-			SourceFSType:      src.Status.FSType,
+			SourceVolume:   id,
+			Dataset:        src.Spec.Dataset,
+			SnapshotName:   "csi-snap-" + uuid.New().String(),
+			ZfsSnapshotRef: "csi-gsnap-" + uuid.New().String(),
+			SourceType:     src.Spec.Type,
+			SourceFSType:   src.Status.FSType,
 		}
 		if src.Spec.Volume != nil {
 			m.SourceVolblocksize = src.Spec.Volume.Volblocksize
@@ -181,7 +181,7 @@ func sameSourceVolumes(grp *storagev1alpha1.ZfsGroupSnapshot, ids []string) bool
 func memberSnapshotIDs(grp *storagev1alpha1.ZfsGroupSnapshot) []string {
 	out := make([]string, 0, len(grp.Spec.Members))
 	for _, m := range grp.Spec.Members {
-		out = append(out, m.ChildSnapshotName)
+		out = append(out, m.ZfsSnapshotRef)
 	}
 	return out
 }
@@ -249,19 +249,19 @@ func (g *GroupControllerServer) groupMessage(ctx context.Context, grp *storagev1
 	snaps := make([]*csi.Snapshot, 0, len(grp.Spec.Members))
 	for _, m := range grp.Spec.Members {
 		child := &storagev1alpha1.ZfsSnapshot{}
-		if err := g.Client.Get(ctx, client.ObjectKey{Name: m.ChildSnapshotName}, child); err != nil {
+		if err := g.Client.Get(ctx, client.ObjectKey{Name: m.ZfsSnapshotRef}, child); err != nil {
 			if apierrors.IsNotFound(err) {
 				// Before provisionedAt the agent is still creating the members one after
 				// the other (creationTime is written first): the member is not lost, it
 				// does not exist yet.
 				if grp.Status.ProvisionedAt == nil {
 					return nil, status.Errorf(codes.Aborted,
-						"group snapshot %q is still being provisioned: member snapshot %q (source volume %q) has not been created yet", grp.Name, m.ChildSnapshotName, m.SourceVolume)
+						"group snapshot %q is still being provisioned: member snapshot %q (source volume %q) has not been created yet", grp.Name, m.ZfsSnapshotRef, m.SourceVolume)
 				}
 				return nil, status.Errorf(codes.FailedPrecondition,
-					"member snapshot %q (source volume %q) of group snapshot %q no longer exists", m.ChildSnapshotName, m.SourceVolume, grp.Name)
+					"member snapshot %q (source volume %q) of group snapshot %q no longer exists", m.ZfsSnapshotRef, m.SourceVolume, grp.Name)
 			}
-			return nil, status.Errorf(codes.Internal, "get ZfsSnapshot %q: %v", m.ChildSnapshotName, err)
+			return nil, status.Errorf(codes.Internal, "get ZfsSnapshot %q: %v", m.ZfsSnapshotRef, err)
 		}
 		if !child.Status.ReadyToUse {
 			ready = false

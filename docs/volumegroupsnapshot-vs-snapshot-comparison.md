@@ -195,16 +195,16 @@ spec:
          sourceType: filesystem
          sourceFSType: xfs
          snapshotName: csi-snap-<uuid-A>
-         childSnapshotName: groupsnapshot-<uid>-<uuid-A2>
+         zfsSnapshotRef: groupsnapshot-<uid>-<uuid-A2>
        - sourceVolume: pvc-9b4d21a0-...
          dataset: k8s/pvc-9b4d21a0-...
          sourceType: filesystem
          sourceFSType: xfs
          snapshotName: csi-snap-<uuid-B>
-         childSnapshotName: groupsnapshot-<uid>-<uuid-B2>
+         zfsSnapshotRef: groupsnapshot-<uid>-<uuid-B2>
      ```
    - Each member gets its **own** independently random `SnapshotName`
-     (`"csi-snap-" + uuid.New().String()`) and `ChildSnapshotName` — generated
+     (`"csi-snap-" + uuid.New().String()`) and `ZfsSnapshotRef` — generated
      **exactly** like a standalone `CreateSnapshot`, not a scheme unique to
      groups. (An earlier draft used one shared name across members; verified
      against `zfs-snapshot(8)` that atomicity never required a shared suffix,
