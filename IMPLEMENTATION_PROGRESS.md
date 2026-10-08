@@ -79,6 +79,15 @@ changes and each controller re-reconciles every object (56 attach requests, 91 d
 - [ ] F4. (deferred: most patches were driven by the 30s churn removed in F1; re-evaluate after F5) Skip status patches when nothing changed (about 180 dataset, 112 attach request, 108 snapshot, 74 share patches/min).
 - [ ] F5. Re-measure afterwards (`apiserver_request_total`, 60s sample).
 
+## Phase G: periodic resource check (follow-up to F1)
+
+F1 stopped the 30s `ZfsPool.status.lastUpdated` heartbeat from re-reconciling every object, which also removed the only periodic "is it still there?" check for datasets and snapshots (Lost detection now happens only on an event or an agent restart). Replace it with an explicit, configurable one.
+
+- [ ] G1. Add a configurable interval (flag + Helm value, e.g. `agent.resourceCheckInterval`, sane default such as 5m, `0` disables) for the periodic check of `ZfsDataset` and `ZfsSnapshot` (and `ZfsGroupSnapshot` Lost derivation); implement as `RequeueAfter` on settled reconciles with jitter, so it needs no pool heartbeat.
+- [ ] G2. The check must also fire immediately when the pool status changes (already true via the F1 predicate: only `lastUpdated`-only updates are ignored); add a test that a node/health change still enqueues.
+- [ ] G3. The periodic check must stay read-only and cheap (one `zfs get` per object, as `reconcileSettled` does today); verify with F5 measurement that API load stays low.
+- [ ] G4. Decide with E6 (drop or slow down the periodic settled check) so both agree; document the interval in the chart values and docs.
+
 ## Log
 
 | Date | Item | Commit | Note |

@@ -138,3 +138,11 @@ controllers watch `ZfsPool` unfiltered. This is what detects a vanished
 primitive quickly, and it means any per-reconcile ZFS call is multiplied by
 every object (about 120 today). Adding a predicate that ignores
 `lastUpdated`-only pool changes would cut the load but also that detection.
+
+## Periodic resource check (Phase G in IMPLEMENTATION_PROGRESS.md)
+
+Since F1 the pool heartbeat no longer re-reconciles datasets/snapshots, so a vanished dataset
+or snapshot (Lost) is only noticed on an event or agent restart. Add a configurable interval
+(default ~5m, `0` = off) for a periodic read-only check of datasets and snapshots that also
+fires at once on a real pool status change.
+
