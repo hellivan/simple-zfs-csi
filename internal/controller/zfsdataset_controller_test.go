@@ -42,6 +42,7 @@ import (
 // the real-pool run recorded in docs/promote-order-verification-2026-07-31.md,
 // so this fidelity is itself tested rather than assumed.
 type fakeZFS struct {
+	snapshotCalls  [][]string
 	existing       map[string]bool
 	props          map[string]map[string]string
 	createdDS      []string
@@ -176,14 +177,19 @@ func (f *fakeZFS) Destroy(_ context.Context, name string, recursive bool) error 
 	return nil
 }
 
-func (f *fakeZFS) Snapshot(_ context.Context, name string) error {
-	dataset, suffix := splitSnapshotName(name)
-	if suffix == "" {
-		return fmt.Errorf("snapshot name %q must be of the form pool/dataset@snap", name)
+func (f *fakeZFS) Snapshot(_ context.Context, names ...string) error {
+	f.snapshotCalls = append(f.snapshotCalls, append([]string(nil), names...))
+	for _, name := range names {
+		if _, suffix := splitSnapshotName(name); suffix == "" {
+			return fmt.Errorf("snapshot name %q must be of the form pool/dataset@snap", name)
+		}
 	}
-	f.createdDS = append(f.createdDS, name)
-	f.seedSnapshot(dataset, suffix)
-	f.props[name] = map[string]string{"creation": "1700000000", "referenced": "1048576"}
+	for _, name := range names {
+		dataset, suffix := splitSnapshotName(name)
+		f.createdDS = append(f.createdDS, name)
+		f.seedSnapshot(dataset, suffix)
+		f.props[name] = map[string]string{"creation": "1700000000", "referenced": "1048576"}
+	}
 	return nil
 }
 

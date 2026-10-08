@@ -13,6 +13,12 @@ import (
 // exist, letting callers implement idempotent create/delete via errors.Is.
 var ErrNotExist = errors.New("zfs: dataset does not exist")
 
+// ErrSnapshotsPartiallyExist is returned by Snapshot when it was asked for
+// several snapshots in one atomic call and only some of them already exist.
+// ZFS then creates none of them, and the gap must never be filled by a second
+// call: the missing members would be cut at a different instant.
+var ErrSnapshotsPartiallyExist = errors.New("zfs: some of the requested snapshots already exist")
+
 // DatasetKind selects filesystem datasets, block zvols, or both.
 type DatasetKind string
 
@@ -45,10 +51,12 @@ type ZFS interface {
 	CreateDataset(ctx context.Context, name string, props map[string]string) error
 	// CreateZvol creates a block zvol of the given logical size in bytes.
 	CreateZvol(ctx context.Context, name string, sizeBytes int64, props map[string]string) error
-	// Snapshot creates the snapshot named by the full ZFS snapshot name
-	// "pool/dataset@snap". It is idempotent: an already-existing snapshot is not
-	// an error.
-	Snapshot(ctx context.Context, name string) error
+	// Snapshot creates the snapshots named by the full ZFS snapshot names
+	// "pool/dataset@snap" in ONE atomic `zfs snapshot` call (a single transaction
+	// group, so every member shares the same instant). It is idempotent when all
+	// of them already exist; when only some do it returns
+	// ErrSnapshotsPartiallyExist and creates nothing.
+	Snapshot(ctx context.Context, names ...string) error
 	// Clone creates dest as a clone of the snapshot (both full ZFS names),
 	// applying optional settable properties. Idempotent: an already-existing dest
 	// is not an error.
@@ -221,20 +229,40 @@ func (z *CLI) Destroy(ctx context.Context, name string, recursive bool) error {
 	return err
 }
 
-// Snapshot creates the snapshot "pool/dataset@snap", treating an already-existing
-// snapshot as success (idempotent).
-func (z *CLI) Snapshot(ctx context.Context, name string) error {
-	if name == "" {
+// Snapshot creates the snapshots "pool/dataset@snap" in ONE `zfs snapshot`
+// invocation, which ZFS commits in a single transaction group: every member is
+// cut at the same instant (this is what a group snapshot relies on). Already
+// existing snapshots are treated as success (idempotent) only when all of them
+// exist. If only some exist, ZFS creates none, and ErrSnapshotsPartiallyExist
+// is returned; the caller must not fill the gap with another call.
+func (z *CLI) Snapshot(ctx context.Context, names ...string) error {
+	if len(names) == 0 {
 		return fmt.Errorf("snapshot name is empty")
 	}
-	if !strings.Contains(name, "@") {
-		return fmt.Errorf("snapshot name %q must be of the form pool/dataset@snap", name)
+	for _, name := range names {
+		if name == "" {
+			return fmt.Errorf("snapshot name is empty")
+		}
+		if !strings.Contains(name, "@") {
+			return fmt.Errorf("snapshot name %q must be of the form pool/dataset@snap", name)
+		}
 	}
-	_, err := z.run(ctx, "snapshot", name)
-	if err != nil && isExists(err) {
+	_, err := z.run(ctx, append([]string{"snapshot"}, names...)...)
+	if err == nil || !isExists(err) {
+		return err
+	}
+	if len(names) == 1 {
 		return nil
 	}
-	return err
+	for _, name := range names {
+		if _, gerr := z.Get(ctx, name, "type"); gerr != nil {
+			if errors.Is(gerr, ErrNotExist) {
+				return fmt.Errorf("%w: %s is missing", ErrSnapshotsPartiallyExist, name)
+			}
+			return gerr
+		}
+	}
+	return nil
 }
 
 // Clone creates dest as a clone of snapshot, treating an already-existing dest as

@@ -36,7 +36,7 @@ commit once the item is done (one commit per item or small group), tick it here 
 
 ## Phase C: `ZfsGroupSnapshot` (ADR-0039, checklist in TODO.md)
 
-- [ ] C1. Variadic `ZFS.Snapshot(ctx, names ...string)`; all exist = no-op, some exist = distinct error; update fakes and call sites.
+- [x] C1. Variadic `ZFS.Snapshot(ctx, names ...string)`; all exist = no-op, some exist = distinct error; update fakes and call sites.
 - [ ] C2. `ZfsGroupSnapshot` CRD (cluster-scoped, finalizer, no ownerReference); regenerate CRD and deepcopy.
 - [ ] C3. `ZfsSnapshot.Spec.GroupSnapshotID` (immutable); child never runs `zfs snapshot` and fails loud (`phase=Error`) if raw snapshot/dataset is missing; `snapshotMessage` sets `group_snapshot_id`; `DeleteSnapshot` on a member = `INVALID_ARGUMENT` (missing CR = OK).
 - [ ] C4. `ZfsGroupSnapshotReconciler`: three-way raw check, one atomic exec, `creationTime` once, create children, `provisionedAt` once, derived status, finalizer (delete children, wait, destroy orphan raw snapshots before `provisionedAt`), Terminating creates nothing; extract `resolveDatasetPath`.

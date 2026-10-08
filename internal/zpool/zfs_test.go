@@ -244,3 +244,45 @@ func TestPromote_PropagatesCommandError(t *testing.T) {
 		t.Fatal("expected the underlying zfs promote error to propagate")
 	}
 }
+
+func TestSnapshot_MultipleNamesAreOneExec(t *testing.T) {
+	f := &fakeRunner{}
+	z := &CLI{Run: f.run}
+	if err := z.Snapshot(context.Background(), "tank/a@s1", "tank/b@s2"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"snapshot", "tank/a@s1", "tank/b@s2"}
+	if !reflect.DeepEqual(f.gotArgs, want) {
+		t.Errorf("args = %v, want %v", f.gotArgs, want)
+	}
+}
+
+func TestSnapshot_MultipleAllExistIsNoop(t *testing.T) {
+	calls := 0
+	z := &CLI{Run: func(ctx context.Context, name string, args ...string) (string, error) {
+		calls++
+		if args[0] == "snapshot" {
+			return "", errors.New("cannot create snapshot 'tank/a@s1': dataset already exists")
+		}
+		return "snapshot\n", nil
+	}}
+	if err := z.Snapshot(context.Background(), "tank/a@s1", "tank/b@s2"); err != nil {
+		t.Fatalf("all existing must be a no-op, got %v", err)
+	}
+}
+
+func TestSnapshot_MultiplePartialExistIsDistinctError(t *testing.T) {
+	z := &CLI{Run: func(ctx context.Context, name string, args ...string) (string, error) {
+		switch {
+		case args[0] == "snapshot":
+			return "", errors.New("cannot create snapshot 'tank/a@s1': dataset already exists")
+		case args[len(args)-1] == "tank/b@s2":
+			return "", errors.New("cannot open 'tank/b@s2': dataset does not exist")
+		}
+		return "snapshot\n", nil
+	}}
+	err := z.Snapshot(context.Background(), "tank/a@s1", "tank/b@s2")
+	if !errors.Is(err, ErrSnapshotsPartiallyExist) {
+		t.Fatalf("err = %v, want ErrSnapshotsPartiallyExist", err)
+	}
+}
