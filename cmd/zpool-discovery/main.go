@@ -124,6 +124,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&controller.ZfsGroupSnapshotReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		NodeName: nodeName,
+		ZFS:      &zpool.CLI{Bin: zfsBin, Run: hostRunner},
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up ZfsGroupSnapshot reconciler")
+		os.Exit(1)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)

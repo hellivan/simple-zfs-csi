@@ -81,6 +81,7 @@ func main() {
 		Capabilities: []*csi.PluginCapability{
 			zfscsi.ControllerServiceCapability(),
 			zfscsi.VolumeExpansionCapability(),
+			zfscsi.GroupServiceCapability(),
 		},
 	}
 	cs := &zfscsi.ControllerServer{
@@ -93,8 +94,15 @@ func main() {
 		Log:               ctrl.Log.WithName("controller"),
 	}
 
+	gcs := &zfscsi.GroupControllerServer{
+		Client:        cl,
+		CreateTimeout: createTimeout,
+		PollInterval:  pollInterval,
+		Log:           ctrl.Log.WithName("group-controller"),
+	}
+
 	setupLog.Info("starting CSI controller", "driver", driverName, "endpoint", endpoint, "version", version)
-	if err := zfscsi.Serve(ctrl.SetupSignalHandler(), endpoint, ids, cs, nil, ctrl.Log.WithName("grpc")); err != nil {
+	if err := zfscsi.Serve(ctrl.SetupSignalHandler(), endpoint, ids, cs, gcs, nil, ctrl.Log.WithName("grpc")); err != nil {
 		setupLog.Error(err, "CSI server exited with error")
 		os.Exit(1)
 	}

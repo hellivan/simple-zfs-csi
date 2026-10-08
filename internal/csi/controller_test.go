@@ -33,7 +33,7 @@ func newTestClient(t *testing.T, objs ...client.Object) client.Client {
 	}
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsShareAttachRequest{}).
+		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsShare{}, &storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsShareAttachRequest{}, &storagev1alpha1.ZfsGroupSnapshot{}).
 		WithObjects(objs...).
 		Build()
 }

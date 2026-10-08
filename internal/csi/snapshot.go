@@ -89,6 +89,18 @@ func (c *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 	if id == "" {
 		return nil, status.Error(codes.InvalidArgument, "snapshot id is required")
 	}
+	cur := &storagev1alpha1.ZfsSnapshot{}
+	if err := c.Client.Get(ctx, client.ObjectKey{Name: id}, cur); err != nil {
+		if apierrors.IsNotFound(err) {
+			return &csi.DeleteSnapshotResponse{}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "get ZfsSnapshot %q: %v", id, err)
+	}
+	// A group member is deleted only through its group (CSI spec: the CO must not
+	// call DeleteSnapshot for it, and the SP may refuse; ADR-0039).
+	if cur.Spec.GroupSnapshotID != "" {
+		return nil, status.Errorf(codes.InvalidArgument, "snapshot %q is a member of group snapshot %q; delete the group instead", id, cur.Spec.GroupSnapshotID)
+	}
 	snap := &storagev1alpha1.ZfsSnapshot{ObjectMeta: metav1.ObjectMeta{Name: id}}
 	if err := c.Client.Delete(ctx, snap); err != nil && !apierrors.IsNotFound(err) {
 		return nil, status.Errorf(codes.Internal, "delete ZfsSnapshot %q: %v", id, err)
@@ -259,5 +271,7 @@ func snapshotMessage(snap *storagev1alpha1.ZfsSnapshot) *csi.Snapshot {
 		SizeBytes:      size,
 		CreationTime:   ct,
 		ReadyToUse:     snap.Status.ReadyToUse,
+
+		GroupSnapshotId: snap.Spec.GroupSnapshotID,
 	}
 }

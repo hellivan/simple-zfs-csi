@@ -93,7 +93,7 @@ func main() {
 	}
 
 	setupLog.Info("starting CSI node plugin", "driver", driverName, "endpoint", endpoint, "node", nodeName, "version", version)
-	if err := zfscsi.Serve(ctrl.SetupSignalHandler(), endpoint, ids, nil, ns, ctrl.Log.WithName("grpc")); err != nil {
+	if err := zfscsi.Serve(ctrl.SetupSignalHandler(), endpoint, ids, nil, nil, ns, ctrl.Log.WithName("grpc")); err != nil {
 		setupLog.Error(err, "CSI server exited with error")
 		os.Exit(1)
 	}

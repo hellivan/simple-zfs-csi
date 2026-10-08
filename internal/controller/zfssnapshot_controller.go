@@ -142,11 +142,17 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			"InvalidSnapshot", err.Error())
 	}
 
-	// Idempotent create: only snapshot when it is absent.
+	// Idempotent create: only snapshot when it is absent (never for a group member).
 	if _, err := r.ZFS.Get(ctx, full, "type"); err != nil {
 		if !errors.Is(err, zpool.ErrNotExist) {
 			return ctrl.Result{}, r.setSnapshotStatus(ctx, &snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
 				"LookupFailed", err.Error())
+		}
+		if snap.Spec.GroupSnapshotID != "" {
+			// A group member never takes its own snapshot: a new one would be cut at a
+			// different instant than the rest of the group (ADR-0039). Fail loudly.
+			return ctrl.Result{}, r.setSnapshotStatus(ctx, &snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
+				"GroupRawSnapshotMissing", fmt.Sprintf("raw snapshot %s of group %q not found; group snapshots are never re-taken", full, snap.Spec.GroupSnapshotID))
 		}
 		if err := r.ZFS.Snapshot(ctx, full); err != nil {
 			return ctrl.Result{}, r.setSnapshotStatus(ctx, &snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
@@ -197,14 +203,20 @@ func (r *ZfsSnapshotReconciler) releaseSnapshotFinalizer(ctx context.Context, sn
 // remains the fallback for when SourceVolume is unset (snapshots predating that
 // field) or the source object is already gone.
 func (r *ZfsSnapshotReconciler) sourceDatasetPath(ctx context.Context, reader client.Reader, snap *storagev1alpha1.ZfsSnapshot) (string, error) {
-	if snap.Spec.SourceVolume == "" {
-		return snap.Spec.Dataset, nil
+	return resolveDatasetPath(ctx, reader, snap.Spec.SourceVolume, snap.Spec.Dataset)
+}
+
+// resolveDatasetPath returns the source ZfsDataset's current dataset path, or
+// the recorded one when sourceVolume is empty or no longer exists.
+func resolveDatasetPath(ctx context.Context, reader client.Reader, sourceVolume, recorded string) (string, error) {
+	if sourceVolume == "" {
+		return recorded, nil
 	}
 	src := &storagev1alpha1.ZfsDataset{}
-	err := reader.Get(ctx, client.ObjectKey{Name: snap.Spec.SourceVolume}, src)
+	err := reader.Get(ctx, client.ObjectKey{Name: sourceVolume}, src)
 	switch {
 	case apierrors.IsNotFound(err):
-		return snap.Spec.Dataset, nil
+		return recorded, nil
 	case err != nil:
 		return "", err
 	}

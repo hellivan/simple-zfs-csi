@@ -37,13 +37,13 @@ commit once the item is done (one commit per item or small group), tick it here 
 ## Phase C: `ZfsGroupSnapshot` (ADR-0039, checklist in TODO.md)
 
 - [x] C1. Variadic `ZFS.Snapshot(ctx, names ...string)`; all exist = no-op, some exist = distinct error; update fakes and call sites.
-- [ ] C2. `ZfsGroupSnapshot` CRD (cluster-scoped, finalizer, no ownerReference); regenerate CRD and deepcopy.
-- [ ] C3. `ZfsSnapshot.Spec.GroupSnapshotID` (immutable); child never runs `zfs snapshot` and fails loud (`phase=Error`) if raw snapshot/dataset is missing; `snapshotMessage` sets `group_snapshot_id`; `DeleteSnapshot` on a member = `INVALID_ARGUMENT` (missing CR = OK).
-- [ ] C4. `ZfsGroupSnapshotReconciler`: three-way raw check, one atomic exec, `creationTime` once, create children, `provisionedAt` once, derived status, finalizer (delete children, wait, destroy orphan raw snapshots before `provisionedAt`), Terminating creates nothing; extract `resolveDatasetPath`.
-- [ ] C5. `GroupControllerServer` (`internal/csi/groupcontroller.go`): Create/Delete/Get per ADR-0039 tables and error codes.
-- [ ] C6. Wiring: `GROUP_CONTROLLER_SERVICE` plugin capability, `GroupControllerGetCapabilities`, optional group server in `csi.Serve`, controller entrypoint only.
+- [x] C2. `ZfsGroupSnapshot` CRD (cluster-scoped, finalizer, no ownerReference); regenerate CRD and deepcopy.
+- [x] C3. `ZfsSnapshot.Spec.GroupSnapshotID` (immutable); child never runs `zfs snapshot` and fails loud (`phase=Error`) if raw snapshot/dataset is missing; `snapshotMessage` sets `group_snapshot_id`; `DeleteSnapshot` on a member = `INVALID_ARGUMENT` (missing CR = OK).
+- [x] C4. `ZfsGroupSnapshotReconciler`: three-way raw check, one atomic exec, `creationTime` once, create children, `provisionedAt` once, derived status, finalizer (delete children, wait, destroy orphan raw snapshots before `provisionedAt`), Terminating creates nothing; extract `resolveDatasetPath`.
+- [x] C5. `GroupControllerServer` (`internal/csi/groupcontroller.go`): Create/Delete/Get per ADR-0039 tables and error codes.
+- [x] C6. Wiring: `GROUP_CONTROLLER_SERVICE` plugin capability, `GroupControllerGetCapabilities`, optional group server in `csi.Serve`, controller entrypoint only.
 - [ ] C7. Helm/RBAC, csi-snapshotter `--enable-volume-group-snapshots`, docs for the `groupsnapshot.storage.k8s.io` CRDs and flags, CRD install note.
-- [ ] C8. Unit tests per TODO.md item 8 (variadic exec, reconciler, child fail-loud, RPC tables).
+- [x] C8. Unit tests per TODO.md item 8 (variadic exec, reconciler, child fail-loud, RPC tables).
 - [ ] C9. End-to-end per TODO.md item 9 (single exec with both datasets, restore both, clean delete, cross-pool `FAILED_PRECONDITION`, member restore after another member deleted).
 - [ ] C10. Verify Helm chart's csi-snapshotter version supports the group snapshot flag.
 - [ ] C11. Check upstream behavior when a group Create never succeeds (does it clean up the group CR?).
@@ -84,5 +84,7 @@ changes and each controller re-reconciles every object (56 attach requests, 91 d
 | Date | Item | Commit | Note |
 |------|------|--------|------|
 | 2026-10-08 | design docs | `96efe13` and earlier | all ADRs written, no code yet |
-| 2026-10-08 | A1-A4 | 293823b | creationTime recorded once; restore-source located via origin (A3 done; E2 only for FindSnapshot remains) |
-| 2026-10-08 | B1-B8 | (this commit) | ADR-0041 delete path: D3, D21, claim clause removed; new round order |
+| 2026-10-08 | A1-A4 | `293823b` | creationTime recorded once; restore-source located via origin (A3 done; E2 only for FindSnapshot remains) |
+| 2026-10-08 | B1-B8 | `f0da7c4` | ADR-0041 delete path: D3, D21, claim clause removed; new round order |
+| 2026-10-08 | C1 | `f2f8beb` | variadic atomic `ZFS.Snapshot` |
+| 2026-10-08 | C2-C6, C8 | (this commit) | group CRD, reconciler, CSI group server, wiring, unit tests |

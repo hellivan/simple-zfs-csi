@@ -17,7 +17,7 @@ import (
 // "tcp://127.0.0.1:10000". The Controller and Node services are registered only
 // when the corresponding server is non-nil, so the same entrypoint serves both
 // the controller Deployment and the node DaemonSet.
-func Serve(ctx context.Context, endpoint string, ids csi.IdentityServer, cs csi.ControllerServer, ns csi.NodeServer, log logr.Logger) error {
+func Serve(ctx context.Context, endpoint string, ids csi.IdentityServer, cs csi.ControllerServer, gcs csi.GroupControllerServer, ns csi.NodeServer, log logr.Logger) error {
 	network, addr, err := parseEndpoint(endpoint)
 	if err != nil {
 		return err
@@ -37,6 +37,9 @@ func Serve(ctx context.Context, endpoint string, ids csi.IdentityServer, cs csi.
 	csi.RegisterIdentityServer(srv, ids)
 	if cs != nil {
 		csi.RegisterControllerServer(srv, cs)
+	}
+	if gcs != nil {
+		csi.RegisterGroupControllerServer(srv, gcs)
 	}
 	if ns != nil {
 		csi.RegisterNodeServer(srv, ns)

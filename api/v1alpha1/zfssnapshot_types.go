@@ -103,16 +103,25 @@ type ZfsSnapshotSpec struct {
 	// is no longer available.
 	// +optional
 	SourceProperties map[string]string `json:"sourceProperties,omitempty"`
+
+	// GroupSnapshotID is the name of the ZfsGroupSnapshot this snapshot is a
+	// member of (also the CSI group_snapshot_id). When set, the raw snapshot was
+	// already taken by the group's one atomic `zfs snapshot` call: this object
+	// never runs `zfs snapshot` itself, it adopts the raw snapshot and builds the
+	// backing clone like any other snapshot (ADR-0039). If the raw snapshot is
+	// missing it fails (phase Error) rather than taking a new one, because a new
+	// snapshot would be cut at a different instant than the rest of the group.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="groupSnapshotID is immutable"
+	GroupSnapshotID string `json:"groupSnapshotID,omitempty"`
 }
 
 // ZfsSnapshotStatus reports the observed snapshot state on the node.
 type ZfsSnapshotStatus struct {
 	// ProvisionedAt is when the snapshot first became Ready. It is written once
 	// and never changed: non-nil means "this snapshot has existed", so its
-	// primitives are never created again (ADR-0034). CreationTime, by contrast,
-	// follows the raw snapshot on disk and is refreshed if a Lost snapshot
-	// reappears; a CreationTime later than ProvisionedAt reveals a replaced
-	// snapshot.
+	// primitives are never created again (ADR-0034). CreationTime is likewise
+	// recorded once, at the first Ready, and never re-read (ADR-0038).
 	// +optional
 	ProvisionedAt *metav1.Time `json:"provisionedAt,omitempty"`
 
