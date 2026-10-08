@@ -315,12 +315,12 @@ csiController:
     # -- csi-snapshotter image repository.
     image: registry.k8s.io/sig-storage/csi-snapshotter
     # -- csi-snapshotter image tag.
-    tag: v8.2.0
+    tag: v8.5.0
     # -- Extra args for csi-snapshotter.
     extraArgs: []
     # VolumeGroupSnapshot: snapshot several PVCs of ONE pool at the same
     # instant (one atomic `zfs snapshot`). Needs the
-    # `groupsnapshot.storage.k8s.io` CRDs (v1beta1) installed cluster-wide and the
+    # `groupsnapshot.storage.k8s.io` CRDs serving v1beta2 (what csi-snapshotter v8.5.0 uses) installed cluster-wide and the
     # snapshot-controller started with `--feature-gates=CSIVolumeGroupSnapshot=true`
     # (neither is shipped by this chart), and the Kubernetes feature gate if your
     # cluster requires it.
