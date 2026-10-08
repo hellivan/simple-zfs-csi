@@ -261,9 +261,10 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	// and the finalizer is released anyway, orphaning the real snapshot on
 	// whatever dataset now holds it (ADR-0028).
 	//
-	// Deliberately done after the backing-clone wait above, so the pool-wide
-	// listing is paid once at the end rather than on every requeue.
-	if found, findErr := r.ZFS.FindSnapshot(ctx, pool.Status.PoolName, snap.Spec.SnapshotName); findErr != nil {
+	// Deliberately done after the backing-clone wait above. A direct read at the
+	// recorded address answers the common case; the pool-wide scan only runs when
+	// the snapshot is not there any more.
+	if found, findErr := r.locateRaw(ctx, pool.Status.PoolName, rawFull, snap.Spec.SnapshotName); findErr != nil {
 		return ctrl.Result{}, findErr
 	} else if found != "" && found != rawFull {
 		logger.Info("raw snapshot was relocated by an earlier promote; destroying it where it actually is",
@@ -328,7 +329,8 @@ func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *stor
 		// snapshot wherever a promote left it.
 		var creation *metav1.Time
 		if snap.Status.CreationTime == nil {
-			if raw, err := r.ZFS.FindSnapshot(ctx, pool.Status.PoolName, snap.Spec.SnapshotName); err == nil && raw != "" {
+			rawRecorded, _ := snapshotFullName(pool.Status.PoolName, datasetPath, snap.Spec.SnapshotName)
+			if raw, err := r.locateRaw(ctx, pool.Status.PoolName, rawRecorded, snap.Spec.SnapshotName); err == nil && raw != "" {
 				creation = snapshotCreationTime(ctx, r.ZFS, raw)
 			}
 		}
@@ -562,7 +564,7 @@ func (r *ZfsSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsSnapshot{}).
-		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.snapshotsForPool)).
+		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.snapshotsForPool), poolChanged()).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("zfssnapshot").
 		Complete(r)
@@ -579,4 +581,18 @@ func firstReadyTime(conds []metav1.Condition) *metav1.Time {
 	}
 	now := metav1.Now()
 	return &now
+}
+
+// locateRaw returns where the raw snapshot lives now. Short names are unique and
+// a promote moves a snapshot instead of copying it, so a snapshot that exists at
+// the recorded address is the one; only a miss needs the pool-wide scan.
+func (r *ZfsSnapshotReconciler) locateRaw(ctx context.Context, poolName, recorded, suffix string) (string, error) {
+	if recorded != "" {
+		if _, err := r.ZFS.Get(ctx, recorded, "type"); err == nil {
+			return recorded, nil
+		} else if !errors.Is(err, zpool.ErrNotExist) {
+			return "", err
+		}
+	}
+	return r.ZFS.FindSnapshot(ctx, poolName, suffix)
 }

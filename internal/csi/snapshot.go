@@ -4,7 +4,6 @@ import (
 	"context"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -39,10 +38,6 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 			return nil, status.Errorf(codes.NotFound, "source volume %q not found", sourceID)
 		}
 		return nil, status.Errorf(codes.Internal, "get source ZfsDataset %q: %v", sourceID, err)
-	}
-
-	if err := rejectRemovedModeParam(req.GetParameters()); err != nil {
-		return nil, err
 	}
 
 	desired := storagev1alpha1.ZfsSnapshotSpec{
@@ -195,29 +190,6 @@ func (c *ControllerServer) ensureSnapshot(ctx context.Context, name string, desi
 		}
 		return existing.Spec, nil
 	}
-}
-
-// snapshotModeParam was the VolumeSnapshotClass parameter that used to select
-// between the "standalone" and "integrated" snapshot mechanisms.
-const snapshotModeParam = "mode"
-
-// rejectRemovedModeParam fails a CreateSnapshot whose VolumeSnapshotClass still
-// carries the removed `mode` parameter with anything but the surviving value.
-//
-// Only one mechanism exists now (snapshot-lifecycle-redesign.md §11): every
-// snapshot gets a backing clone. Silently ignoring a leftover `mode: integrated`
-// would change a class's meaning without telling anyone, so it is rejected with
-// an actionable message instead. `mode: standalone` is accepted as a no-op so
-// existing classes that named the surviving behaviour keep working.
-func rejectRemovedModeParam(params map[string]string) error {
-	raw := strings.TrimSpace(params[snapshotModeParam])
-	if raw == "" || raw == "standalone" {
-		return nil
-	}
-	return status.Errorf(codes.InvalidArgument,
-		"VolumeSnapshotClass parameter %q=%q is no longer supported: snapshot modes were removed and every "+
-			"snapshot is now backed by its own clone; drop the parameter from the VolumeSnapshotClass",
-		snapshotModeParam, raw)
 }
 
 // waitSnapshotReady polls the ZfsSnapshot until it is ready to use, fails, or the

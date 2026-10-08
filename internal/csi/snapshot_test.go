@@ -96,39 +96,6 @@ func TestCreateSnapshot_MissingSourceVolume(t *testing.T) {
 	}
 }
 
-// TestCreateSnapshot_RemovedModeParameterRejected verifies §11: snapshot modes
-// were removed, and a VolumeSnapshotClass still carrying `mode: integrated` is
-// rejected rather than silently getting the surviving behaviour. Changing a
-// class's meaning without telling anyone is the failure this guards against.
-func TestCreateSnapshot_RemovedModeParameterRejected(t *testing.T) {
-	for _, mode := range []string{"integrated", "bogus"} {
-		t.Run(mode, func(t *testing.T) {
-			cl := newTestClient(t, sourceDataset("pvc-1"))
-			cs := newController(cl)
-			_, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
-				Name: "snap-1", SourceVolumeId: "pvc-1", Parameters: map[string]string{"mode": mode},
-			})
-			if status.Code(err) != codes.InvalidArgument {
-				t.Fatalf("expected InvalidArgument for mode=%q, got %v", mode, err)
-			}
-		})
-	}
-}
-
-// TestCreateSnapshot_StandaloneModeParameterAccepted verifies a class that
-// explicitly named the surviving behaviour keeps working as a no-op, so
-// removing the mode does not force every existing VolumeSnapshotClass to change.
-func TestCreateSnapshot_StandaloneModeParameterAccepted(t *testing.T) {
-	cl := newTestClient(t, sourceDataset("pvc-1"))
-	cs := newController(cl)
-	markSnapshotReadyAsync(cl, "snap-1")
-	if _, err := cs.CreateSnapshot(context.Background(), &csi.CreateSnapshotRequest{
-		Name: "snap-1", SourceVolumeId: "pvc-1", Parameters: map[string]string{"mode": "standalone"},
-	}); err != nil {
-		t.Fatalf("CreateSnapshot with mode=standalone: %v", err)
-	}
-}
-
 func TestCreateSnapshot_Idempotent(t *testing.T) {
 	cl := newTestClient(t, sourceDataset("pvc-1"))
 	cs := newController(cl)

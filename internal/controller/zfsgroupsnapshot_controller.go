@@ -422,7 +422,7 @@ func (r *ZfsGroupSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsGroupSnapshot{}).
-		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.groupsForPool)).
+		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.groupsForPool), poolChanged()).
 		Watches(&storagev1alpha1.ZfsSnapshot{}, handler.EnqueueRequestsFromMapFunc(r.groupForMember)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("zfsgroupsnapshot").

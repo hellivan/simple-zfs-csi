@@ -50,8 +50,8 @@ commit once the item is done (one commit per item or small group), tick it here 
 
 ## Phase D: cleanup and open decisions
 
-- [ ] D1. Remove the `provisionedAt` migration fallback after verifying all objects (TODO.md).
-- [ ] D2. Remove the legacy `mode` parameter (`cleanup-remove-legacy-mode-param`).
+- [ ] D1. Remove the `provisionedAt` migration fallback after verifying all objects (TODO.md). **Blocked:** on 2026-10-08 the live cluster had `provisionedAt` on 0 of 91 datasets and 0 of 57 snapshots (the deployed build predates it); deploy, let agents backfill, re-check, then remove.
+- [x] D2. Removed the legacy snapshot `mode` parameter check (live VolumeSnapshotClass `zfs-snapshot` has no parameters).
 - [ ] D3. Decide: act on a `provisionedAt` vs `creationTime` mismatch.
 - [ ] D4. Decide: adoption of an already-existing dataset.
 - [ ] D5. Optional: record `createtxg` and `snapshotTakenAt` on group snapshots.
@@ -61,9 +61,9 @@ commit once the item is done (one commit per item or small group), tick it here 
 Today `FindSnapshot` runs `zfs list -t snapshot -r <pool>` and suffix-matches; it follows no `origin` pointers.
 Callers: `reconcileSettled` (every ~30s per object, observation only) and `reconcileDelete`.
 
-- [ ] E1. Narrow the listing to `-r <pool>/<prefix>` (one-line change, already blessed by ADR-0028).
+- [ ] E1. (not done: needs the lineage prefix passed in; E3 already removes the scan from the common case) Narrow the listing to `-r <pool>/<prefix>` (one-line change, already blessed by ADR-0028).
 - [ ] E2. Follow `origin` pointers (backing clone `origin` -> raw snapshot; promoted clone: `<clone>@<raw>`); pool scan only as fallback. This is also the A3 fix, so do A3 and E2 together.
-- [ ] E3. Group children adopt the raw snapshot at the recorded path via direct `zfs get`; `FindSnapshot` only on a miss (needed by C3/C4).
+- [x] E3. Delete and Lost-recovery read the recorded raw path directly (`locateRaw`); `FindSnapshot` only on a miss. (Group children already use direct reads.)
 - [ ] E4. Optional: one snapshot scan per pool per cycle shared by all objects.
 - [ ] E5. Optional: user-property tag on snapshots (verify it moves with a promote first).
 - [ ] E6. Decide: drop or slow down the periodic settled check (leaning: drop; FUTURE_OPTMIZATIONS.md item 5).
@@ -73,10 +73,10 @@ Callers: `reconcileSettled` (every ~30s per object, observation only) and `recon
 The driver issues about 855 of about 2870 API requests per minute. Cause: every 30s `ZfsPool.status.lastUpdated`
 changes and each controller re-reconciles every object (56 attach requests, 91 datasets, 54 snapshots, 37 shares).
 
-- [ ] F1. Add a predicate to the `ZfsPool` watches (dataset, snapshot, share, attach request) that ignores updates where only `lastUpdated` changed.
-- [ ] F2. Attach request local-only path (`zfsshareattachrequest_controller.go` ~245, ~288): stop the uncached `Delete` of a non-existent `ZfsShare` on every reconcile (about 108 DELETE 404/min); read from cache first, delete only if it exists.
-- [ ] F3. Stop the uncached `ZfsPool` GET (`gateReader()`, about 112/min) and the live attach-request LIST (about 154/min) on every settled reconcile; use them only where a stale read is dangerous (teardown).
-- [ ] F4. Skip status patches when nothing changed (about 180 dataset, 112 attach request, 108 snapshot, 74 share patches/min).
+- [x] F1. Add a predicate to the `ZfsPool` watches (dataset, snapshot, share, attach request) that ignores updates where only `lastUpdated` changed.
+- [x] F2. Attach request local-only path (`zfsshareattachrequest_controller.go` ~245, ~288): stop the uncached `Delete` of a non-existent `ZfsShare` on every reconcile (about 108 DELETE 404/min); read from cache first, delete only if it exists.
+- [ ] F3. (deferred: these reads are deliberate safety gates; re-evaluate after F5) Stop the uncached `ZfsPool` GET (`gateReader()`, about 112/min) and the live attach-request LIST (about 154/min) on every settled reconcile; use them only where a stale read is dangerous (teardown).
+- [ ] F4. (deferred: most patches were driven by the 30s churn removed in F1; re-evaluate after F5) Skip status patches when nothing changed (about 180 dataset, 112 attach request, 108 snapshot, 74 share patches/min).
 - [ ] F5. Re-measure afterwards (`apiserver_request_total`, 60s sample).
 
 ## Log
@@ -88,4 +88,5 @@ changes and each controller re-reconciles every object (56 attach requests, 91 d
 | 2026-10-08 | B1-B8 | `f0da7c4` | ADR-0041 delete path: D3, D21, claim clause removed; new round order |
 | 2026-10-08 | C1 | `f2f8beb` | variadic atomic `ZFS.Snapshot` |
 | 2026-10-08 | C2-C6, C8 | (this commit) | group CRD, reconciler, CSI group server, wiring, unit tests |
-| 2026-10-08 | C7 | (this commit) | chart: agent/controller RBAC, opt-in `groupSnapshots.enabled` (feature gate + RBAC); flag name corrected from upstream source |
+| 2026-10-08 | C7 | `dfc1690` | chart: agent/controller RBAC, opt-in `groupSnapshots.enabled` (feature gate + RBAC); flag name corrected from upstream source |
+| 2026-10-08 | D2, E3, F1, F2 | (this commit) | pool-watch predicate ignoring `lastUpdated`; cache-first ZfsShare delete; direct raw lookup; mode param removed. Note: the 30s pool heartbeat no longer triggers periodic re-reconciles (relevant to E6) |

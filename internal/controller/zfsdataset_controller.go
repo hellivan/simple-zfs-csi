@@ -546,7 +546,7 @@ func (r *ZfsDatasetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsDataset{}).
-		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.volumesForPool)).
+		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.volumesForPool), poolChanged()).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("zfsdataset").
 		Complete(r)

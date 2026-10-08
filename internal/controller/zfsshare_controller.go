@@ -209,7 +209,7 @@ func (r *ZfsShareReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsShare{}).
 		Owns(&storagev1alpha1.NetworkExport{}).
-		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.sharesForPool)).
+		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.sharesForPool), poolChanged()).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("zfsshare").
 		Complete(r)

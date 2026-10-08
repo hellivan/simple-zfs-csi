@@ -241,8 +241,7 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 			// A ZfsShare's existence means "exported over the network" (ADR-0031); we
 			// must not create one for a local-only case.
 			if pool.Status.CurrentNode != "" && pool.Status.CurrentNode == node {
-				share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
-				if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
+				if err := r.deleteShareIfPresent(ctx, volume); err != nil {
 					return nil, nil, false, err
 				}
 				return nil, exported, true, nil
@@ -284,8 +283,7 @@ func (r *ZfsShareAttachRequestReconciler) reconcileVolume(ctx context.Context, v
 			return nil, nil, false, fmt.Errorf("get ZfsPool %q: %w", ds.Spec.PoolGUID, err)
 		}
 		if pool.Status.CurrentNode != "" && pool.Status.CurrentNode == node {
-			share := &storagev1alpha1.ZfsShare{ObjectMeta: metav1.ObjectMeta{Name: volume}}
-			if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
+			if err := r.deleteShareIfPresent(ctx, volume); err != nil {
 				return nil, nil, false, err
 			}
 			if err := r.deleteDHChapSecret(ctx, volume); err != nil {
@@ -618,7 +616,7 @@ func (r *ZfsShareAttachRequestReconciler) SetupWithManager(mgr ctrl.Manager) err
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsShareAttachRequest{}).
 		Watches(&storagev1alpha1.ZfsShare{}, handler.EnqueueRequestsFromMapFunc(r.requestsForShare)).
-		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPool)).
+		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPool), poolChanged()).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("zfsshareattachrequest").
 		Complete(r)
@@ -644,4 +642,19 @@ func protocolForDatasetType(t storagev1alpha1.DatasetType) (storagev1alpha1.Prot
 	default:
 		return "", fmt.Errorf("unknown dataset type %q", t)
 	}
+}
+
+// deleteShareIfPresent removes the volume's ZfsShare, but only after a cached
+// read says it exists: a blind Delete is a 404 round-trip on every reconcile of
+// a local-only attach. A share the cache has not seen yet triggers the ZfsShare
+// watch, which re-runs this reconcile.
+func (r *ZfsShareAttachRequestReconciler) deleteShareIfPresent(ctx context.Context, volume string) error {
+	share := &storagev1alpha1.ZfsShare{}
+	if err := r.Get(ctx, client.ObjectKey{Name: volume}, share); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if err := r.Delete(ctx, share); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
