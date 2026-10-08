@@ -32,6 +32,7 @@ const (
 // volume. That clone is not a Kubernetes object (ADR-0030). The former `mode`
 // field, which could select a plain-snapshot variant instead, was removed — see
 // snapshot-lifecycle-redesign.md §11.
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.groupSnapshotID) ? (has(self.groupSnapshotID) && self.groupSnapshotID == oldSelf.groupSnapshotID) : !has(self.groupSnapshotID)",message="groupSnapshotID is immutable (it can be neither set nor cleared)"
 type ZfsSnapshotSpec struct {
 	// PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name without
 	// the "zpool-" prefix) that hosts the source dataset. The agent derives the
@@ -112,7 +113,6 @@ type ZfsSnapshotSpec struct {
 	// missing it fails (phase Error) rather than taking a new one, because a new
 	// snapshot would be cut at a different instant than the rest of the group.
 	// +optional
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="groupSnapshotID is immutable"
 	GroupSnapshotID string `json:"groupSnapshotID,omitempty"`
 }
 

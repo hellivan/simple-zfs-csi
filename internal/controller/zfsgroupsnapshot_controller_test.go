@@ -280,3 +280,26 @@ func TestZfsGroupSnapshot_StaleCacheCannotRestartFrozenGroup(t *testing.T) {
 		}
 	}
 }
+
+func TestZfsGroupSnapshot_CrashAfterExecAdoptsRawSnapshots(t *testing.T) {
+	c, r, z := groupFixture(t)
+	for _, n := range []string{"tank/k8s/data@raw-data", "tank/k8s/wal@raw-wal"} {
+		z.existing[n] = true
+		d, s := splitSnapshotName(n)
+		z.seedSnapshot(d, s)
+	}
+	reconcileGroup(t, r) // finalizer
+	reconcileGroup(t, r)
+
+	if len(z.snapshotCalls) != 0 {
+		t.Fatalf("re-ran the atomic exec: %v", z.snapshotCalls)
+	}
+	if g := getGroup(t, c); g.Status.CreationTime == nil {
+		t.Fatal("creationTime not recorded from the existing raw snapshot")
+	}
+	for _, n := range []string{"child-data", "child-wal"} {
+		if err := c.Get(context.Background(), client.ObjectKey{Name: n}, &storagev1alpha1.ZfsSnapshot{}); err != nil {
+			t.Fatalf("child %s: %v", n, err)
+		}
+	}
+}

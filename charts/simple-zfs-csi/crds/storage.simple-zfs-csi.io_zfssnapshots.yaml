@@ -94,9 +94,6 @@ spec:
                   missing it fails (phase Error) rather than taking a new one, because a new
                   snapshot would be cut at a different instant than the rest of the group.
                 type: string
-                x-kubernetes-validations:
-                - message: groupSnapshotID is immutable
-                  rule: self == oldSelf
               poolGUID:
                 description: |-
                   PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name without
@@ -170,6 +167,10 @@ spec:
             - poolGUID
             - snapshotName
             type: object
+            x-kubernetes-validations:
+            - message: groupSnapshotID is immutable (it can be neither set nor cleared)
+              rule: 'has(oldSelf.groupSnapshotID) ? (has(self.groupSnapshotID) &&
+                self.groupSnapshotID == oldSelf.groupSnapshotID) : !has(self.groupSnapshotID)'
           status:
             description: ZfsSnapshotStatus reports the observed snapshot state on
               the node.
