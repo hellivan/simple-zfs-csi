@@ -148,6 +148,9 @@ spec:
             - --csi-address={{ .Values.csiController.socketDir }}/csi.sock
             - --leader-election
             - --leader-election-namespace=$(POD_NAMESPACE)
+            {{- if .Values.csiController.snapshotter.groupSnapshots.enabled }}
+            - --feature-gates=CSIVolumeGroupSnapshot=true
+            {{- end }}
             {{- with .Values.csiController.snapshotter.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -786,7 +786,7 @@ vs. per-child `reconcileBackingClone`).
   (additive); the CSI controller gets create/get/list/watch/delete on `zfsgroupsnapshots`;
   the agent gets get/list/watch/update/patch on `zfsgroupsnapshots` and its `/status` and
   `/finalizers`.
-- Helm: `--enable-volume-group-snapshots` sidecar flag,
+- Helm: `--feature-gates=CSIVolumeGroupSnapshot=true` (verified in external-snapshotter v8.2.0 main.go; opt-in via `csiController.snapshotter.groupSnapshots.enabled`) sidecar flag,
   `groupsnapshot.storage.k8s.io` CRDs/webhook as a documented prerequisite.
 
 Everything else — backing clone creation, restore-source snapshotting,

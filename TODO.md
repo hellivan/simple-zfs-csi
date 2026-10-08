@@ -60,7 +60,7 @@ Order: 1 -> 9. Each item lists what must be true when it is done.
    group server in `csi.Serve`, constructed in the controller Deployment entrypoint only.
 7. **Helm/RBAC:** agent gets `create;delete` on `zfssnapshots` and get/list/watch/update/patch on
    `zfsgroupsnapshots` (+ `/status`, `/finalizers`); controller gets get/list/watch/create/delete on
-   `zfsgroupsnapshots`; csi-snapshotter `--enable-volume-group-snapshots`; document the
+   `zfsgroupsnapshots`; csi-snapshotter `--feature-gates=CSIVolumeGroupSnapshot=true` (verified in external-snapshotter v8.2.0 main.go; opt-in via `csiController.snapshotter.groupSnapshots.enabled`); document the
    `groupsnapshot.storage.k8s.io` CRDs and snapshot-controller flag; CRD install (Helm never
    upgrades `crds/`).
 8. **Tests:** variadic exec (single process, mixed existence); reconciler (gating, atomic create

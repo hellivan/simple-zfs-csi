@@ -42,7 +42,7 @@ commit once the item is done (one commit per item or small group), tick it here 
 - [x] C4. `ZfsGroupSnapshotReconciler`: three-way raw check, one atomic exec, `creationTime` once, create children, `provisionedAt` once, derived status, finalizer (delete children, wait, destroy orphan raw snapshots before `provisionedAt`), Terminating creates nothing; extract `resolveDatasetPath`.
 - [x] C5. `GroupControllerServer` (`internal/csi/groupcontroller.go`): Create/Delete/Get per ADR-0039 tables and error codes.
 - [x] C6. Wiring: `GROUP_CONTROLLER_SERVICE` plugin capability, `GroupControllerGetCapabilities`, optional group server in `csi.Serve`, controller entrypoint only.
-- [ ] C7. Helm/RBAC, csi-snapshotter `--enable-volume-group-snapshots`, docs for the `groupsnapshot.storage.k8s.io` CRDs and flags, CRD install note.
+- [x] C7. Helm/RBAC, csi-snapshotter `--feature-gates=CSIVolumeGroupSnapshot=true` (verified in external-snapshotter v8.2.0 main.go; opt-in via `csiController.snapshotter.groupSnapshots.enabled`), docs for the `groupsnapshot.storage.k8s.io` CRDs and flags, CRD install note.
 - [x] C8. Unit tests per TODO.md item 8 (variadic exec, reconciler, child fail-loud, RPC tables).
 - [ ] C9. End-to-end per TODO.md item 9 (single exec with both datasets, restore both, clean delete, cross-pool `FAILED_PRECONDITION`, member restore after another member deleted).
 - [ ] C10. Verify Helm chart's csi-snapshotter version supports the group snapshot flag.
@@ -88,3 +88,4 @@ changes and each controller re-reconciles every object (56 attach requests, 91 d
 | 2026-10-08 | B1-B8 | `f0da7c4` | ADR-0041 delete path: D3, D21, claim clause removed; new round order |
 | 2026-10-08 | C1 | `f2f8beb` | variadic atomic `ZFS.Snapshot` |
 | 2026-10-08 | C2-C6, C8 | (this commit) | group CRD, reconciler, CSI group server, wiring, unit tests |
+| 2026-10-08 | C7 | (this commit) | chart: agent/controller RBAC, opt-in `groupSnapshots.enabled` (feature gate + RBAC); flag name corrected from upstream source |

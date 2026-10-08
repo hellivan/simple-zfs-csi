@@ -318,6 +318,16 @@ csiController:
     tag: v8.2.0
     # -- Extra args for csi-snapshotter.
     extraArgs: []
+    # VolumeGroupSnapshot: snapshot several PVCs of ONE pool at the same
+    # instant (one atomic `zfs snapshot`). Needs the
+    # `groupsnapshot.storage.k8s.io` CRDs (v1beta1) installed cluster-wide and the
+    # snapshot-controller started with `--feature-gates=CSIVolumeGroupSnapshot=true`
+    # (neither is shipped by this chart), and the Kubernetes feature gate if your
+    # cluster requires it.
+    groupSnapshots:
+      # -- Pass `--feature-gates=CSIVolumeGroupSnapshot=true` to csi-snapshotter
+      # and grant it the group snapshot RBAC.
+      enabled: false
     # -- Resource requests/limits for the sidecar.
     resources: {}
   # external-attacher sidecar (attach-stage access control). Mandatory: the share

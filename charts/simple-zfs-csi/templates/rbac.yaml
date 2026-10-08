@@ -84,9 +84,17 @@ rules:
   # ZfsSnapshot: the agent takes/destroys `dataset@snap` on the hosting node.
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfssnapshots"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
     resources: ["zfssnapshots/status"]
+    verbs: ["get", "update", "patch"]
+  # ZfsGroupSnapshot: the agent takes the one atomic multi-dataset snapshot and
+  # creates/deletes the member ZfsSnapshots (ADR-0038/0039).
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfsgroupsnapshots"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfsgroupsnapshots/status"]
     verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -213,10 +221,10 @@ metadata:
 rules:
   # --- driver: ZFS-centric CRDs it authors ---
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsdatasets", "zfsshares", "zfssnapshots", "zfsshareattachrequests"]
+    resources: ["zfsdatasets", "zfsshares", "zfssnapshots", "zfsshareattachrequests", "zfsgroupsnapshots"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["storage.simple-zfs-csi.io"]
-    resources: ["zfsdatasets/status", "zfsshares/status", "zfssnapshots/status", "zfsshareattachrequests/status"]
+    resources: ["zfsdatasets/status", "zfsshares/status", "zfssnapshots/status", "zfsshareattachrequests/status", "zfsgroupsnapshots/status"]
     verbs: ["get"]
   # --- driver: PVC annotations for the parameter inheritance layer ---
   - apiGroups: [""]
@@ -269,6 +277,18 @@ rules:
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots"]
     verbs: ["get", "list"]
+  {{- if .Values.csiController.snapshotter.groupSnapshots.enabled }}
+  # --- external-snapshotter group snapshots (VolumeGroupSnapshot) ---
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotcontents/status"]
+    verbs: ["update", "patch"]
+  {{- end }}
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
