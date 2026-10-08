@@ -148,6 +148,14 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, r.setSnapshotStatus(ctx, &snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
 				"LookupFailed", err.Error())
 		}
+		// Both outcomes below are decisive (a new snapshot, or a loud failure), so
+		// confirm the source path with a direct read: a lagging cache after a rename
+		// would otherwise snapshot or condemn the wrong address.
+		if direct, derr := r.sourceDatasetPath(ctx, r.gateReader(), &snap); derr != nil {
+			return ctrl.Result{}, derr
+		} else if direct != datasetPath {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 		if snap.Spec.GroupSnapshotID != "" {
 			// A group member never takes its own snapshot: a new one would be cut at a
 			// different instant than the rest of the group (ADR-0039). Fail loudly.

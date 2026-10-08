@@ -90,3 +90,4 @@ changes and each controller re-reconciles every object (56 attach requests, 91 d
 | 2026-10-08 | C2-C6, C8 | (this commit) | group CRD, reconciler, CSI group server, wiring, unit tests |
 | 2026-10-08 | C7 | `dfc1690` | chart: agent/controller RBAC, opt-in `groupSnapshots.enabled` (feature gate + RBAC); flag name corrected from upstream source |
 | 2026-10-08 | D2, E3, F1, F2 | (this commit) | pool-watch predicate ignoring `lastUpdated`; cache-first ZfsShare delete; direct raw lookup; mode param removed. Note: the 30s pool heartbeat no longer triggers periodic re-reconciles (relevant to E6) |
+| 2026-10-08 | review fixes | (this commit) | cache audit: group provision re-reads the group directly (no re-provision/creation from a stale view), delete reads `provisionedAt` directly, child confirms the source path directly before a decisive snapshot/GroupRawSnapshotMissing; transient ZFS errors retry with backoff instead of setting `Error` |

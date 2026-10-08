@@ -258,3 +258,25 @@ func TestZfsSnapshotReconcile_GroupMemberWithoutRawSnapshotFailsLoud(t *testing.
 		t.Fatalf("member took its own snapshot: %v", z.snapshotCalls)
 	}
 }
+
+func TestZfsGroupSnapshot_StaleCacheCannotRestartFrozenGroup(t *testing.T) {
+	c, r, z := groupFixture(t)
+	reconcileGroup(t, r) // finalizer
+
+	// The direct reader already sees provisionedAt; the cached client does not.
+	g := getGroup(t, c)
+	now := metav1.Now()
+	g.Status.ProvisionedAt = &now
+	apiOnly := fake.NewClientBuilder().WithScheme(newTestScheme(t)).WithObjects(g).Build()
+	r.APIReader = apiOnly
+
+	res := reconcileGroup(t, r)
+	if len(z.snapshotCalls) != 0 || res.RequeueAfter == 0 {
+		t.Fatalf("stale cache re-provisioned: calls=%v res=%+v", z.snapshotCalls, res)
+	}
+	for _, n := range []string{"child-data", "child-wal"} {
+		if err := c.Get(context.Background(), client.ObjectKey{Name: n}, &storagev1alpha1.ZfsSnapshot{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("child %s created from stale view", n)
+		}
+	}
+}

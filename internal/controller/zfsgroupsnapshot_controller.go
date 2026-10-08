@@ -145,6 +145,19 @@ func (r *ZfsGroupSnapshotReconciler) provision(ctx context.Context, grp *storage
 	logger := log.FromContext(ctx)
 	poolName := pool.Status.PoolName
 
+	// Everything below creates something, so the cached copy that routed us here
+	// is not good enough: a lagging cache could still show "not provisioned" or
+	// "not deleting" and make us re-create a frozen group's children or snapshot
+	// for a group that is being deleted. A stale view just retries.
+	fresh := &storagev1alpha1.ZfsGroupSnapshot{}
+	if err := r.gateReader().Get(ctx, client.ObjectKey{Name: grp.Name}, fresh); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !fresh.DeletionTimestamp.IsZero() || fresh.Status.ProvisionedAt != nil {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	grp.Status = fresh.Status
+
 	raws := make([]string, len(grp.Spec.Members))
 	datasets := make([]string, len(grp.Spec.Members))
 	present := 0
@@ -156,7 +169,7 @@ func (r *ZfsGroupSnapshotReconciler) provision(ctx context.Context, grp *storage
 		raws[i], datasets[i] = raw, ds
 		ok, err := r.exists(ctx, raw)
 		if err != nil {
-			return ctrl.Result{}, r.setStatus(ctx, grp, storagev1alpha1.GroupSnapshotPhaseError, "LookupFailed", err.Error())
+			return ctrl.Result{}, err // transient: retried with backoff
 		}
 		if ok {
 			present++
@@ -183,7 +196,15 @@ func (r *ZfsGroupSnapshotReconciler) provision(ctx context.Context, grp *storage
 		// All raw snapshots exist already (a previous pass, or a retry): adopt.
 	case present == 0:
 		if err := r.ZFS.Snapshot(ctx, raws...); err != nil {
-			return ctrl.Result{}, r.setStatus(ctx, grp, storagev1alpha1.GroupSnapshotPhaseError, "SnapshotFailed", err.Error())
+			if errors.Is(err, zpool.ErrSnapshotsPartiallyExist) {
+				return ctrl.Result{}, r.setStatus(ctx, grp, storagev1alpha1.GroupSnapshotPhaseError, "PartialRawSnapshots", err.Error())
+			}
+			// Nothing was taken (zfs snapshot is all-or-nothing): keep the group
+			// Pending, show why, and retry with backoff.
+			if serr := r.setStatus(ctx, grp, storagev1alpha1.GroupSnapshotPhasePending, "SnapshotFailed", err.Error()); serr != nil {
+				logger.Error(serr, "record snapshot failure")
+			}
+			return ctrl.Result{}, err
 		}
 		logger.Info("created atomic group snapshot", "members", len(raws), "first", raws[0])
 	default:
@@ -298,6 +319,13 @@ func (r *ZfsGroupSnapshotReconciler) derive(ctx context.Context, grp *storagev1a
 // also has its leftover raw snapshot destroyed (nothing clones it yet).
 func (r *ZfsGroupSnapshotReconciler) reconcileDelete(ctx context.Context, grp *storagev1alpha1.ZfsGroupSnapshot, pool *storagev1alpha1.ZfsPool, hostedHere bool) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	// provisionedAt decides whether an unclaimed raw snapshot may be destroyed, so
+	// read it directly rather than from a possibly lagging cache.
+	fresh := &storagev1alpha1.ZfsGroupSnapshot{}
+	if err := r.gateReader().Get(ctx, client.ObjectKey{Name: grp.Name}, fresh); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	grp = fresh
 	remaining := 0
 	for i := range grp.Spec.Members {
 		m := &grp.Spec.Members[i]
