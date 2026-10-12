@@ -10,7 +10,7 @@ No code is written until this plan is complete and approved.
 2. No unowned snapshot on a live volume, except snapshots that are the origin of a live clone (inherent to ZFS).
 3. Live data is never damaged.
 4. Everything is removed once everything is deleted.
-5. Selection by labels (ZFS user properties), not by name patterns.
+5. Selection by labels (ZFS user properties), not by name patterns (phase 2).
 
 Out of scope (postponed): `zfs hold` as protection against manual destroys.
 
@@ -18,7 +18,7 @@ Out of scope (postponed): `zfs hold` as protection against manual destroys.
 
 | # | Decision | Status |
 |---|---|---|
-| P1 | **Labels.** Every dataset and snapshot the driver creates carries `simple-zfs-csi:role` (`volume`, `raw`, `backing`, `restore-source`, `clone-origin`) and `simple-zfs-csi:owner` (UID of the owning `ZfsDataset`/`ZfsSnapshot`). Delete and sweep logic selects by these. The `driverSnapshotSuffix` allow-list stays only as a fallback for objects created before labels existed. | approved |
+| P1 | **Labels** (phase 2, after deferred deletes). Every dataset and snapshot the driver creates carries `simple-zfs-csi:role` (`volume`, `raw`, `backing`, `restore-source`, `clone-origin`) and `simple-zfs-csi:owner` (UID of the owning `ZfsDataset`/`ZfsSnapshot`). Delete and sweep logic selects by these. The `driverSnapshotSuffix` allow-list stays only as a fallback for objects created before labels existed. | approved |
 | P2 | **Deferred destroy everywhere.** Snapshots are removed with `zfs destroy -d`. Deleting a snapshot never promotes a restore. | approved, to be verified in the model (strategy B) |
 | P3 | **Tombstone backing clone.** When a snapshot is deleted while restores still clone its `restore-source`, the backing clone `bk` stays (labelled, owner gone) and a reaper destroys it once nothing depends on it. Promote remains only when a volume or backing clone that owns snapshots must itself be destroyed (D0). | to be verified in the model |
 | P4 | **Unique `restore-source` name** per backing clone for new snapshots (`restore-source-<uuid>`), fixing the scenario-13 collision. Old names remain valid. | approved |
@@ -62,15 +62,21 @@ Out of scope (postponed): `zfs hold` as protection against manual destroys.
 - Bounded property test generating operation sequences as the model does.
 - Include fan-out (several restores of one snapshot) and group snapshots (a group delete is a series of single deletes).
 
-### W5. Implementation
-- Labels on create (P1), unique restore-source (P4), deferred destroy and tombstone (P2, P3), clone-origin cleanup (P5), sweeper (P6).
+### W5. Implementation, phase 1: deferred deletes (no labels)
+- Ships first and works with the existing names and the `driverSnapshotSuffix` allow-list.
+- Deferred destroy and tombstone backing clone (P2, P3), unique `restore-source` name (P4), clone-origin cleanup (P5).
+- Sweeper (P6) in its name-based form, restricted to the allow-list, report-only for anything it cannot attribute.
 - Revise ADR-0028, ADR-0030, ADR-0041 and D0/D19 text that mentions `detachSnapshotClones`; update
   `lifecycle-protection-matrix.md` and `delete-path-verification-2026-08-03.md`.
-- The uncommitted prototype (`DestroySnapshotDeferred`, promote removal) is the starting point for P2 and is re-checked against W4.
+- The uncommitted prototype (`DestroySnapshotDeferred`, promote removal) is the starting point and is re-checked against W4.
+- Needs no migration: old objects keep working because the allow-list and the old fixed `restore-source` name stay valid.
 
-### W6. Migration
-- Objects from 0.0.44 and earlier have no labels and the fixed `restore-source` name. The fallback allow-list covers them.
-- One-time labelling pass: read-only audit first (list unlabelled driver snapshots and datasets, compare with `ZfsSnapshot`/`ZfsDataset` objects), then label with approval.
+### W6. Implementation, phase 2: labels and migration
+- Starts only after phase 1 is released and stable.
+- Labels on create (P1). Delete and sweep logic prefers labels and falls back to the allow-list for unlabelled objects.
+- Objects from 0.0.44 and earlier have no labels. One-time labelling pass: read-only audit first (list unlabelled driver
+  snapshots and datasets, compare with `ZfsSnapshot`/`ZfsDataset` objects), then label with approval.
+- Once everything is labelled, the allow-list fallback can be removed in a later release.
 - Nothing touches the production cluster without explicit approval.
 
 ### W7. Release and verify
