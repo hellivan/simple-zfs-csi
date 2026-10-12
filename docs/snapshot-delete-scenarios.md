@@ -123,3 +123,22 @@ followed by every delete order (about 140 000 distinct states per strategy):
    live volumes and snapshots intact, and no unowned snapshot on a live volume.
 3. **Property test.** Generate the operation sequences as the model does (bounded, small) so new orderings
    are covered without writing rows by hand.
+
+## Strategy B (tombstone backing clone + unique `restore-source` names)
+
+Added after the first review (2026-10). Model only, same caveats as above.
+
+- **B** = deferred destroy everywhere, no promote when a snapshot is deleted, the backing clone stays as a hidden
+  tombstone until nothing depends on it (a reaper destroys it), a unique `rs-<snapshot id>` name per backing clone, and
+  cleanup of the `@clone-<name>` snapshot when a direct clone is deleted (found by name anywhere, because a promote may
+  have moved it). The reaper repeats until nothing more can be removed.
+- Exhaustive search, all legal sequences with up to **6 creations** (about 75 000 states):
+  no stuck delete (so scenario 13 is fixed), no object left after everything is deleted, no live volume or snapshot damaged,
+  **no residual snapshot on a live volume at all**, including scenarios 12 and 12b. B needs no sweeper in the model.
+- Fan-out: one volume and one snapshot with 5 and with 6 restores, every delete order (5 040 and 40 320 orders):
+  B has no stuck delete, no leak and no residual. The deferred-only variant with sweeper (A+cc+sweeper+unique name)
+  has no stuck delete either but shows the pinned residual from scenario 12 in many orders.
+- The unique name is required: without it the model loses restorability (a delete removes the wrong `restore-source`).
+- The cost of B is the hidden tombstone dataset, which stays while restores of a deleted snapshot are alive.
+- B relies on one unverified ZFS behaviour: that the `-d` mark moves together with the snapshot on a promote. The
+  conformance suite (plan W3) must confirm it before implementation.

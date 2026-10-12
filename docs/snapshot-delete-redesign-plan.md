@@ -39,6 +39,8 @@ Out of scope (postponed): `zfs hold` as protection against manual destroys.
 - Add strategy **B** (P2 + P3 + P4 + P5 + P6) to `sim.py`; keep it outside the repo until ported.
 - Re-run the 25 scenarios and the exhaustive search with a larger restore fan-out (at least 5 restores of one snapshot).
 - Exit: B has no STUCK and no free residual, or the remaining cases are understood.
+- **Done (2026-10):** B has no stuck delete, leak, damage or residual up to 6 creations and in 5/6-restore fan-out; see
+  [snapshot-delete-scenarios.md](snapshot-delete-scenarios.md). Still depends on the unverified defer-mark-moves-on-promote behaviour (W3).
 
 ### W2. In-memory ZFS (test-support package)
 - One state machine implementing `zpool.ZFS`. State: datasets (properties, kind), snapshots (properties, defer mark,
