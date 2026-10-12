@@ -34,6 +34,7 @@ volume and backing-clone deletes (promote what is cloned, destroy what is not).
 | **A** | Destroys `bk` the same way, then `zfs destroy -d` on the raw snapshot. No promote. |
 | **A+cloneclean** | A, plus deleting a direct clone also runs `zfs destroy -d` on the `@clone-<name>` snapshot it was made from. |
 | **A+cc+sweeper** | A+cloneclean, plus a sweep that destroys any driver-named snapshot that has no owner object and no clones. |
+| **B** | Tombstone design, see the section at the end: deferred destroy, no promote at snapshot delete, backing clone kept until unused, unique `restore-source` name, clone-origin cleanup. No sweeper. |
 
 ## Result columns
 
@@ -47,34 +48,42 @@ volume and backing-clone deletes (promote what is cloned, destroy what is not).
 Notation: `P` volume, `S` snapshot, `R` restore from a snapshot, `C` direct clone. Every row ends with all
 objects deleted.
 
-| # | Steps | 0.0.44 | A | A+cloneclean | A+cc+sweeper |
-|---|---|---|---|---|---|
-| **Single volume + snapshot** | | | | | |
-| 1 | create P, snapshot S of P, delete S, delete P | clean | clean | clean | clean |
-| 2 | create P, snapshot S of P, delete P, delete S | clean | clean | clean | clean |
-| **Direct PVC clone** | | | | | |
-| 3 | create P, clone C of P, delete C, delete P | clean, 1 residual | clean, 1 residual | clean | clean |
-| 4 | create P, clone C of P, delete P, delete C | clean | clean | clean | clean |
-| **Restore from snapshot (3 objects, all 6 orders)** | | | | | |
-| 5 | create P, snapshot S of P, restore R of S, delete R, delete S, delete P | clean | clean | clean | clean |
-| 6 | create P, snapshot S of P, restore R of S, delete S, delete R, delete P | clean, 3 residual | clean, 1 residual | clean, 1 residual | clean |
-| 7 | create P, snapshot S of P, restore R of S, delete S, delete P, delete R | clean, 2 residual | clean, 1 residual | clean, 1 residual | clean |
-| 8 | create P, snapshot S of P, restore R of S, delete P, delete S, delete R | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean |
-| 9 | create P, snapshot S of P, restore R of S, delete P, delete R, delete S | clean | clean | clean | clean |
-| 9b | create P, snapshot S of P, restore R of S, delete R, delete P, delete S | clean | clean | clean | clean |
-| **Several snapshots / restores** | | | | | |
-| 10 | create P, snapshot S1 of P, snapshot S2 of P, delete S1, delete S2, delete P | clean | clean | clean | clean |
-| 10b | create P, snapshot S1 of P, snapshot S2 of P, delete P, delete S2, delete S1 | clean | clean | clean | clean |
-| 11 | create P, snapshot S1 of P, snapshot S2 of P, restore R1 of S1, restore R2 of S2, delete S1, delete S2, delete R1, delete R2, delete P | clean, 6 residual | clean, 2 residual | clean, 2 residual | clean |
-| 12 | create P, snapshot S of P, restore R1 of S, restore R2 of S, delete S, delete R1, delete R2, delete P | clean, 4 residual | clean, 2 residual | clean, 2 residual | clean, 1 residual |
-| 12b | create P, snapshot S of P, restore R1 of S, restore R2 of S, delete P, delete S, delete R2, delete R1 | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean, 1 residual |
-| **Chains (restore, then snapshot of the restore)** | | | | | |
-| 13 | create P, snapshot S of P, restore R of S, snapshot S2 of R, delete R, delete S, delete S2, delete P | **STUCK** | **STUCK** | **STUCK** | **STUCK** |
-| 14 | create P, snapshot S of P, restore R of S, snapshot S2 of R, delete R, delete S2, delete S, delete P | clean | clean | clean | clean |
-| 14b | create P, snapshot S of P, restore R of S, snapshot S2 of R, delete S, delete R, delete S2, delete P | clean, 3 residual | clean, 1 residual | clean, 1 residual | clean |
-| 15 | create P, clone C of P, snapshot S of C, delete C, delete S, delete P | clean, 1 residual | clean, 1 residual | clean | clean |
-| 16 | create P, snapshot S of P, restore R of S, clone C of R, delete R, delete C, delete S, delete P | clean | clean | clean | clean |
-| 17 | create P, snapshot S of P, restore R of S, delete P, snapshot S2 of R, delete S, delete R, delete S2 | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean |
+| # | Steps | 0.0.44 | A | A+cloneclean | A+cc+sweeper | **B** |
+|---|---|---|---|---|---|---|
+| **Single volume + snapshot** | | | | | | |
+| 1 | create P, snapshot S of P, delete S, delete P | clean | clean | clean | clean | clean |
+| 2 | create P, snapshot S of P, delete P, delete S | clean | clean | clean | clean | clean |
+| **Direct PVC clone** | | | | | | |
+| 3 | create P, clone C of P, delete C, delete P | clean, 1 residual | clean, 1 residual | clean | clean | clean |
+| 4 | create P, clone C of P, delete P, delete C | clean | clean | clean | clean | clean |
+| **Restore from snapshot (3 objects, all 6 orders)** | | | | | | |
+| 5 | create P, snapshot S of P, restore R of S, delete R, delete S, delete P | clean | clean | clean | clean | clean |
+| 6 | create P, snapshot S of P, restore R of S, delete S, delete R, delete P | clean, 3 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+| 7 | create P, snapshot S of P, restore R of S, delete S, delete P, delete R | clean, 2 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+| 8 | create P, snapshot S of P, restore R of S, delete P, delete S, delete R | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+| 9 | create P, snapshot S of P, restore R of S, delete P, delete R, delete S | clean | clean | clean | clean | clean |
+| 9b | create P, snapshot S of P, restore R of S, delete R, delete P, delete S | clean | clean | clean | clean | clean |
+| **Several snapshots / restores** | | | | | | |
+| 10 | create P, snapshot S1 of P, snapshot S2 of P, delete S1, delete S2, delete P | clean | clean | clean | clean | clean |
+| 10b | create P, snapshot S1 of P, snapshot S2 of P, delete P, delete S2, delete S1 | clean | clean | clean | clean | clean |
+| 11 | create P, snapshot S1 of P, snapshot S2 of P, restore R1 of S1, restore R2 of S2, delete S1, delete S2, delete R1, delete R2, delete P | clean, 6 residual | clean, 2 residual | clean, 2 residual | clean | clean |
+| 12 | create P, snapshot S of P, restore R1 of S, restore R2 of S, delete S, delete R1, delete R2, delete P | clean, 4 residual | clean, 2 residual | clean, 2 residual | clean, 1 residual | clean |
+| 12b | create P, snapshot S of P, restore R1 of S, restore R2 of S, delete P, delete S, delete R2, delete R1 | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean |
+| **Chains (restore, then snapshot of the restore)** | | | | | | |
+| 13 | create P, snapshot S of P, restore R of S, snapshot S2 of R, delete R, delete S, delete S2, delete P | **STUCK** | **STUCK** | **STUCK** | **STUCK** | clean |
+| 14 | create P, snapshot S of P, restore R of S, snapshot S2 of R, delete R, delete S2, delete S, delete P | clean | clean | clean | clean | clean |
+| 14b | create P, snapshot S of P, restore R of S, snapshot S2 of R, delete S, delete R, delete S2, delete P | clean, 3 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+| 15 | create P, clone C of P, snapshot S of C, delete C, delete S, delete P | clean, 1 residual | clean, 1 residual | clean | clean | clean |
+| 16 | create P, snapshot S of P, restore R of S, clone C of R, delete R, delete C, delete S, delete P | clean | clean | clean | clean | clean |
+| 17 | create P, snapshot S of P, restore R of S, delete P, snapshot S2 of R, delete S, delete R, delete S2 | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+| **Restore, source deleted, then a snapshot of the restore** | | | | | | |
+| 18 | create P, snapshot S of P, restore R of S, delete P, delete S, snapshot S2 of R, delete S2, delete R | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+| 18b | same, but delete R before S2 | clean, 1 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+| 19 | create P, snapshot S of P, restore R of S, delete S, delete P, snapshot S2 of R, delete S2, delete R | clean, 2 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+| 19b | same, but delete R before S2 | clean, 2 residual | clean, 1 residual | clean, 1 residual | clean | clean |
+
+Rows 18 to 19b: a snapshot of a restore does **not** release a deferred snapshot the restore was cloned from.
+In B the tombstone `bk` with its marked `rs-<id>` stays until R is deleted, whether or not R has its own snapshot.
 
 ## Exhaustive search
 
