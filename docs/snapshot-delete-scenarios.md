@@ -151,3 +151,15 @@ Added after the first review (2026-10). Model only, same caveats as above.
 - The cost of B is the hidden tombstone dataset, which stays while restores of a deleted snapshot are alive.
 - B relies on one unverified ZFS behaviour: that the `-d` mark moves together with the snapshot on a promote. The
   conformance suite (plan W3) must confirm it before implementation.
+
+## Strategy C (promote at delete, then mark the orphaned `restore-source`)
+
+Found after the review of the tombstone design (2026-10). Model only.
+
+- **C** = deferred destroy of the raw snapshot, unique `rs-<id>` name, clone-origin cleanup, and, after the backing clone has been
+  destroyed (promoting its restores off it), `zfs destroy -d` on the `rs-<id>` snapshot that the promote moved onto the restore.
+  No tombstone datasets and no sweeper.
+- Same checks as B: up to 6 creations (about 65 000 states) and the 5/6-restore fan-out in every delete order show no stuck delete,
+  no leak, no damage and no unowned snapshot on a live volume. In the sibling case (scenario 12) the snapshot is kept by the other
+  restore, but it is marked and disappears by itself when that restore goes.
+- The difference to B is where the old data lives while a restore exists: on the restore (C) or on a hidden dataset (B).
