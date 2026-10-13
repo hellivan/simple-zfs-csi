@@ -1,6 +1,6 @@
 # ZFS conformance checklist
 
-Status: **nothing verified yet** (2026-10). Every item is an assumption of the model in
+Status: **sections 1 to 3 and most of 4 and 5 verified on `zfs-2.4.3-1` (2026-10-13)**, test dataset `spinning-archive/verify_zfs_functions` (unmounted, removed afterwards), scripts in the session folder. Untested rows are still empty. Every item is an assumption of the model in
 [snapshot-delete-scenarios.md](snapshot-delete-scenarios.md) or of the plan in
 [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Each one must be checked on a real pool before
 implementation and before the in-memory ZFS is trusted.
@@ -16,57 +16,57 @@ Legend: S = snapshot, C = clone, `ds` = dataset.
 
 | # | Question | Expected (model) | Result |
 |---|---|---|---|
-| 1.1 | `destroy -d` on a snapshot with no clones and no holds | destroyed immediately, no mark | |
-| 1.2 | `destroy -d` on a snapshot with a clone | succeeds, snapshot stays, `defer_destroy=on` | |
-| 1.3 | Does a marked snapshot show in `zfs list -t snapshot` (with and without `-r`, `-d 1`) or need a flag? | visible (man page); doc does not mention a hiding flag | |
-| 1.4 | Last clone destroyed: is the marked snapshot removed at once or later (txg)? | removed by ZFS itself, check timing with an immediate `zfs list` | |
-| 1.5 | Last clone destroyed by promote-and-destroy-parent rather than plain destroy | removed once no clones remain | |
-| 1.6 | `destroy -d` on a snapshot that does not exist | error text `could not find any snapshots to destroy` (our `isNotExist` already matches it) | |
-| 1.7 | `destroy -d` twice on a marked snapshot | no error, still marked | |
-| 1.8 | New clone from a marked snapshot | allowed (man page) | |
+| 1.1 | `destroy -d` on a snapshot with no clones and no holds | destroyed immediately, no mark | OK: removed at once, nothing listed |
+| 1.2 | `destroy -d` on a snapshot with a clone | succeeds, snapshot stays, `defer_destroy=on` | OK: stays, `defer_destroy=on`, `clones` lists the clone |
+| 1.3 | Does a marked snapshot show in `zfs list -t snapshot` (with and without `-r`, `-d 1`) or need a flag? | visible (man page); doc does not mention a hiding flag | OK: **visible** in plain `zfs list -t snapshot`, with `-d 1` and `-t all -r`; no flag needed. `defer_destroy` column shows `on` |
+| 1.4 | Last clone destroyed: is the marked snapshot removed at once or later (txg)? | removed by ZFS itself, check timing with an immediate `zfs list` | OK: removed by ZFS as soon as the last clone is destroyed (already gone on the immediate `zfs list`) |
+| 1.5 | Last clone destroyed by promote-and-destroy-parent rather than plain destroy | removed once no clones remain | OK: promote R2 then destroy R, `R2@rs` removed (scenario F, repeated flow) |
+| 1.6 | `destroy -d` on a snapshot that does not exist | error text `could not find any snapshots to destroy` (our `isNotExist` already matches it) | OK: `could not find any snapshots to destroy; check snapshot names.` (missing snapshot on existing dataset); `cannot open '<ds>': dataset does not exist` (missing dataset) |
+| 1.7 | `destroy -d` twice on a marked snapshot | no error, still marked | OK: rc 0, stays marked |
+| 1.8 | New clone from a marked snapshot | allowed (man page) | OK: allowed, the new clone is added to `clones` |
 | 1.9 | Snapshot of a dataset whose own origin snapshot is marked | does not change the mark | |
-| 1.10 | Snapshot of the clone R does not release R's origin | origin snapshot still has R in `clones` | |
+| 1.10 | Snapshot of the clone R does not release R's origin | origin snapshot still has R in `clones` | OK: `e1@o` stays marked with `e1r` in `clones`; `e1r@mine` does not release it |
 
 ## 2. Promote
 
 | # | Question | Expected (model) | Result |
 |---|---|---|---|
-| 2.1 | Which snapshots move: the origin and all older ones, as in the man page | yes | |
-| 2.2 | Is the `defer_destroy` mark kept on a snapshot that moves | mark moves with it | |
-| 2.3 | Are user properties of a moved snapshot kept | yes | |
-| 2.4 | The promoted clone takes over the old parent's previous origin | yes | |
-| 2.5 | Sibling clones of a moved snapshot are re-parented to the promoted clone | yes | |
-| 2.6 | The old parent becomes a clone of the moved snapshot | yes | |
-| 2.7 | Promote when the clone already has a snapshot with the same name | fails; record the exact error text (model: `conflicting snapshot`) | |
-| 2.8 | Promote when only the new origin name collides vs. an older moved snapshot collides | both fail, or only one | |
-| 2.9 | Promote of a clone whose origin is marked for deferred destroy | succeeds, mark moves with the snapshot | |
-| 2.10 | Promote of a clone of a clone (chain): is one call enough? | openzfs#15587 says sometimes not; reproduce and record | |
-| 2.11 | Promote on a zvol (not only filesystems) | same behaviour | |
+| 2.1 | Which snapshots move: the origin and all older ones, as in the man page | yes | OK: origin and all older moved (`a`,`b`), newer (`c`) stays on the parent |
+| 2.2 | Is the `defer_destroy` mark kept on a snapshot that moves | mark moves with it | OK: `defer_destroy=on` moves with the snapshot |
+| 2.3 | Are user properties of a moved snapshot kept | yes | OK: `t:role=x` still on the moved snapshot |
+| 2.4 | The promoted clone takes over the old parent's previous origin | yes | OK: promoted dataset inherits the parent's previous origin (`D_c2` got `D@s`, `J_bk2` got `J_bk1@rs-1`) |
+| 2.5 | Sibling clones of a moved snapshot are re-parented to the promoted clone | yes | OK: siblings (`A_D`, `A_E`, `F_R2`) re-parented to the promoted dataset's snapshot |
+| 2.6 | The old parent becomes a clone of the moved snapshot | yes | OK: old parent's origin becomes `<promoted>@<snap>` |
+| 2.7 | Promote when the clone already has a snapshot with the same name | fails; record the exact error text (model: `conflicting snapshot`) | OK: `cannot promote 'R/C2_c': conflicting snapshot 'x' from parent 'R/C2@x'` |
+| 2.8 | Promote when only the new origin name collides vs. an older moved snapshot collides | both fail, or only one | OK: both fail with the same message (`conflicting snapshot 'dup' from parent 'R/C@x'` for an older moved snapshot) |
+| 2.9 | Promote of a clone whose origin is marked for deferred destroy | succeeds, mark moves with the snapshot | OK: promote succeeded, mark moved (`B_C@x on`) |
+| 2.10 | Promote of a clone of a clone (chain): is one call enough? | openzfs#15587 says sometimes not; reproduce and record | Partly: two-level chain converged with one promote; a second promote then also worked. #15587 not reproduced |
+| 2.11 | Promote on a zvol (not only filesystems) | same behaviour | OK: zvol promote behaves the same |
 | 2.12 | Promote while the clone is mounted / the zvol is in use | works or fails; record | |
-| 2.13 | Promote when the parent has a snapshot newer than the origin | newer snapshots stay on the parent | |
+| 2.13 | Promote when the parent has a snapshot newer than the origin | newer snapshots stay on the parent | OK: see 2.1 |
 
 ## 3. Destroy of datasets
 
 | # | Question | Expected (model) | Result |
 |---|---|---|---|
-| 3.1 | `zfs destroy ds` while it has a plain snapshot | refused, error text recorded | |
-| 3.2 | Same while the snapshot is marked for deferred destroy | refused (marked snapshots still exist) | |
-| 3.3 | `zfs destroy -r ds` when its snapshot has a clone outside the tree | refused, error text recorded | |
-| 3.4 | `zfs destroy ds` of a clone whose origin snapshot is marked and has no other clones | succeeds and the origin snapshot goes away | |
-| 3.5 | Destroying the clone that held the last reference to a marked snapshot on a different dataset | snapshot removed | |
-| 3.6 | `zfs destroy -d` on a filesystem or volume | rejected (`-d` is snapshot-only) | |
-| 3.7 | `zfs destroy` of a non-existent dataset | error text matches `isNotExist` | |
+| 3.1 | `zfs destroy ds` while it has a plain snapshot | refused, error text recorded | OK: `filesystem has children` / `use '-r' to destroy the following datasets: <ds>@plain` |
+| 3.2 | Same while the snapshot is marked for deferred destroy | refused (marked snapshots still exist) | OK: refused, same text, marked snapshot listed as child |
+| 3.3 | `zfs destroy -r ds` when its snapshot has a clone outside the tree | refused, error text recorded | OK: `filesystem has dependent clones` / `use '-R'` listing the clones |
+| 3.4 | `zfs destroy ds` of a clone whose origin snapshot is marked and has no other clones | succeeds and the origin snapshot goes away | OK: see 1.4 and the strategy-C flow |
+| 3.5 | Destroying the clone that held the last reference to a marked snapshot on a different dataset | snapshot removed | OK: see 1.4 |
+| 3.6 | `zfs destroy -d` on a filesystem or volume | rejected (`-d` is snapshot-only) | OK: `cannot open '<ds>': missing '@' delimiter in snapshot name` |
+| 3.7 | `zfs destroy` of a non-existent dataset | error text matches `isNotExist` | OK: `cannot open '<ds>': dataset does not exist` |
 | 3.8 | Destroy of a dataset that is the origin of nothing but owns marked snapshots with no clones | succeeds only if the marked snapshots are already gone | |
 
 ## 4. Clone, snapshot, list and property reads
 
 | # | Question | Expected (model) | Result |
 |---|---|---|---|
-| 4.1 | `clones` property of a snapshot after clone, promote and clone destroy | lists direct clones only, updated at once | |
-| 4.2 | `origin` property after each of the above | `-` for independent datasets | |
+| 4.1 | `clones` property of a snapshot after clone, promote and clone destroy | lists direct clones only, updated at once | OK for direct clones, updated at once and re-parented by promote |
+| 4.2 | `origin` property after each of the above | `-` for independent datasets | OK: shown as the dataset's origin; `-` when independent |
 | 4.3 | `zfs list -t snapshot -d 1 -s creation ds` ordering after a promote | oldest first, includes moved snapshots | |
 | 4.4 | `zfs list -t snapshot -r pool` finds a snapshot by short name after a promote (our `FindSnapshot`) | only one match | |
-| 4.5 | Multi-snapshot call `zfs snapshot a@x b@y`: same `createtxg` for both | yes (confirmed live on 2026-10-10, repeat on the scratch pool) | |
+| 4.5 | Multi-snapshot call `zfs snapshot a@x b@y`: same `createtxg` for both | yes (confirmed live on 2026-10-10, repeat on the scratch pool) | OK: both snapshots `createtxg` 6898551 |
 | 4.6 | Clone with `-o` properties | applied | |
 | 4.7 | Snapshot name rules: length, characters (`rs-<uuid>`, `csi-snap-<uuid>`) | accepted | |
 | 4.8 | `used`, `usedbysnapshots`, `referenced` after promote and after the clone destroy (space freed as expected) | space follows the promoted dataset | |
@@ -75,12 +75,12 @@ Legend: S = snapshot, C = clone, `ds` = dataset.
 
 | # | Question | Expected (model) | Result |
 |---|---|---|---|
-| 5.1 | `zfs set simple-zfs-csi:role=raw ds@snap` on a snapshot | accepted | |
-| 5.2 | Property survives promote of the snapshot | yes | |
-| 5.3 | Property is not inherited by clones; clone starts with its own values | check `zfs get -s local,inherited` | |
+| 5.1 | `zfs set simple-zfs-csi:role=raw ds@snap` on a snapshot | accepted | OK |
+| 5.2 | Property survives promote of the snapshot | yes | OK: moved with the snapshot (2.3) |
+| 5.3 | Property is not inherited by clones; clone starts with its own values | check `zfs get -s local,inherited` | OK: clone shows `-` (not inherited) |
 | 5.4 | Property on a marked snapshot | readable | |
-| 5.5 | `zfs list -o name,simple-zfs-csi:owner` works for selecting by label | yes | |
-| 5.6 | `zfs rename` of a snapshot (for migrating the fixed `restore-source` name) and its effect on clones that depend on it | works; clones keep depending on it | |
+| 5.5 | `zfs list -o name,simple-zfs-csi:owner` works for selecting by label | yes | OK: `zfs list -t snapshot -o name,t:owner` works |
+| 5.6 | `zfs rename` of a snapshot (for migrating the fixed `restore-source` name) and its effect on clones that depend on it | works; clones keep depending on it | OK: rename works with a clone attached; the clone's `origin` and the snapshot's `clones` follow, property kept |
 | 5.7 | `zfs rename` of a snapshot while a clone is mounted | works or fails; record | |
 
 ## 6. Whole-scenario replays
