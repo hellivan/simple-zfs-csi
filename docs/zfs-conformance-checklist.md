@@ -42,7 +42,7 @@ Legend: S = snapshot, C = clone, `ds` = dataset.
 | 2.9 | Promote of a clone whose origin is marked for deferred destroy | succeeds, mark moves with the snapshot | OK: promote succeeded, mark moved (`B_C@x on`) |
 | 2.10 | Promote of a clone of a clone (chain): is one call enough? | openzfs#15587 says sometimes not; reproduce and record | Partly: two-level chain converged with one promote; a second promote then also worked. #15587 not reproduced |
 | 2.11 | Promote on a zvol (not only filesystems) | same behaviour | OK: zvol promote behaves the same |
-| 2.12 | Promote while the clone is mounted / the zvol is in use | works or fails; record | |
+| 2.12 | Promote while the clone is mounted / the zvol is in use | works or fails; record |  Partly: promote and destroy of mounted filesystems work (`mounted=yes`). A process holding the mountpoint could not be tested, because the Talos host has no shell for `nsenter` |
 | 2.13 | Promote when the parent has a snapshot newer than the origin | newer snapshots stay on the parent | OK: see 2.1 |
 
 ## 3. Destroy of datasets
@@ -56,7 +56,7 @@ Legend: S = snapshot, C = clone, `ds` = dataset.
 | 3.5 | Destroying the clone that held the last reference to a marked snapshot on a different dataset | snapshot removed | OK: see 1.4 |
 | 3.6 | `zfs destroy -d` on a filesystem or volume | rejected (`-d` is snapshot-only) | OK: `cannot open '<ds>': missing '@' delimiter in snapshot name` |
 | 3.7 | `zfs destroy` of a non-existent dataset | error text matches `isNotExist` | OK: `cannot open '<ds>': dataset does not exist` |
-| 3.8 | Destroy of a dataset that is the origin of nothing but owns marked snapshots with no clones | succeeds only if the marked snapshots are already gone | |
+| 3.8 | Destroy of a dataset that is the origin of nothing but owns marked snapshots with no clones | succeeds only if the marked snapshots are already gone |  Not tested separately; covered by the strategy-C flow, where `bk` is destroyed only after the promote removed its snapshots |
 
 ## 4. Clone, snapshot, list and property reads
 
@@ -69,7 +69,7 @@ Legend: S = snapshot, C = clone, `ds` = dataset.
 | 4.5 | Multi-snapshot call `zfs snapshot a@x b@y`: same `createtxg` for both | yes (confirmed live on 2026-10-10, repeat on the scratch pool) | OK: both snapshots `createtxg` 6898551 |
 | 4.6 | Clone with `-o` properties | applied | |
 | 4.7 | Snapshot name rules: length, characters (`rs-<uuid>`, `csi-snap-<uuid>`) | accepted | |
-| 4.8 | `used`, `usedbysnapshots`, `referenced` after promote and after the clone destroy (space freed as expected) | space follows the promoted dataset | |
+| 4.8 | `used`, `usedbysnapshots`, `referenced` after promote and after the clone destroy (space freed as expected) | space follows the promoted dataset |  OK: used space moves to the promoted dataset (`zv` 56K -> 0B, `zvc` 0B -> 56K); destroying the old parent leaves the child's usage unchanged |
 
 ## 5. Labels (ZFS user properties), phase 2
 
@@ -78,10 +78,10 @@ Legend: S = snapshot, C = clone, `ds` = dataset.
 | 5.1 | `zfs set simple-zfs-csi:role=raw ds@snap` on a snapshot | accepted | OK |
 | 5.2 | Property survives promote of the snapshot | yes | OK: moved with the snapshot (2.3) |
 | 5.3 | Property is not inherited by clones; clone starts with its own values | check `zfs get -s local,inherited` | OK: clone shows `-` (not inherited) |
-| 5.4 | Property on a marked snapshot | readable | |
+| 5.4 | Property on a marked snapshot | readable |  OK: property readable and settable on a marked snapshot; `destroy -n -v -d` prints `would destroy` |
 | 5.5 | `zfs list -o name,simple-zfs-csi:owner` works for selecting by label | yes | OK: `zfs list -t snapshot -o name,t:owner` works |
 | 5.6 | `zfs rename` of a snapshot (for migrating the fixed `restore-source` name) and its effect on clones that depend on it | works; clones keep depending on it | OK: rename works with a clone attached; the clone's `origin` and the snapshot's `clones` follow, property kept |
-| 5.7 | `zfs rename` of a snapshot while a clone is mounted | works or fails; record | |
+| 5.7 | `zfs rename` of a snapshot while a clone is mounted | works or fails; record |  Not tested with a mounted clone; rename with an attached clone works (5.6) |
 
 ## 6. Whole-scenario replays
 
@@ -90,11 +90,38 @@ compare the state after **every** step with the model.
 
 | # | What | Result |
 |---|---|---|
-| 6.1 | All 25 rows plus 18 to 19b, for strategy C (and B if C fails) | |
-| 6.2 | Fan-out: one snapshot, 5 restores, several delete orders (12, 12b, and at least 10 random orders) | |
+| 6.1 | All 25 rows plus 18 to 19b, for strategy C (and B if C fails) |  OK: all 25 rows plus 18 to 19b, as filesystems and as zvols, state compared after every step, no difference (see results log) |
+| 6.2 | Fan-out: one snapshot, 5 restores, several delete orders (12, 12b, and at least 10 random orders) |  OK: fan-out with 5 restores in 5 delete orders and the 2-restore case (12/12b), no difference |
 | 6.3 | The exact joplin sequence: restore, promote, delete snapshot, delete restore (the ghost snapshot case) | |
 | 6.4 | Scenario 13 with unique `rs-<id>` names (stuck before) | |
-| 6.5 | Same replay with zvols instead of filesystems | |
+| 6.5 | Same replay with zvols instead of filesystems |  OK: every table row also replayed on zvols, no difference apart from the transient busy error (results log) |
+
+## Results log
+
+### 2026-10-13, `zfs-2.4.3-1`, node talos-1, dataset `spinning-archive/verify_zfs_functions` (unmounted, empty afterwards)
+
+Method: the model (strategy C, with the deferred destroy before the promote) produced every ZFS command of every scenario
+step. The same commands ran on the test dataset, and the live state (datasets, origins, snapshots, `defer_destroy`) was
+compared with the model after **every** step.
+
+- 96 scenarios, 686 steps: the 29 table rows each as filesystems and as zvols, 5 fan-out orders with 5 restores, the 2-restore
+  case, and 40 random sequences (up to 6 creations, then deleted in random order, alternating filesystem and zvol).
+  Scenarios 13 (with unique `rs-<id>` names) and 12/12b are included.
+- Result: **no difference** in state, **no stuck delete**, nothing left over at the end, with one exception below.
+- **Finding (zvols): `zfs destroy` of a zvol right after `zfs create` fails with `cannot destroy '<zvol>': dataset is busy`**
+  in about 40 percent of tries (8 of 20 in a tight loop) and succeeds when repeated one second later. It is unrelated to clones
+  and snapshots (probably the device node being probed after creation). The driver propagates the error and the reconciler
+  retries (`internal/zpool/zfs_test.go` covers the propagation), so it is harmless, but tests and the delete path must treat
+  `dataset is busy` as retryable and the mock should be able to inject it.
+- Other results from the same run:
+  - Deleting the source volume while a restore of a deleted snapshot is alive fails with `filesystem has children` because
+    `P@raw` is still pinned (marked). The volume delete has to promote the restore first, as the delete path already does.
+  - Renaming `restore-source` to `rs-<id>` works while a restore depends on it. Renaming onto an existing name fails with
+    `cannot rename '<snap>': dataset already exists`.
+  - Promote of a five-level clone chain: one call moves only the first level; the loop in `detachAndCleanSnapshots` is needed.
+  - Promoting and destroying mounted filesystems works.
+- Not covered: a process holding a mountpoint open (the host has no shell for `nsenter`), crash and race behaviour (section 7),
+  deeper chains of #15587.
 
 ## 7. Crash and race behaviour (optional, later)
 
