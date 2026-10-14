@@ -10,25 +10,26 @@ No code is written until this plan is complete and approved.
 2. No unowned snapshot on a live volume, except snapshots that are the origin of a live clone (inherent to ZFS).
 3. Live data is never damaged.
 4. Everything is removed once everything is deleted.
-5. Selection by labels (ZFS user properties), not by name patterns (phase 2).
+5. Selection by labels (ZFS user properties), not by name patterns.
 
 Out of scope (postponed): `zfs hold` as protection against manual destroys.
 
 ## Decisions
 
-Target strategy: **C** (see [snapshot-delete-scenarios.md](snapshot-delete-scenarios.md)). B (tombstone backing clone with
-a reaper) is only a fallback if C fails; C has been verified on a real pool (2026-10-13, see
-[zfs-conformance-checklist.md](zfs-conformance-checklist.md)).
+Target strategy: **D (raw-only)**, see [snapshot-delete-scenarios.md](snapshot-delete-scenarios.md) and the section at the end. C (a
+`restore-source` snapshot on the backing clone) and B (tombstone backing clone with a reaper) are superseded. D was verified on a real pool
+(2026-10-14, see [zfs-conformance-checklist.md](zfs-conformance-checklist.md)).
 
 | # | Decision | Status |
 |---|---|---|
-| P1 | **Labels** (phase 2, after deferred deletes). Every dataset and snapshot the driver creates carries `simple-zfs-csi:role` (`volume`, `raw`, `backing`, `restore-source`, `clone-origin`) and `simple-zfs-csi:owner` (UID of the owning `ZfsDataset`/`ZfsSnapshot`). Delete logic selects by these. The `driverSnapshotSuffix` allow-list stays only as a fallback for objects created before labels existed. | approved |
-| P2 | **Rule: whoever creates a snapshot defers its destruction, always with `zfs destroy -d`.** The snapshot, the direct clone and the volume delete only mark what they created. A restore creates nothing and never touches `rs-<id>`. | approved |
-| P3 | **Snapshot delete flow (C):** mark `P@raw` and `bk@rs-<id>` with `destroy -d`, promote every restore off `bk` (the loop in `detachAndCleanSnapshots`), destroy the now empty `bk`, mark the `rs-<id>` that moved onto the restore again. No tombstone datasets, no reaper. | approved, verified on ZFS 2.4.3 |
-| P4 | **Unique `rs-<id>` name** per backing clone for new snapshots, fixing the scenario-13 collision. | approved |
+| P1 | **Labels, in phase 1.** Every dataset and snapshot the driver creates carries `simple-zfs-csi:role` (`volume`, `raw`, `backing`, `clone-origin`) and `simple-zfs-csi:owner` (UID of the owning `ZfsDataset`/`ZfsSnapshot`). Delete and promote selection use these instead of name matching. Old objects are labelled by the one-time script (P7). | approved |
+| P2 | **Rule: whoever creates a snapshot defers its destruction, always with `zfs destroy -d`.** The snapshot, the direct clone and the volume delete only mark what they created. A restore creates nothing and never touches the raw snapshot. | approved |
+| P3 | **Snapshot delete flow (D, raw-only):** `destroy -d` the raw snapshot, promote every clone of it off whichever dataset holds it (the loop in `detachAndCleanSnapshots`), then destroy the empty backing clone. No `restore-source`/`rs-*` snapshot exists any more. No tombstones, no reaper. Verified in the model (up to 6 creations) and live on ZFS 2.4.3 (116 scenarios, 740 steps). | approved |
+| P4 | **Restore finds the raw snapshot through the backing clone's `origin` property**: either the origin is the raw snapshot, or the backing clone itself holds it (it was promoted). Always verify the snapshot exists; if the backing clone is missing (creation or delete interrupted, manual change), fall back to the pool-wide scan by name. Restores clone the raw snapshot directly. | approved, origin rule derived from promote semantics, to be checked in W3 |
+| P4a | **Promote loop rule:** oldest pinned snapshot first (a promote moves the origin and all older snapshots, so this moves the least and avoids name conflicts); among the clones of that snapshot prefer the backing clone, selected by label, so the raw snapshot stays on the source or its backing clone. Every W4 scenario checks "the raw snapshot is on the source or its backing clone" after every step. | approved |
 | P5 | **`clone-origin` cleanup.** Deleting a direct clone marks the `@clone-<name>` snapshot it came from (found by name anywhere, since a promote may have moved it). | approved |
 | P6 | **No sweeper and no reaper.** Consistent deferred deletes cover every modelled case. Existing objects are migrated instead (P7). | approved |
-| P7 | **One-time migration script** (not driver code) renames the fixed `restore-source` of existing backing clones to `rs-<id>` (`zfs rename`, verified to work while restores depend on it). Dry run by default, read-only audit first, explicit approval before it touches the cluster. Likely few or no such snapshots. Labelling of old objects is part of phase 2. | approved |
+| P7 | **One-time migration script** (not driver code): labels old objects and runs `destroy -d` on every `restore-source` (W6a). Dry run by default, read-only audit first, explicit approval before it touches the cluster. | approved |
 | P8 | **`dataset is busy` is retryable.** A zvol destroyed right after create fails with it about 40 percent of the time and succeeds a second later. | found 2026-10-13 |
 
 ## Open ZFS questions
@@ -67,28 +68,27 @@ a process holding a mountpoint open during promote or destroy, crash and race be
 - Bounded property test generating operation sequences as the model does.
 - Include fan-out (several restores of one snapshot) and group snapshots (a group delete is a series of single deletes).
 
-### W5. Implementation, phase 1: deferred deletes (no labels)
-- Ships first and works with the existing names and the `driverSnapshotSuffix` allow-list.
-- Flow C for snapshot delete (P3), deferred destroy everywhere for snapshots (P2), unique `rs-<id>` name for new snapshots (P4),
-  clone-origin cleanup (P5), retryable `dataset is busy` (P8).
-- Revise ADR-0028, ADR-0030, ADR-0041 and D0/D19 text that mentions `detachSnapshotClones`; update
-  `lifecycle-protection-matrix.md` and `delete-path-verification-2026-08-03.md`.
+### W5. Implementation: strategy D with labels
+- Flow D for snapshot delete (P3), deferred destroy everywhere for snapshots (P2), clone-origin cleanup (P5), retryable `dataset is busy` (P8), labels on create (P1).
+- Restore: locate the raw snapshot via the backing clone's `origin` (P4), verify it exists, fall back to the pool-wide scan only if the backing clone is missing.
+- Promote loop (`detachAndCleanSnapshots`): oldest pinned snapshot first; among its clones prefer the one labelled `backing` for that snapshot, otherwise any; bounded rounds, re-checked after each promote.
+- Revise ADR-0028, ADR-0030, ADR-0041 and D0/D19 text that mentions `detachSnapshotClones`; update `lifecycle-protection-matrix.md` and `delete-path-verification-2026-08-03.md`.
 - The uncommitted prototype (`DestroySnapshotDeferred`, promote removal) is the starting point and is re-checked against W4.
-- The delete path keeps recognising the old fixed `restore-source` name, so old objects keep working until the script (W6a) ran.
+- Delete logic selects by label. The allow-list only keeps its `restore-source` arm until the migration ran (W6a).
 
-### W6a. One-time migration script: rename old `restore-source`
-- Script outside the driver (`hack/`), dry run by default.
-- Audit: list every `@restore-source` snapshot on the pool, the backing clone it belongs to and the `ZfsSnapshot` that owns it.
-- Rename each to `rs-<snapshot id>` with `zfs rename`; abort on `dataset already exists`. Idempotent.
+### W6a. One-time migration script (labels and `restore-source`)
+- Script outside the driver (`hack/`), dry run by default. Idempotent.
+- Audit (read-only): list every driver dataset and snapshot, the `ZfsDataset`/`ZfsSnapshot` that owns it, and every `@restore-source`.
+- Labels each old backing clone and volume with the P1 properties (`zfs set`), which is what lets the driver drop name matching.
+- Runs `zfs destroy -d` on every `@restore-source`: ZFS removes it at once, or when the last old restore that depends on it is gone (the mark survives promotes).
+- No rename, and no restore-from-`restore-source` fallback in the driver.
 - Run once after phase 1 is deployed and after the user approves the audit. Likely few or no objects.
-
-### W6b. Implementation, phase 2: labels and migration
-- Starts only after phase 1 is released and stable.
-- Labels on create (P1). Delete logic prefers labels and falls back to the allow-list for unlabelled objects.
-- Objects from 0.0.44 and earlier have no labels. One-time labelling pass: read-only audit first (list unlabelled driver
-  snapshots and datasets, compare with `ZfsSnapshot`/`ZfsDataset` objects), then label with approval.
-- Once everything is labelled, the allow-list fallback can be removed in a later release.
+- The driver keeps a single `restore-source` arm in its allow-list for one release, so an old restore that still holds a marked `restore-source` can be deleted. Removed once an audit finds none.
+- The migration is verified live on a layout built the old way (a few scenarios) before it is run anywhere real. Mixed-state simulation is not needed.
 - Nothing touches the production cluster without explicit approval.
+
+### W6b. Later: remove the allow-list
+- Once an audit shows no unlabelled objects and no `restore-source`, remove `driverSnapshotSuffix` and its `restore-source` arm.
 
 ### W7. Release and verify
 - Chart and image release by the user, then a live test on a throwaway namespace repeating the joplin group test, a restore, and deletes in the orders of scenarios 6, 12 and 13.
@@ -113,6 +113,6 @@ holds it (the loop in `detachAndCleanSnapshots`), destroy the empty vessel.
 - Live (ZFS 2.4.3, `spinning-archive/verify_zfs_functions`): replay of 116 scenarios (29 table rows on filesystems and zvols,
   fan-out, 60 random sequences), 740 steps, matched the model after every step. The only differences are the known transient
   zvol `dataset is busy` on destroy (P8).
-- Gains over C: no `rs-*` name at all (scenario 13 cannot collide), no re-marking step, no rename migration (W6a disappears),
+- Gains over C: no `rs-*` name at all (scenario 13 cannot collide), no re-marking step, no rename migration (W6a only labels and marks),
   one snapshot fewer per CSI snapshot.
-- Status: proposal, not yet adopted.
+- Status: adopted (see Decisions).
