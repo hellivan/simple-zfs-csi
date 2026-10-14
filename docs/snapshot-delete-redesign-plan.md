@@ -100,3 +100,19 @@ a process holding a mountpoint open during promote or destroy, crash and race be
 - Crashes between steps and create-vs-delete races are not modeled. Mitigation: every step idempotent and retried by the
   reconciler (the finalizer stays until the flow completes); add fault-injection tests in the mock (fail after step N).
 - A process holding a mountpoint open during promote/destroy is untested.
+
+## Strategy D (raw-only): candidate, verified 2026-10-14
+
+Idea (user): drop `rs-<id>`/`restore-source`. The backing clone `csi-snap-<uuid>` stays, but only as a snapshot-less vessel for a
+promote. Restores clone the raw snapshot `csi-snap-<uuid>` directly, wherever it currently lives (the source dataset or the
+backing clone; one lookup by the unique name). Flow on delete: `destroy -d` the raw, promote the restores off whichever dataset
+holds it (the loop in `detachAndCleanSnapshots`), destroy the empty vessel.
+
+- Model: exhaustive search, up to 6 creations (about 62k states), no STUCK, LEAK, INTEGRITY, residual or ghost-dataset result,
+  same as C. In every reachable state the raw is either in the source or in its own vessel, never elsewhere.
+- Live (ZFS 2.4.3, `spinning-archive/verify_zfs_functions`): replay of 116 scenarios (29 table rows on filesystems and zvols,
+  fan-out, 60 random sequences), 740 steps, matched the model after every step. The only differences are the known transient
+  zvol `dataset is busy` on destroy (P8).
+- Gains over C: no `rs-*` name at all (scenario 13 cannot collide), no re-marking step, no rename migration (W6a disappears),
+  one snapshot fewer per CSI snapshot.
+- Status: proposal, not yet adopted.
