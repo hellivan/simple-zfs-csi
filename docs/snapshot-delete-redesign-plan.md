@@ -1,6 +1,6 @@
 # Snapshot delete redesign: plan
 
-Status: **plan, nothing implemented** (2026-10); model and live ZFS replay done, strategy C chosen. Companion to
+Status: **plan complete, nothing implemented** (2026-10-15); model and live ZFS replay done, strategy D chosen. Companion to
 [snapshot-delete-scenarios.md](snapshot-delete-scenarios.md), which holds the scenario table and the model results.
 No code is written until this plan is complete and approved.
 
@@ -37,63 +37,95 @@ Target strategy: **D (raw-only)**, see [snapshot-delete-scenarios.md](snapshot-d
 Answered on 2026-10-13, see the results log in [zfs-conformance-checklist.md](zfs-conformance-checklist.md). Still open:
 a process holding a mountpoint open during promote or destroy, crash and race behaviour, and deeper #15587 chains.
 
-## Work packages (in order)
+## Implementation plan (in order)
 
-### W1. Extend the model
-- Add the strategies B and C to the model; keep it outside the repo until ported.
-- Re-run the 25 scenarios and the exhaustive search with a larger restore fan-out (at least 5 restores of one snapshot).
-- Exit: B has no STUCK and no free residual, or the remaining cases are understood.
-- **Done (2026-10):** B has no stuck delete, leak, damage or residual up to 6 creations and in 5/6-restore fan-out; see
-  [snapshot-delete-scenarios.md](snapshot-delete-scenarios.md). Still depends on the unverified defer-mark-moves-on-promote behaviour (W3).
+Rule for every step: tests first or together with the code, one commit per step, nothing touches the production cluster or
+pool without explicit approval, live ZFS tests only under `spinning-archive/verify_zfs_functions`, the user pushes and releases.
 
-### W2. In-memory ZFS (test-support package)
-- One state machine implementing `zpool.ZFS`. State: datasets (properties, kind), snapshots (properties, defer mark,
-  creation order), origin per clone.
-- Every method reads or mutates this one state: `List`, `Get` (`origin`, `clones`, user properties), `ListSnapshots`,
-  `Clones`, `FindSnapshot` are views of it.
-- Rules enforced in the mutation with ZFS-style errors: destroy with clones, destroy dataset with snapshots, promote
-  conflict, `-d` auto-removal, the multi-call promote quirk (openzfs#15587).
-- Invariants checked after every step: no dangling origin, unique snapshot names per dataset, clone origins exist.
+### Done
+- **S0. Model and live verification.** Scenario table, exhaustive model search, live replay of 116 scenarios for D
+  (and 96 for C), checklist in [zfs-conformance-checklist.md](zfs-conformance-checklist.md). Session tooling lives outside
+  the repo (`sim2.py`, `sim3.py`, `replay*.py`); the Go suite in S2 replaces it.
+
+### S1. Labels (P1)
+No behaviour change; ships first.
+- `internal/zpool/zfs.go`: add to the `ZFS` interface and the CLI the calls to set and read user properties on datasets and
+  snapshots (`zfs set simple-zfs-csi:role=...`, `zfs get -H -o value`, and a list call that returns chosen properties,
+  e.g. `zfs list -o name,simple-zfs-csi:role`). Verified live: user properties work on snapshots, are not inherited by clones,
+  and move with a promoted snapshot.
+- Label on create, all four places: volume dataset (`volume`), raw snapshot (`raw`), backing clone (`backing`), direct-clone
+  origin snapshot (`clone-origin`). `simple-zfs-csi:owner` is the UID of the owning `ZfsDataset`/`ZfsSnapshot`; a
+  restore-from-snapshot volume is a `volume`. Properties are set at create time where possible (`zfs create -o`,
+  `zfs clone -o`), and for snapshots right after `zfs snapshot` (idempotent, repaired on reconcile if missing).
+- Tests on the existing fake first; the same tests move to the in-memory ZFS in S2.
+- Files: `internal/zpool/zfs.go`, `zfsdataset_controller.go`, `zfssnapshot_controller.go`, `zfsgroupsnapshot_controller.go`.
+
+### S2. In-memory ZFS and conformance suite (W2, W3)
+- Test-support package implementing `zpool.ZFS` as one state machine: datasets (kind, properties), snapshots (properties, defer
+  mark, creation order), origin per clone. All reads (`List`, `Get`, `Clones`, `ListSnapshots`, `FindSnapshot`) are views of it.
+- Enforces with exact ZFS error texts: destroy with clones or snapshots, `-d` semantics and auto-removal when the last clone
+  goes, promote (moves origin and older snapshots, mark and properties move, conflict error), rename, injectable
+  `dataset is busy` (P8), user properties.
+- Invariants checked after every step: no dangling origin, unique snapshot names per dataset, clone origins exist, the raw
+  snapshot is on its source or its backing clone.
+- Conformance suite: scenario scripts run on the mock always and on a real pool behind a build tag, only under the test dataset.
+  The 116 scenarios already verified live are ported as the first cases. Also checks the origin rule (P4) against real ZFS.
 - Replaces `fakeZFS` in the controller tests.
 
-### W3. Conformance suite
-- Scenario scripts written once, run against the in-memory ZFS (always) and the real `zfs` CLI on a file-backed scratch
-  pool (build tag or env var, never the production pool).
-- Compare state after every step. A difference means the mock is wrong; fix the mock and the doc.
-- Answers the open ZFS questions above.
+### S3. Source references (API change)
+Needed because under D the raw snapshot has no fixed path (see P4). The CSI layer must pass intent, not a path.
+- `DatasetSource` keeps the two path fields (`snapshot`, `volume`: create from a given ZFS path, still supported and useful
+  for manual or tooling use) and gains two references: `zfsSnapshotRef: {name}` (a `ZfsSnapshot`) and
+  `zfsDatasetRef: {name}` (a `ZfsDataset`). The names avoid `volumeRef`, which would clash with `spec.volume` (zvol options).
+- The three options are mutually exclusive: path (`snapshot` or `volume`), `zfsSnapshotRef`, `zfsDatasetRef`. A CEL rule on
+  `DatasetSource` allows exactly one of the four fields; `source` stays immutable.
+- CSI (`internal/csi/clone.go`): fills the references, keeps the existing checks (same pool, type compatible, same prefix,
+  snapshot not terminating and Ready). Stops deriving the backing-clone path.
+- `ZfsDataset` reconciler: resolves a reference on the node. Snapshot ref: read the `ZfsSnapshot`, find the raw snapshot
+  (P4, origin lookup, scan as fallback), `zfs clone` it. Dataset ref: read the `ZfsDataset`, snapshot it as `@clone-<name>`
+  and clone. A path source behaves as today. A missing or terminating referenced object means wait or report, never clone
+  something else.
+- RBAC: check that the role running the `ZfsDataset` reconciler can `get` `zfssnapshots` and `zfsdatasets`; update chart roles.
+- CRD, generated code and chart CRDs regenerated. Existing objects with path sources keep working unchanged.
+- Old backing clones (with `restore-source`) restore fine through the new path: the raw snapshot is still pinned by the backing clone.
 
-### W4. Scenario tests
-- One test per row of the scenario table, driving the real reconcilers on the in-memory ZFS.
-- Assertions: no stuck delete, nothing left at the end, live volumes and snapshots intact, no unowned snapshot on a live volume.
-- Bounded property test generating operation sequences as the model does.
-- Include fan-out (several restores of one snapshot) and group snapshots (a group delete is a series of single deletes).
+### S4. Strategy D in the driver (W4, W5)
+- Scenario tests (W4): one test per row of the scenario table (25 rows plus 18 to 19b), fan-out, group snapshots, and a
+  bounded property test, driving the real reconcilers on the in-memory ZFS. Assertions: no stuck delete, nothing left at the
+  end, live volumes and snapshots intact, no unowned snapshot on a live volume, invariants after every step.
+- Snapshot create: raw snapshot, backing clone (labelled), no `restore-source`.
+- Restore: resolve the raw snapshot via the backing clone's `origin` (P4), verify it, fall back to the scan.
+- Snapshot delete (P3): `destroy -d` the raw, promote clones of it off whichever dataset holds it, destroy the empty backing clone.
+- Promote loop `detachAndCleanSnapshots` (P4a): oldest pinned snapshot first; among its clones prefer the one labelled
+  `backing`; bounded rounds, re-check after each promote. Every snapshot destroy is `-d`.
+- Volume delete: same loop; a direct clone marks its `@clone-<name>` snapshot (P5, found by label or name anywhere).
+- `dataset is busy` is retryable (P8).
+- The uncommitted prototype (`DestroySnapshotDeferred`, `detachSnapshotClones` removed) is the starting point and is
+  re-checked against these tests before it is committed.
+- Delete logic selects by label. The allow-list (`driverSnapshotSuffix`) keeps only a `restore-source` arm until S6 ran.
+- Remove the fixed `restore-source` creation and every code path that reads it (`restoreSourcePresent`, the self-snapshot in `reconcileBackingClone`).
 
-### W5. Implementation: strategy D with labels
-- Flow D for snapshot delete (P3), deferred destroy everywhere for snapshots (P2), clone-origin cleanup (P5), retryable `dataset is busy` (P8), labels on create (P1).
-- Restore: locate the raw snapshot via the backing clone's `origin` (P4), verify it exists, fall back to the pool-wide scan only if the backing clone is missing.
-- API consequence: today the CSI layer (no ZFS access) builds `DatasetSource.Snapshot = <backing clone>@restore-source` ([clone.go](../internal/csi/clone.go)). Under D the raw snapshot's location is only known from ZFS, so the CSI layer passes a reference to the snapshot (its `ZfsSnapshot`) and the `ZfsDataset` reconciler resolves the raw location (P4) when it clones. Needs a `DatasetSource` field and CRD change.
-- Group snapshots are unaffected: the group reconciler only takes the atomic `zfs snapshot` of the raws; each member then gets its own backing clone from the normal `ZfsSnapshot` path. Under D a member restore clones its raw directly, so it carries exactly the group instant (the old `restore-source` was taken a moment later).
-- Promote loop (`detachAndCleanSnapshots`): oldest pinned snapshot first; among its clones prefer the one labelled `backing` for that snapshot, otherwise any; bounded rounds, re-checked after each promote.
-- Revise ADR-0028, ADR-0030, ADR-0041 and D0/D19 text that mentions `detachSnapshotClones`; update `lifecycle-protection-matrix.md` and `delete-path-verification-2026-08-03.md`.
-- The uncommitted prototype (`DestroySnapshotDeferred`, promote removal) is the starting point and is re-checked against W4.
-- Delete logic selects by label. The allow-list only keeps its `restore-source` arm until the migration ran (W6a).
+### S5. Documentation
+- Revise ADR-0028, ADR-0030, ADR-0041, ADR-0009 (source references) and D0/D5/D15/D19 text that mentions `detachSnapshotClones`
+  or `restore-source`; add an ADR for strategy D. Update `lifecycle-protection-matrix.md`,
+  `delete-path-verification-2026-08-03.md`, `IMPLEMENTATION_PROGRESS.md`, and the scenario doc (D column).
 
-### W6a. One-time migration script (labels and `restore-source`)
-- Script outside the driver (`hack/`), dry run by default. Idempotent.
-- Audit (read-only): list every driver dataset and snapshot, the `ZfsDataset`/`ZfsSnapshot` that owns it, and every `@restore-source`.
-- Labels each old backing clone and volume with the P1 properties (`zfs set`), which is what lets the driver drop name matching.
-- Runs `zfs destroy -d` on every `@restore-source`: ZFS removes it at once, or when the last old restore that depends on it is gone (the mark survives promotes).
-- No rename, and no restore-from-`restore-source` fallback in the driver.
-- Run once after phase 1 is deployed and after the user approves the audit. Likely few or no objects.
-- The driver keeps a single `restore-source` arm in its allow-list for one release, so an old restore that still holds a marked `restore-source` can be deleted. Removed once an audit finds none.
-- The migration is verified live on a layout built the old way (a few scenarios) before it is run anywhere real. Mixed-state simulation is not needed.
-- Nothing touches the production cluster without explicit approval.
+### S6. One-time migration script (P7)
+- Outside the driver (`hack/`), dry run by default, idempotent.
+- Audit (read-only): every driver dataset and snapshot, the object that owns it, every `@restore-source`.
+- Labels old datasets and snapshots, and runs `zfs destroy -d` on every `@restore-source` (removed at once, or when the last old
+  restore that depends on it is gone; the mark survives promotes).
+- Verified live first on a layout built the old way (a few scenarios), then run on the cluster only after the user approves the audit.
 
-### W6b. Later: remove the allow-list
-- Once an audit shows no unlabelled objects and no `restore-source`, remove `driverSnapshotSuffix` and its `restore-source` arm.
+### S7. Release and verify
+- The user releases. Live test on a throwaway namespace: the joplin group test, a restore, deletes in the orders of scenarios 6, 12 and 13.
+- After the migration and an audit that finds no unlabelled object and no `restore-source`: remove the allow-list.
 
-### W7. Release and verify
-- Chart and image release by the user, then a live test on a throwaway namespace repeating the joplin group test, a restore, and deletes in the orders of scenarios 6, 12 and 13.
+### Open items outside this redesign
+Finish C9 (cross-pool `FAILED_PRECONDITION`, member restore after a member is deleted), C10, C11, D1/D3/D4/D5, E1/E2/E4 to E6,
+F3 to F5, Phase G, the optional chart template `volumeGroupSnapshotClasses`, the stale gitops comment on `snapshotter.tag`.
+Remove the test dataset `spinning-archive/verify_zfs_functions` at the end, only with the user's OK.
+
 
 ## Risks
 
@@ -103,7 +135,7 @@ a process holding a mountpoint open during promote or destroy, crash and race be
   reconciler (the finalizer stays until the flow completes); add fault-injection tests in the mock (fail after step N).
 - A process holding a mountpoint open during promote/destroy is untested.
 
-## Strategy D (raw-only): candidate, verified 2026-10-14
+## Strategy D (raw-only): verified 2026-10-14
 
 Idea (user): drop `rs-<id>`/`restore-source`. The backing clone `csi-snap-<uuid>` stays, but only as a snapshot-less vessel for a
 promote. Restores clone the raw snapshot `csi-snap-<uuid>` directly, wherever it currently lives (the source dataset or the
