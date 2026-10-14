@@ -71,6 +71,8 @@ a process holding a mountpoint open during promote or destroy, crash and race be
 ### W5. Implementation: strategy D with labels
 - Flow D for snapshot delete (P3), deferred destroy everywhere for snapshots (P2), clone-origin cleanup (P5), retryable `dataset is busy` (P8), labels on create (P1).
 - Restore: locate the raw snapshot via the backing clone's `origin` (P4), verify it exists, fall back to the pool-wide scan only if the backing clone is missing.
+- API consequence: today the CSI layer (no ZFS access) builds `DatasetSource.Snapshot = <backing clone>@restore-source` ([clone.go](../internal/csi/clone.go)). Under D the raw snapshot's location is only known from ZFS, so the CSI layer passes a reference to the snapshot (its `ZfsSnapshot`) and the `ZfsDataset` reconciler resolves the raw location (P4) when it clones. Needs a `DatasetSource` field and CRD change.
+- Group snapshots are unaffected: the group reconciler only takes the atomic `zfs snapshot` of the raws; each member then gets its own backing clone from the normal `ZfsSnapshot` path. Under D a member restore clones its raw directly, so it carries exactly the group instant (the old `restore-source` was taken a moment later).
 - Promote loop (`detachAndCleanSnapshots`): oldest pinned snapshot first; among its clones prefer the one labelled `backing` for that snapshot, otherwise any; bounded rounds, re-checked after each promote.
 - Revise ADR-0028, ADR-0030, ADR-0041 and D0/D19 text that mentions `detachSnapshotClones`; update `lifecycle-protection-matrix.md` and `delete-path-verification-2026-08-03.md`.
 - The uncommitted prototype (`DestroySnapshotDeferred`, promote removal) is the starting point and is re-checked against W4.
