@@ -47,8 +47,9 @@ pool without explicit approval, live ZFS tests only under `spinning-archive/veri
   (and 96 for C), checklist in [zfs-conformance-checklist.md](zfs-conformance-checklist.md). Session tooling lives outside
   the repo (`sim2.py`, `sim3.py`, `replay*.py`); the Go suite in S2 replaces it.
 
-### S1. Labels (P1)
-No behaviour change; ships first.
+### S1. Labels (P1) — DONE (`2b8d429`)
+No behaviour change; ships first. Verified live: `-o` on create/clone, labels survive `destroy -d` and promote, snapshots
+inherit the dataset's user properties when read (see `labels.md`).
 - `internal/zpool/zfs.go`: add to the `ZFS` interface and the CLI the calls to set and read user properties on datasets and
   snapshots (`zfs set simple-zfs-csi:role=...`, `zfs get -H -o value`, and a list call that returns chosen properties,
   e.g. `zfs list -o name,simple-zfs-csi:role`). Verified live: user properties work on snapshots, are not inherited by clones,
@@ -56,7 +57,7 @@ No behaviour change; ships first.
 - Label on create, all four places: volume dataset (`volume`), raw snapshot (`raw`), backing clone (`backing`), direct-clone
   origin snapshot (`clone-origin`). `simple-zfs-csi:owner` is the UID of the owning `ZfsDataset`/`ZfsSnapshot`; a
   restore-from-snapshot volume is a `volume`. Properties are set at create time where possible (`zfs create -o`,
-  `zfs clone -o`), and for snapshots right after `zfs snapshot` (idempotent, repaired on reconcile if missing).
+  `zfs clone -o`), and for snapshots right after `zfs snapshot` (idempotent; only while the object is being provisioned, see S6).
 - Tests on the existing fake first; the same tests move to the in-memory ZFS in S2.
 - Files: `internal/zpool/zfs.go`, `zfsdataset_controller.go`, `zfssnapshot_controller.go`, `zfsgroupsnapshot_controller.go`.
 
@@ -115,10 +116,11 @@ Why: from S4 on the driver selects objects by label (see `labels.md`). Objects c
 pre-S1 driver while the new one rolls out) carry no labels. Labels are not optional for correctness: an unlabelled raw
 snapshot or backing clone must never be misclassified.
 
-The driver cannot self-repair: once an object is provisioned (`provisionedAt`, ADR-0038) its reconciler only observes and
-never touches ZFS again, so `EnsureLabels` runs only while an object is being provisioned (it covers objects in flight during
-the rollout, nothing else). **Every object that exists before the S1 driver is therefore labelled only by the migration
-script**, and S4's label-based delete may only be released once the script's audit is clean.
+The driver barely self-repairs. Verified in the code: the `ZfsSnapshot` reconciler returns early once an object is provisioned
+(`provisionedAt`, ADR-0038) and never touches ZFS again, so raw snapshots and backing clones created before S1 are never labelled
+by the driver. The `ZfsDataset` reconciler keeps running for existing volumes (it only refuses to re-create), so it labels
+volumes on their next reconcile, but `clone-origin` snapshots are only labelled at clone creation. The migration script must not
+rely on any of this: **it labels every pre-S1 object**, and S4's label-based delete may only be released once its audit is clean.
 
 The script also covers orphans (driver-named ZFS objects without a CR), `restore-source` snapshots and `@clone-*` snapshots
 whose `ZfsDataset` is gone.
