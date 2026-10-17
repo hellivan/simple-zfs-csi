@@ -169,6 +169,13 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("created ZFS snapshot", "snapshot", full)
 	}
 
+	// The raw snapshot is labelled right after it exists. A group member's raw
+	// snapshot is taken by the group reconciler in one atomic call, so this is
+	// also where it gets its owner.
+	if err := zpool.EnsureLabels(ctx, r.ZFS, full, zpool.RoleRaw, string(snap.UID)); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Restores clone the backing clone's "@restore-source" (D5), never the raw
 	// snapshot above directly (D0/§3.1).
 	return r.reconcileBackingClone(ctx, &snap, &pool, datasetPath, full)
@@ -424,11 +431,15 @@ func (r *ZfsSnapshotReconciler) reconcileBackingClone(ctx context.Context, snap 
 			return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
 				"LookupFailed", err.Error())
 		}
-		if err := r.ZFS.Clone(ctx, rawFull, backingFull, backingCloneProperties(sourceType)); err != nil {
+		if err := r.ZFS.Clone(ctx, rawFull, backingFull, zpool.MergeLabels(backingCloneProperties(sourceType), zpool.RoleBacking, string(snap.UID))); err != nil {
 			return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
 				"BackingCloneFailed", err.Error())
 		}
 		logger.Info("created backing clone", "dataset", backingFull, "origin", rawFull)
+	}
+
+	if err := zpool.EnsureLabels(ctx, r.ZFS, backingFull, zpool.RoleBacking, string(snap.UID)); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	restoreSourceFull := backingFull + "@" + restoreSourceSnapshotName

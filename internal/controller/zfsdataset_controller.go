@@ -189,6 +189,12 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		logger.Info("created ZFS object", "dataset", full, "type", vol.Spec.Type)
 	}
 
+	// Labels are set at create time; this repairs a dataset that has none
+	// (created by an older driver) and is a no-op otherwise.
+	if err := zpool.EnsureLabels(ctx, r.ZFS, full, zpool.RoleVolume, string(vol.UID)); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Converge the on-disk size toward the spec (volume expansion). The CSI
 	// controller bumps spec.filesystem.quota / spec.volume.size; the agent applies
 	// it here on the next reconcile.
@@ -253,12 +259,12 @@ func (r *ZfsDatasetReconciler) create(ctx context.Context, vol *storagev1alpha1.
 	}
 	switch vol.Spec.Type {
 	case storagev1alpha1.DatasetTypeFilesystem:
-		return r.ZFS.CreateDataset(ctx, full, filesystemProps(vol))
+		return r.ZFS.CreateDataset(ctx, full, zpool.MergeLabels(filesystemProps(vol), zpool.RoleVolume, string(vol.UID)))
 	case storagev1alpha1.DatasetTypeVolume:
 		if vol.Spec.Volume == nil {
 			return fmt.Errorf("spec.volume is required for volume")
 		}
-		return r.ZFS.CreateZvol(ctx, full, vol.Spec.Volume.Size.Value(), volumeProps(vol))
+		return r.ZFS.CreateZvol(ctx, full, vol.Spec.Volume.Size.Value(), zpool.MergeLabels(volumeProps(vol), zpool.RoleVolume, string(vol.UID)))
 	default:
 		return fmt.Errorf("unknown volume type %q", vol.Spec.Type)
 	}
@@ -290,7 +296,7 @@ func (r *ZfsDatasetReconciler) applyRootOwnership(ctx context.Context, vol *stor
 // size and then converges to the requested capacity.
 func (r *ZfsDatasetReconciler) clone(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, dest string) error {
 	src := vol.Spec.Source
-	props := copyProps(vol.Spec.Properties)
+	props := zpool.MergeLabels(vol.Spec.Properties, zpool.RoleVolume, string(vol.UID))
 	switch {
 	case src.Snapshot != "":
 		snapFull := poolName + "/" + strings.TrimLeft(src.Snapshot, "/")
@@ -299,6 +305,9 @@ func (r *ZfsDatasetReconciler) clone(ctx context.Context, vol *storagev1alpha1.Z
 		srcFull := poolName + "/" + strings.Trim(src.Volume, "/")
 		snapFull := srcFull + "@clone-" + cloneSnapshotSuffix(vol.Name)
 		if err := r.ZFS.Snapshot(ctx, snapFull); err != nil {
+			return err
+		}
+		if err := zpool.EnsureLabels(ctx, r.ZFS, snapFull, zpool.RoleCloneOrigin, string(vol.UID)); err != nil {
 			return err
 		}
 		return r.ZFS.Clone(ctx, snapFull, dest, props)
