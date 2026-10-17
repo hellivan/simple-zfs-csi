@@ -154,7 +154,39 @@ spec:
                       cloning from another volume. The agent takes an intermediate snapshot of it
                       first, then clones that.
                     type: string
+                  zfsDatasetRef:
+                    description: |-
+                      ZfsDatasetRef clones another ZfsDataset: the node takes an intermediate
+                      snapshot of it and clones that. While the ZfsDataset is missing or being
+                      deleted, nothing is cloned.
+                    properties:
+                      name:
+                        description: Name is the metadata.name of the referenced object.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  zfsSnapshotRef:
+                    description: |-
+                      ZfsSnapshotRef restores from a ZfsSnapshot. The node finds the snapshot's
+                      ZFS snapshot wherever it currently lives and clones it. While the
+                      ZfsSnapshot is missing, being deleted or not Ready, nothing is cloned.
+                    properties:
+                      name:
+                        description: Name is the metadata.name of the referenced object.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
                 type: object
+                x-kubernetes-validations:
+                - message: exactly one of snapshot, volume, zfsSnapshotRef or zfsDatasetRef
+                    must be set
+                  rule: '(has(self.snapshot) ? 1 : 0) + (has(self.volume) ? 1 : 0)
+                    + (has(self.zfsSnapshotRef) ? 1 : 0) + (has(self.zfsDatasetRef)
+                    ? 1 : 0) == 1'
               type:
                 description: |-
                   Type selects a filesystem or a volume/zvol and determines which of the

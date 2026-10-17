@@ -62,8 +62,8 @@ func TestCreateVolume_RestoreFromSnapshot(t *testing.T) {
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-restore"}, vol); err != nil {
 		t.Fatalf("get ZfsDataset: %v", err)
 	}
-	if vol.Spec.Source == nil || vol.Spec.Source.Snapshot != "k8s/snap-1@restore-source" {
-		t.Errorf("clone source = %+v, want snapshot k8s/snap-1@restore-source", vol.Spec.Source)
+	if vol.Spec.Source == nil || vol.Spec.Source.ZfsSnapshotRef == nil || vol.Spec.Source.ZfsSnapshotRef.Name != "snap-1" || vol.Spec.Source.Snapshot != "" || vol.Spec.Source.Volume != "" {
+		t.Errorf("clone source = %+v, want zfsSnapshotRef snap-1 only", vol.Spec.Source)
 	}
 }
 
@@ -112,8 +112,8 @@ func TestCreateVolume_CloneFromVolume(t *testing.T) {
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-clone"}, vol); err != nil {
 		t.Fatalf("get ZfsDataset: %v", err)
 	}
-	if vol.Spec.Source == nil || vol.Spec.Source.Volume != "k8s/pvc-src" {
-		t.Errorf("clone source = %+v, want volume k8s/pvc-src", vol.Spec.Source)
+	if vol.Spec.Source == nil || vol.Spec.Source.ZfsDatasetRef == nil || vol.Spec.Source.ZfsDatasetRef.Name != "pvc-src" || vol.Spec.Source.Snapshot != "" || vol.Spec.Source.Volume != "" {
+		t.Errorf("clone source = %+v, want zfsDatasetRef pvc-src only", vol.Spec.Source)
 	}
 }
 
@@ -270,11 +270,10 @@ func TestCreateVolume_RestoreTypeMismatchRejectedAfterSourceDeleted(t *testing.T
 	}
 }
 
-// TestCreateVolume_RestoreClonesFromBackingClone verifies D0/D15: a
-// snapshot's restore clones from its backing clone's
-// "@restore-source" self-snapshot, never the raw origin snapshot, and records
-// no dependency bookkeeping on that backing clone (D17).
-func TestCreateVolume_RestoreClonesFromBackingClone(t *testing.T) {
+// TestCreateVolume_RestoreUsesSnapshotReference verifies that a restore is
+// stated as a reference to the ZfsSnapshot (the node locates the ZFS snapshot),
+// not as a path, and records no dependency bookkeeping (D17).
+func TestCreateVolume_RestoreUsesSnapshotReference(t *testing.T) {
 	snap := &storagev1alpha1.ZfsSnapshot{
 		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
@@ -308,8 +307,8 @@ func TestCreateVolume_RestoreClonesFromBackingClone(t *testing.T) {
 	if err := cl.Get(context.Background(), client.ObjectKey{Name: "pvc-restore"}, vol); err != nil {
 		t.Fatalf("get ZfsDataset: %v", err)
 	}
-	if vol.Spec.Source == nil || vol.Spec.Source.Snapshot != "k8s/csi-snap-x@restore-source" {
-		t.Errorf("clone source = %+v, want snapshot k8s/csi-snap-x@restore-source", vol.Spec.Source)
+	if vol.Spec.Source == nil || vol.Spec.Source.ZfsSnapshotRef == nil || vol.Spec.Source.ZfsSnapshotRef.Name != "snap-1" {
+		t.Errorf("clone source = %+v, want zfsSnapshotRef snap-1", vol.Spec.Source)
 	}
 
 	// D17 removed the restored-by.* tracking finalizer entirely: the agent's

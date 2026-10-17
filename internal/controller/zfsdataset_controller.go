@@ -7,6 +7,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -179,6 +180,13 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{RequeueAfter: lostRecheckInterval}, nil
 		}
 		if err := r.create(ctx, &vol, pool.Status.PoolName, full); err != nil {
+			var wait *sourceNotReadyError
+			if errors.As(err, &wait) {
+				// The referenced source may still appear or become Ready: report
+				// and retry, never clone anything else (ADR-0038, point 7).
+				return ctrl.Result{RequeueAfter: sourceRetryInterval}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
+					"SourceNotReady", err.Error())
+			}
 			return ctrl.Result{}, r.setStatus(ctx, &vol, storagev1alpha1.DatasetPhaseError, "",
 				"CreateFailed", err.Error())
 		}
@@ -293,29 +301,101 @@ func (r *ZfsDatasetReconciler) applyRootOwnership(ctx context.Context, vol *stor
 	return r.ZFS.ApplyOwnership(ctx, mountpoint, fs.UID, fs.GID, fs.Mode)
 }
 
-// clone provisions the dataset by cloning a source snapshot or volume. Sizing is
-// left to ensureSize (which runs right after) so the clone inherits the origin's
-// size and then converges to the requested capacity.
+// sourceRetryInterval is how long a clone waits before looking at its source
+// reference again.
+const sourceRetryInterval = 10 * time.Second
+
+// sourceNotReadyError means a referenced source does not exist yet, is being
+// deleted, or is not Ready. It is retried; it never falls back to another source.
+type sourceNotReadyError struct{ msg string }
+
+func (e *sourceNotReadyError) Error() string { return e.msg }
+
+func notReady(format string, a ...any) error {
+	return &sourceNotReadyError{msg: fmt.Sprintf(format, a...)}
+}
+
+// clone provisions the dataset by cloning a source: a snapshot or volume path, a
+// ZfsSnapshot reference or a ZfsDataset reference. Sizing is left to ensureSize
+// (which runs right after) so the clone inherits the origin's size and then
+// converges to the requested capacity.
 func (r *ZfsDatasetReconciler) clone(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, dest string) error {
 	src := vol.Spec.Source
 	props := zpool.MergeLabels(vol.Spec.Properties, zpool.RoleVolume, string(vol.UID))
 	switch {
 	case src.Snapshot != "":
-		snapFull := poolName + "/" + strings.TrimLeft(src.Snapshot, "/")
-		return r.ZFS.Clone(ctx, snapFull, dest, props)
+		return r.ZFS.Clone(ctx, poolName+"/"+strings.TrimLeft(src.Snapshot, "/"), dest, props)
 	case src.Volume != "":
-		srcFull := poolName + "/" + strings.Trim(src.Volume, "/")
-		snapFull := srcFull + "@clone-" + cloneSnapshotSuffix(vol.Name)
-		if err := r.ZFS.Snapshot(ctx, snapFull); err != nil {
+		return r.cloneFromDataset(ctx, vol, poolName, strings.Trim(src.Volume, "/"), dest, props)
+	case src.ZfsSnapshotRef != nil:
+		raw, err := r.resolveSnapshotRef(ctx, vol, poolName, src.ZfsSnapshotRef.Name)
+		if err != nil {
 			return err
 		}
-		if err := zpool.EnsureLabels(ctx, r.ZFS, snapFull, zpool.RoleCloneOrigin, string(vol.UID)); err != nil {
+		return r.ZFS.Clone(ctx, raw, dest, props)
+	case src.ZfsDatasetRef != nil:
+		var from storagev1alpha1.ZfsDataset
+		if err := r.Get(ctx, client.ObjectKey{Name: src.ZfsDatasetRef.Name}, &from); err != nil {
+			if apierrors.IsNotFound(err) {
+				return notReady("source ZfsDataset %q not found", src.ZfsDatasetRef.Name)
+			}
 			return err
 		}
-		return r.ZFS.Clone(ctx, snapFull, dest, props)
+		if !from.DeletionTimestamp.IsZero() {
+			return notReady("source ZfsDataset %q is being deleted", from.Name)
+		}
+		if from.Spec.PoolGUID != vol.Spec.PoolGUID {
+			return fmt.Errorf("source ZfsDataset %q is on pool %s, not %s", from.Name, from.Spec.PoolGUID, vol.Spec.PoolGUID)
+		}
+		return r.cloneFromDataset(ctx, vol, poolName, strings.Trim(from.Spec.Dataset, "/"), dest, props)
 	default:
-		return fmt.Errorf("spec.source has neither snapshot nor volume")
+		return fmt.Errorf("spec.source sets none of snapshot, volume, zfsSnapshotRef, zfsDatasetRef")
 	}
+}
+
+// cloneFromDataset snapshots a source dataset as "@clone-<name>" and clones that.
+func (r *ZfsDatasetReconciler) cloneFromDataset(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, srcPath, dest string, props map[string]string) error {
+	snapFull := poolName + "/" + srcPath + "@clone-" + cloneSnapshotSuffix(vol.Name)
+	if err := r.ZFS.Snapshot(ctx, snapFull); err != nil {
+		return err
+	}
+	if err := zpool.EnsureLabels(ctx, r.ZFS, snapFull, zpool.RoleCloneOrigin, string(vol.UID)); err != nil {
+		return err
+	}
+	return r.ZFS.Clone(ctx, snapFull, dest, props)
+}
+
+// resolveSnapshotRef returns the full name of the raw ZFS snapshot behind a
+// ZfsSnapshot, wherever promotes have put it.
+func (r *ZfsDatasetReconciler) resolveSnapshotRef(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, name string) (string, error) {
+	var snap storagev1alpha1.ZfsSnapshot
+	if err := r.Get(ctx, client.ObjectKey{Name: name}, &snap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", notReady("source ZfsSnapshot %q not found", name)
+		}
+		return "", err
+	}
+	if !snap.DeletionTimestamp.IsZero() {
+		return "", notReady("source ZfsSnapshot %q is being deleted", name)
+	}
+	if snap.Status.Phase != storagev1alpha1.SnapshotPhaseReady {
+		return "", notReady("source ZfsSnapshot %q is in phase %q, not Ready", name, snap.Status.Phase)
+	}
+	if snap.Spec.PoolGUID != vol.Spec.PoolGUID {
+		return "", fmt.Errorf("source ZfsSnapshot %q is on pool %s, not %s", name, snap.Spec.PoolGUID, vol.Spec.PoolGUID)
+	}
+	srcPath, err := resolveDatasetPath(ctx, r.Client, snap.Spec.SourceVolume, snap.Spec.Dataset)
+	if err != nil {
+		return "", err
+	}
+	raw, err := locateRawSnapshot(ctx, r.ZFS, poolName, backingCloneFullName(poolName, srcPath, snap.Spec.SnapshotName), snap.Spec.SnapshotName)
+	if err != nil {
+		return "", err
+	}
+	if raw == "" {
+		return "", notReady("raw snapshot of ZfsSnapshot %q not found", name)
+	}
+	return raw, nil
 }
 
 // cloneSnapshotSuffix derives the identifier for the intermediate

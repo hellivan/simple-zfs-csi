@@ -15,12 +15,6 @@ import (
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
-// restoreSourceSnapshotName mirrors internal/controller's constant of the same
-// name (D5, snapshot-lifecycle-redesign.md): the fixed, CSI-invisible
-// self-snapshot every backing clone carries.
-// Restores always clone from this, never from the raw origin snapshot.
-const restoreSourceSnapshotName = "restore-source"
-
 // normalizedDatasetPrefix normalises a StorageClass datasetPrefix for
 // comparison against path.Dir() of a full dataset path: path.Dir() of a
 // single-segment (no-prefix) path returns ".", so an empty prefix must
@@ -88,19 +82,10 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 			return nil, err
 		}
 
-		// Restores always clone from the backing clone's own "@restore-source"
-		// self-snapshot (D0/D15), never from the raw snapshot directly, so
-		// restoring keeps working whether the source volume is still alive,
-		// deleted-but-not-yet-promoted, or already promoted away — and, unlike a
-		// reference to the raw snapshot, it survives a promote relocating that
-		// snapshot onto another dataset (§11.1).
-		//
-		// The backing clone is not an object (ADR-0030), so its path is derived
-		// the same way the agent derives it: a flat sibling of the source dataset
-		// named after Spec.SnapshotName. The "is it usable?" precondition becomes
-		// the ZfsSnapshot's own state, which is more direct than the old check on
-		// the backing clone object's deletionTimestamp — a snapshot that is
-		// terminating or not yet Ready has no usable @restore-source.
+		// The restore is stated as a reference to the ZfsSnapshot; the node finds
+		// the ZFS snapshot behind it wherever promotes have moved it. All that is
+		// checked here is that the snapshot is usable now: a snapshot that is
+		// terminating or not yet Ready must not be restored from.
 		if !snap.DeletionTimestamp.IsZero() {
 			return nil, status.Errorf(codes.FailedPrecondition, "snapshot %q is being deleted; retry", id)
 		}
@@ -108,11 +93,12 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"snapshot %q is in phase %q, not yet restorable; retry", id, snap.Status.Phase)
 		}
-		backingDataset := path.Join(path.Dir(strings.Trim(c.snapshotSourceDataset(ctx, snap), "/")), snap.Spec.SnapshotName)
-		if err := checkSamePrefix(rp, backingDataset, "restore", id); err != nil {
+		// The backing clone is a sibling of the source dataset, so the source's
+		// prefix is the prefix the data lives under.
+		if err := checkSamePrefix(rp, c.snapshotSourceDataset(ctx, snap), "restore", id); err != nil {
 			return nil, err
 		}
-		return &storagev1alpha1.DatasetSource{Snapshot: backingDataset + "@" + restoreSourceSnapshotName}, nil
+		return &storagev1alpha1.DatasetSource{ZfsSnapshotRef: &storagev1alpha1.ObjectRef{Name: id}}, nil
 
 	case *csi.VolumeContentSource_Volume:
 		id := cs.GetVolume().GetVolumeId()
@@ -141,7 +127,7 @@ func (c *ControllerServer) resolveContentSource(ctx context.Context, req *csi.Cr
 		if err := checkCloneCompatibility(rp, src, requestedFsType(req.GetVolumeCapabilities())); err != nil {
 			return nil, err
 		}
-		return &storagev1alpha1.DatasetSource{Volume: src.Spec.Dataset}, nil
+		return &storagev1alpha1.DatasetSource{ZfsDatasetRef: &storagev1alpha1.ObjectRef{Name: id}}, nil
 
 	default:
 		return nil, status.Error(codes.InvalidArgument, "unsupported volume content source")

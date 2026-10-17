@@ -80,7 +80,17 @@ Original scope:
   The 116 scenarios already verified live are ported as the first cases. Also checks the origin rule (P4) against real ZFS.
 - Replaces `fakeZFS` in the controller tests.
 
-### S3. Source references (API change)
+### S3. Source references (API change) — DONE
+Implemented: `DatasetSource` gained `zfsSnapshotRef` / `zfsDatasetRef` (`ObjectRef{name}`), CEL "exactly one of the four", CRD
+regenerated. The CSI controller now sets the references (no backing-clone path, no `restore-source` name). The `ZfsDataset`
+reconciler resolves them: snapshot ref via `locateRawSnapshot` (backing clone's `origin`, verified, then the pool scan),
+dataset ref via `@clone-<name>`; a missing, terminating or not-Ready source gives `SourceNotReady` and a 10 s retry, never another
+source; a pool mismatch fails hard. RBAC needed no change (the agent role already reads `zfssnapshots` and `zfsdatasets`).
+Verified on the cluster's API server with a throwaway CRD (deleted again): the rule accepts each single field and rejects two
+fields, none and an empty name. Tests: `internal/controller/source_ref_test.go` (on the in-memory ZFS, including "the origin was
+enough, no scan" and "scan exactly once when the backing clone was promoted"), `internal/csi/clone_test.go`.
+Not done: `source` is not enforced immutable by the CRD today (it was not before either); add `self == oldSelf` if wanted.
+Original scope:
 Needed because under D the raw snapshot has no fixed path (see P4). The CSI layer must pass intent, not a path.
 - `DatasetSource` keeps the two path fields (`snapshot`, `volume`: create from a given ZFS path, still supported and useful
   for manual or tooling use) and gains two references: `zfsSnapshotRef: {name}` (a `ZfsSnapshot`) and

@@ -87,10 +87,23 @@ type VolumeConfig struct {
 	Volblocksize string `json:"volblocksize,omitempty"`
 }
 
-// DatasetSource references a ZFS source to clone the new dataset from instead of
+// ObjectRef names another cluster-scoped object of this API group.
+type ObjectRef struct {
+	// Name is the metadata.name of the referenced object.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// DatasetSource names the ZFS source to clone the new dataset from instead of
 // creating it empty (CSI VolumeContentSource). Clones are same-pool by ZFS
 // constraint, so the source lives on the same pool (PoolGUID) as the dataset.
-// Exactly one of Snapshot or Volume is set.
+//
+// Exactly one of the four fields is set. The two references are resolved by the
+// node at provisioning time, so the creator states intent ("restore from this
+// snapshot", "clone this volume") and does not need to know where ZFS keeps the
+// underlying snapshot, which a promote can move. The two paths address ZFS
+// objects directly and are meant for manual or tooling use.
+// +kubebuilder:validation:XValidation:rule="(has(self.snapshot) ? 1 : 0) + (has(self.volume) ? 1 : 0) + (has(self.zfsSnapshotRef) ? 1 : 0) + (has(self.zfsDatasetRef) ? 1 : 0) == 1",message="exactly one of snapshot, volume, zfsSnapshotRef or zfsDatasetRef must be set"
 type DatasetSource struct {
 	// Snapshot is the source snapshot's logical reference "<dataset>@<snapshot>"
 	// relative to the pool root, when restoring from a snapshot. The agent runs
@@ -103,6 +116,18 @@ type DatasetSource struct {
 	// first, then clones that.
 	// +optional
 	Volume string `json:"volume,omitempty"`
+
+	// ZfsSnapshotRef restores from a ZfsSnapshot. The node finds the snapshot's
+	// ZFS snapshot wherever it currently lives and clones it. While the
+	// ZfsSnapshot is missing, being deleted or not Ready, nothing is cloned.
+	// +optional
+	ZfsSnapshotRef *ObjectRef `json:"zfsSnapshotRef,omitempty"`
+
+	// ZfsDatasetRef clones another ZfsDataset: the node takes an intermediate
+	// snapshot of it and clones that. While the ZfsDataset is missing or being
+	// deleted, nothing is cloned.
+	// +optional
+	ZfsDatasetRef *ObjectRef `json:"zfsDatasetRef,omitempty"`
 }
 
 // ZfsDatasetSpec is the desired allocation of a ZFS dataset on the pool identified
