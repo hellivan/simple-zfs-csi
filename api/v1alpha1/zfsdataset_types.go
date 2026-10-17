@@ -141,6 +141,7 @@ type DatasetSource struct {
 // +kubebuilder:validation:XValidation:rule="self.type != 'volume' || has(self.volume)",message="spec.volume is required when type is volume"
 // +kubebuilder:validation:XValidation:rule="self.type != 'volume' || !has(self.filesystem)",message="spec.filesystem is only valid when type is filesystem"
 // +kubebuilder:validation:XValidation:rule="self.type != 'filesystem' || !has(self.volume)",message="spec.volume is only valid when type is volume"
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.source) ? (has(self.source) && self.source == oldSelf.source) : !has(self.source)",message="spec.source is immutable (it can be neither changed, set nor cleared)"
 type ZfsDatasetSpec struct {
 	// PoolGUID is the immutable ZFS pool GUID (the ZfsPool metadata.name, without
 	// the "zpool-" prefix) that this volume is allocated on. The agent derives the
@@ -182,7 +183,9 @@ type ZfsDatasetSpec struct {
 
 	// Source, when set, clones the dataset from an existing snapshot or volume
 	// instead of creating it empty (CSI VolumeContentSource). The source must be
-	// on the same pool (PoolGUID) and of the same Type.
+	// on the same pool (PoolGUID) and of the same Type. It is read once, when the
+	// dataset is created, and records what the dataset was derived from, so it is
+	// immutable.
 	// +optional
 	Source *DatasetSource `json:"source,omitempty"`
 }

@@ -89,7 +89,7 @@ source; a pool mismatch fails hard. RBAC needed no change (the agent role alread
 Verified on the cluster's API server with a throwaway CRD (deleted again): the rule accepts each single field and rejects two
 fields, none and an empty name. Tests: `internal/controller/source_ref_test.go` (on the in-memory ZFS, including "the origin was
 enough, no scan" and "scan exactly once when the backing clone was promoted"), `internal/csi/clone_test.go`.
-Not done: `source` is not enforced immutable by the CRD today (it was not before either); add `self == oldSelf` if wanted.
+`spec.source` is now enforced immutable by a CEL rule on `ZfsDatasetSpec` (cannot be changed, set or cleared; verified on the API server with a throwaway CRD, unrelated spec updates still pass); see api-conventions §5.
 Original scope:
 Needed because under D the raw snapshot has no fixed path (see P4). The CSI layer must pass intent, not a path.
 - `DatasetSource` keeps the two path fields (`snapshot`, `volume`: create from a given ZFS path, still supported and useful

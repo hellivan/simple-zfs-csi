@@ -137,6 +137,12 @@ pointer someone may legitimately need to re-aim?"** Freeze the first, leave the
 second open. See
 [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) D24.
 
+`ZfsDataset.spec.source` is frozen under the same test (CEL on the spec: it can be neither
+changed, set nor cleared). It is read once, at creation, and records what the dataset was
+derived from; once the dataset exists, editing it could only make the record lie, and it has
+no repair use (nothing is re-cloned). It is not a location someone re-aims: a wrong source
+means deleting and recreating the volume.
+
 > **Historical note.** This section's original worked example was
 > `ZfsSnapshot.spec.mode`, a field that *selected a mechanism* — it switched
 > teardown semantics between the promote path and a blocking path, so flipping it
