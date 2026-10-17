@@ -111,11 +111,44 @@ Needed because under D the raw snapshot has no fixed path (see P4). The CSI laye
   `delete-path-verification-2026-08-03.md`, `IMPLEMENTATION_PROGRESS.md`, and the scenario doc (D column).
 
 ### S6. One-time migration script (P7)
-- Outside the driver (`hack/`), dry run by default, idempotent.
-- Audit (read-only): every driver dataset and snapshot, the object that owns it, every `@restore-source`.
-- Labels old datasets and snapshots, and runs `zfs destroy -d` on every `@restore-source` (removed at once, or when the last old
-  restore that depends on it is gone; the mark survives promotes).
-- Verified live first on a layout built the old way (a few scenarios), then run on the cluster only after the user approves the audit.
+Why: from S4 on the driver selects objects by label (see `labels.md`). Objects created before S1 (and any created by a
+pre-S1 driver while the new one rolls out) carry no labels. Labels are not optional for correctness: an unlabelled raw
+snapshot or backing clone must never be misclassified.
+
+Two layers, so nothing depends on the script alone:
+1. **Self-repair in the driver (already in S1):** `EnsureLabels` labels every live volume, raw snapshot and backing clone on
+   its next reconcile. Because the controllers re-reconcile all CRs on start, this fixes everything that has a CR.
+2. **Migration script (`hack/`)** for what the driver cannot or must not repair: orphans (driver-named ZFS objects without a
+   CR), `restore-source` snapshots, `clone-origin` snapshots whose `ZfsDataset` is gone, and an audit that proves the end state.
+   It also is the gate: S4's label-based delete may only be released once the audit is clean.
+
+Properties:
+- Outside the driver, dry run by default (`--apply` to act), idempotent, only touches objects under the configured prefix.
+- Never guesses: an object is labelled only when ownership is derivable from a CR (below). Everything else is *reported*, not changed.
+
+Derivation of labels (CR to object):
+
+| Object | Found via | role | owner |
+|---|---|---|---|
+| volume dataset/zvol | `ZfsDataset` status/spec dataset path | `volume` | CR UID |
+| raw snapshot | `ZfsSnapshot` `spec.dataset@spec.snapshotName` (follow the origin chain if it was promoted: pool-wide scan by name) | `raw` | CR UID |
+| backing clone | `ZfsSnapshot` name to `<parent>/csi-snap-<uuid>` of the raw snapshot | `backing` | CR UID |
+| `@clone-<name>` snapshot | `ZfsDataset <name>` exists | `clone-origin` | CR UID |
+| `@restore-source` | (old layout) | not labelled; `zfs destroy -d` (removed at once, or when the last old restore depending on it is gone; the mark survives promotes) | |
+
+Steps:
+1. Audit (read-only): list all driver datasets and snapshots with `zfs list -t all -o name,origin,clones,simple-zfs-csi:role,simple-zfs-csi:owner`
+   and all CRs; produce: labelled OK, to-label (CR derivable), orphans (no CR), `restore-source` list, conflicts (existing label
+   differs from derived one; inherited snapshot values must be told from local ones with `zfs get -s local`).
+2. Dry-run prints the exact `zfs set` / `zfs destroy -d` commands.
+3. `--apply` runs them; re-audit must report zero to-label, zero `restore-source`. Orphans stay a human decision.
+4. Verified live first on a layout built the old way (volume, snapshot, restore, clone, group) in `verify_zfs_functions`; run on the
+   cluster only after the user approves the audit output.
+5. Ordering with the release: deploy the S1 driver first (self-repair), run the script, audit clean, then the S4 driver.
+   Rollback is trivial: labels are inert properties and `destroy -d` was always the intended end state.
+
+Tests: the derivation and audit logic is Go or testable shell against the in-memory ZFS (S2), covering: unlabelled legacy layout,
+partially labelled, promoted raw (raw lives on a restore), orphan, wrong existing label, snapshot-inherited false positive.
 
 ### S7. Release and verify
 - The user releases. Live test on a throwaway namespace: the joplin group test, a restore, deletes in the orders of scenarios 6, 12 and 13.
