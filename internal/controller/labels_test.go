@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -91,20 +92,24 @@ func TestLabels_DirectCloneOriginSnapshot(t *testing.T) {
 	wantLabels(t, z, origin, zpool.RoleCloneOrigin, "uid-pvc-clone")
 }
 
-func TestLabels_ExistingVolumeIsRepaired(t *testing.T) {
+func TestLabels_ProvisionedVolumeIsNotTouched(t *testing.T) {
 	z := newFakeZFS("tank/k8s/pvc-old")
 	vol := labelDataset("pvc-old", nil)
 	vol.Status.Phase = storagev1alpha1.DatasetPhaseReady
 	r := datasetReconciler(t, z, vol)
-	reconcileTwiceOrMore(t, r, "pvc-old", 1)
-	wantLabels(t, z, "tank/k8s/pvc-old", zpool.RoleVolume, "uid-pvc-old")
-	n := len(z.setProps)
 	reconcileTwiceOrMore(t, r, "pvc-old", 2)
-	for _, s := range z.setProps[n:] {
-		if len(s) >= len("tank/k8s/pvc-old "+zpool.PropRole) && s[:len("tank/k8s/pvc-old simple-zfs-csi")] == "tank/k8s/pvc-old simple-zfs-csi" {
-			t.Errorf("labels rewritten although already correct: %s", s)
+	for _, s := range z.setProps {
+		if strings.Contains(s, zpool.PropRole) || strings.Contains(s, zpool.PropOwner) {
+			t.Errorf("provisioned volume was labelled by the driver: %s", s)
 		}
 	}
+}
+
+func TestLabels_UnprovisionedExistingDatasetIsLabelled(t *testing.T) {
+	z := newFakeZFS("tank/k8s/pvc-new")
+	r := datasetReconciler(t, z, labelDataset("pvc-new", nil))
+	reconcileTwiceOrMore(t, r, "pvc-new", 1)
+	wantLabels(t, z, "tank/k8s/pvc-new", zpool.RoleVolume, "uid-pvc-new")
 }
 
 func snapshotFixtureWithUID(t *testing.T, group string) (*ZfsSnapshotReconciler, *fakeZFS) {

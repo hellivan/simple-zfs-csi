@@ -189,10 +189,12 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		logger.Info("created ZFS object", "dataset", full, "type", vol.Spec.Type)
 	}
 
-	// Labels are set at create time; this repairs a dataset that has none
-	// (created by an older driver) and is a no-op otherwise.
-	if err := zpool.EnsureLabels(ctx, r.ZFS, full, zpool.RoleVolume, string(vol.UID)); err != nil {
-		return ctrl.Result{}, err
+	// Labels belong to provisioning (ADR-0038): a provisioned dataset is never
+	// touched again; pre-label datasets are labelled by the migration script.
+	if !datasetProvisioned(&vol) {
+		if err := zpool.EnsureLabels(ctx, r.ZFS, full, zpool.RoleVolume, string(vol.UID)); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Converge the on-disk size toward the spec (volume expansion). The CSI

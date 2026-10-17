@@ -116,11 +116,10 @@ Why: from S4 on the driver selects objects by label (see `labels.md`). Objects c
 pre-S1 driver while the new one rolls out) carry no labels. Labels are not optional for correctness: an unlabelled raw
 snapshot or backing clone must never be misclassified.
 
-The driver barely self-repairs. Verified in the code: the `ZfsSnapshot` reconciler returns early once an object is provisioned
-(`provisionedAt`, ADR-0038) and never touches ZFS again, so raw snapshots and backing clones created before S1 are never labelled
-by the driver. The `ZfsDataset` reconciler keeps running for existing volumes (it only refuses to re-create), so it labels
-volumes on their next reconcile, but `clone-origin` snapshots are only labelled at clone creation. The migration script must not
-rely on any of this: **it labels every pre-S1 object**, and S4's label-based delete may only be released once its audit is clean.
+The driver does not repair anything (ADR-0038): once an object is provisioned (`provisionedAt`) its reconciler creates and
+repairs nothing and never touches ZFS again. Labels are written only at creation (and while an object is still being
+provisioned). **The migration script therefore labels every pre-S1 object: volumes, raw snapshots, backing clones and
+clone-origin snapshots.** S4's label-based delete may only be released once its audit is clean.
 
 The script also covers orphans (driver-named ZFS objects without a CR), `restore-source` snapshots and `@clone-*` snapshots
 whose `ZfsDataset` is gone.
