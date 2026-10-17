@@ -136,6 +136,17 @@ func (f *fakeZFS) CreateZvol(_ context.Context, name string, sizeBytes int64, pr
 // delete path (D11) depends on. Destroying something that does not exist stays
 // a success, mirroring CLI.Destroy's isNotExist tolerance. Every call is
 // recorded, successful or not, so tests can assert the call sequence.
+// DestroySnapshotDeferred is a stub until fakeZFS is replaced by memzfs: it
+// destroys only a snapshot without clones and leaves any other in place.
+func (f *fakeZFS) DestroySnapshotDeferred(ctx context.Context, name string) error {
+	for _, o := range f.origin {
+		if o == name {
+			return nil
+		}
+	}
+	return f.Destroy(ctx, name, false)
+}
+
 func (f *fakeZFS) Destroy(_ context.Context, name string, recursive bool) error {
 	f.destroyed = append(f.destroyed, name)
 	if !f.existing[name] {

@@ -72,6 +72,11 @@ type ZFS interface {
 	// Destroy removes a dataset/zvol. It is idempotent: destroying a
 	// non-existent object is not an error. recursive also destroys children.
 	Destroy(ctx context.Context, name string, recursive bool) error
+	// DestroySnapshotDeferred runs `zfs destroy -d`: the snapshot is destroyed
+	// now if nothing depends on it, otherwise it is marked and ZFS destroys it
+	// itself as soon as its last clone is gone. It never promotes anything.
+	// Idempotent: a snapshot that no longer exists is not an error.
+	DestroySnapshotDeferred(ctx context.Context, snapshot string) error
 	// ListSnapshots returns the full ZFS names of every snapshot taken directly
 	// on dataset, oldest first, excluding snapshots belonging to any child
 	// dataset. It wraps ErrNotExist when dataset itself does not exist, and
@@ -223,6 +228,18 @@ func (z *CLI) Destroy(ctx context.Context, name string, recursive bool) error {
 	}
 	args = append(args, name)
 	_, err := z.run(ctx, args...)
+	if err != nil && isNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+// DestroySnapshotDeferred runs `zfs destroy -d` on a snapshot; see the interface.
+func (z *CLI) DestroySnapshotDeferred(ctx context.Context, snapshot string) error {
+	if !strings.Contains(snapshot, "@") {
+		return fmt.Errorf("snapshot name %q must be of the form pool/dataset@snap", snapshot)
+	}
+	_, err := z.run(ctx, "destroy", "-d", snapshot)
 	if err != nil && isNotExist(err) {
 		return nil
 	}

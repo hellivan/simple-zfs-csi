@@ -294,3 +294,28 @@ func TestSnapshot_MultiplePartialExistIsDistinctError(t *testing.T) {
 		t.Fatalf("err = %v, want ErrSnapshotsPartiallyExist", err)
 	}
 }
+
+func TestDestroySnapshotDeferred_Args(t *testing.T) {
+	f := &fakeRunner{}
+	z := &CLI{Run: f.run}
+	if err := z.DestroySnapshotDeferred(context.Background(), "tank/x@s"); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"destroy", "-d", "tank/x@s"}; !reflect.DeepEqual(f.gotArgs, want) {
+		t.Errorf("args = %v, want %v", f.gotArgs, want)
+	}
+}
+
+func TestDestroySnapshotDeferred_IdempotentAndStrict(t *testing.T) {
+	z := &CLI{Run: (&fakeRunner{err: errors.New("could not find any snapshots to destroy; check snapshot names.")}).run}
+	if err := z.DestroySnapshotDeferred(context.Background(), "tank/x@s"); err != nil {
+		t.Fatalf("missing snapshot must not be an error, got %v", err)
+	}
+	if err := z.DestroySnapshotDeferred(context.Background(), "tank/x"); err == nil {
+		t.Fatal("a dataset name must be rejected")
+	}
+	z = &CLI{Run: (&fakeRunner{err: errors.New("dataset is busy")}).run}
+	if err := z.DestroySnapshotDeferred(context.Background(), "tank/x@s"); err == nil {
+		t.Fatal("other errors must propagate")
+	}
+}

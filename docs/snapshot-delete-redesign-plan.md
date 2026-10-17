@@ -61,7 +61,14 @@ inherit the dataset's user properties when read (see `labels.md`).
 - Tests on the existing fake first; the same tests move to the in-memory ZFS in S2.
 - Files: `internal/zpool/zfs.go`, `zfsdataset_controller.go`, `zfssnapshot_controller.go`, `zfsgroupsnapshot_controller.go`.
 
-### S2. In-memory ZFS and conformance suite (W2, W3)
+### S2. In-memory ZFS and conformance suite (W2, W3) — mostly DONE
+Done: `internal/zpool/memzfs` (the model, `Check()` invariants, error injection, `BusyAfterZvolCreate`),
+`internal/zpool/zfsconf` (41 cases: 21 each for filesystem and zvol, shared by mock and real pool, includes the P4 origin rule,
+label inheritance and promote semantics), `DestroySnapshotDeferred` on the `ZFS` interface and the CLI. The suite passes on the
+model (`go test ./internal/zpool/memzfs`) and on the real pool (`-tags zfsreal`, see `real_test.go`), ZFS 2.4.3, 2026-10-17.
+Still open: port the 116 whole-scenario replays as driver tests (they need the S4 driver, so they land there), and replace
+`fakeZFS` in the controller tests (done with S4, when those tests are rewritten; `fakeZFS` has a stub for the new method).
+Original scope:
 - Test-support package implementing `zpool.ZFS` as one state machine: datasets (kind, properties), snapshots (properties, defer
   mark, creation order), origin per clone. All reads (`List`, `Get`, `Clones`, `ListSnapshots`, `FindSnapshot`) are views of it.
 - Enforces with exact ZFS error texts: destroy with clones or snapshots, `-d` semantics and auto-removal when the last clone

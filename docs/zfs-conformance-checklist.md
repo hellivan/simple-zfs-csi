@@ -123,6 +123,16 @@ compared with the model after **every** step.
 - Not covered: a process holding a mountpoint open (the host has no shell for `nsenter`), crash and race behaviour (section 7),
   deeper chains of #15587.
 
+### 2026-10-17, `zfs-2.4.3-1`, conformance suite as code
+
+The checklist rows for deferred destroy, promote, dataset destroy, listing, atomic snapshots, user properties and the P4 origin
+rule are now Go test cases (`internal/zpool/zfsconf`), run against the in-memory model on every `go test` and against the real
+pool with `-tags zfsreal` (`ZFS_CONF_ROOT` must contain `verify_zfs_functions`). All 41 cases passed on the real pool and on
+the model. New facts confirmed live: user properties are **inherited from the parent dataset** (a child reads `inherit-me`),
+a snapshot reads its dataset's value until it has a local one, the backing clone's `origin` follows the raw snapshot through
+promotes of other clones and becomes `-` only when the backing clone itself is promoted (the pool scan then finds the
+snapshot on it), and a non-user property cannot be set on a snapshot.
+
 ## 7. Crash and race behaviour (optional, later)
 
 | # | Question | Result |
