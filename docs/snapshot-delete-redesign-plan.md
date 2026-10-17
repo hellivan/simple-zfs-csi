@@ -115,12 +115,13 @@ Why: from S4 on the driver selects objects by label (see `labels.md`). Objects c
 pre-S1 driver while the new one rolls out) carry no labels. Labels are not optional for correctness: an unlabelled raw
 snapshot or backing clone must never be misclassified.
 
-Two layers, so nothing depends on the script alone:
-1. **Self-repair in the driver (already in S1):** `EnsureLabels` labels every live volume, raw snapshot and backing clone on
-   its next reconcile. Because the controllers re-reconcile all CRs on start, this fixes everything that has a CR.
-2. **Migration script (`hack/`)** for what the driver cannot or must not repair: orphans (driver-named ZFS objects without a
-   CR), `restore-source` snapshots, `clone-origin` snapshots whose `ZfsDataset` is gone, and an audit that proves the end state.
-   It also is the gate: S4's label-based delete may only be released once the audit is clean.
+The driver cannot self-repair: once an object is provisioned (`provisionedAt`, ADR-0038) its reconciler only observes and
+never touches ZFS again, so `EnsureLabels` runs only while an object is being provisioned (it covers objects in flight during
+the rollout, nothing else). **Every object that exists before the S1 driver is therefore labelled only by the migration
+script**, and S4's label-based delete may only be released once the script's audit is clean.
+
+The script also covers orphans (driver-named ZFS objects without a CR), `restore-source` snapshots and `@clone-*` snapshots
+whose `ZfsDataset` is gone.
 
 Properties:
 - Outside the driver, dry run by default (`--apply` to act), idempotent, only touches objects under the configured prefix.
@@ -144,7 +145,7 @@ Steps:
 3. `--apply` runs them; re-audit must report zero to-label, zero `restore-source`. Orphans stay a human decision.
 4. Verified live first on a layout built the old way (volume, snapshot, restore, clone, group) in `verify_zfs_functions`; run on the
    cluster only after the user approves the audit output.
-5. Ordering with the release: deploy the S1 driver first (self-repair), run the script, audit clean, then the S4 driver.
+5. Ordering with the release: deploy the S1 driver first (new objects get labels at creation), run the script, audit clean, then the S4 driver.
    Rollback is trivial: labels are inert properties and `destroy -d` was always the intended end state.
 
 Tests: the derivation and audit logic is Go or testable shell against the in-memory ZFS (S2), covering: unlabelled legacy layout,

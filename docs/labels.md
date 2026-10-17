@@ -60,8 +60,10 @@ the snapshot on promote, so `raw` is found by label wherever it ends up.
 
 ## Behaviour and caveats (verified on ZFS 2.4.3)
 
-- `EnsureLabels` writes only when the value is missing or different, so reconciles are
-  idempotent and old, unlabelled objects are repaired on their next reconcile.
+- `EnsureLabels` writes only when the value is missing or different, so it is idempotent. It
+  runs only while an object is being provisioned: provisioned objects are never touched again
+  (ADR-0038), so **objects created before labels existed are labelled only by the migration
+  script** (see the S6 section of `snapshot-delete-redesign-plan.md`).
 - `zfs get` prints `-` for an unset property; the driver treats `-` and empty as unset.
 - Labels survive `zfs destroy -d` (deferred destroy) and `zfs promote`; they move with the snapshot.
 - A clone does not inherit the origin snapshot's labels; it gets its own at creation.
