@@ -125,6 +125,10 @@ compared with the model after **every** step.
 
 ### 2026-10-17, `zfs-2.4.3-1`, conformance suite as code
 
+`go test ./...` runs the suite against the in-memory model only (no ZFS or kernel module needed). The real-pool run is a
+manual script, `hack/run-zfs-conformance.sh`, which builds the suite and runs it in the toolbox pod on the cluster. Run it after
+changing `memzfs` or the suite and when the node ZFS version changes. The model is only as good as the last real run.
+
 The checklist rows for deferred destroy, promote, dataset destroy, listing, atomic snapshots, user properties and the P4 origin
 rule are now Go test cases (`internal/zpool/zfsconf`), run against the in-memory model on every `go test` and against the real
 pool with `-tags zfsreal` (`ZFS_CONF_ROOT` must contain `verify_zfs_functions`). All 41 cases passed on the real pool and on
