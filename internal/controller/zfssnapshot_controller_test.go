@@ -389,8 +389,8 @@ func TestZfsSnapshotReconcile_LostRecoversWhenPrimitiveReturns(t *testing.T) {
 	}
 }
 
-// The reported creation time comes from the raw snapshot, not the later
-// later backing clone (ADR-0036).
+// The reported creation time comes from the raw snapshot, not the
+// backing clone (ADR-0036).
 func TestZfsSnapshotReconcile_CreationTimeComesFromRawSnapshot(t *testing.T) {
 	scheme := newTestScheme(t)
 	src := &storagev1alpha1.ZfsDataset{
