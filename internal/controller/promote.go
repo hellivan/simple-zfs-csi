@@ -38,13 +38,12 @@ import (
 // proceed at all — but those are reads of *desired* state (spec), never of
 // derived bookkeeping.
 
-// restoreSourceSnapshotName is the fixed, CSI-invisible self-snapshot name (D5)
-// taken on every backing clone immediately
-// after it is created. Restores always clone from
-// "<backing-clone-dataset>@restore-source", never from the raw origin snapshot
-// directly, so restores keep working whether the true source volume is still
-// alive, deleted-but-not-yet-promoted, or already promoted away.
-const restoreSourceSnapshotName = "restore-source"
+// legacyRestoreSourceSnapshot is the self-snapshot older drivers took on every
+// backing clone (and restored from). Nothing creates or reads it any more
+// (strategy D, docs/snapshot-delete-redesign-plan.md); it stays on the delete
+// allow-list so objects created by those drivers can still be cleaned up until
+// the migration script has retired them.
+const legacyRestoreSourceSnapshot = "restore-source"
 
 // maxDetachRounds bounds the detach fixpoint. Each round performs exactly one
 // `zfs promote`, and every promote strictly reduces the number of snapshots
@@ -56,7 +55,7 @@ const maxDetachRounds = 100
 // driverSnapshotSuffix matches the snapshot short names (the part after "@")
 // this driver creates, and only those:
 //
-//   - "restore-source" — a backing clone's self-snapshot (D5);
+//   - "restore-source" — legacy self-snapshot of a backing clone (see legacyRestoreSourceSnapshot);
 //   - "clone-<dest-name>" — the ephemeral intermediate snapshot ADR-0009's
 //     direct PVC-to-PVC clone path takes on the source dataset, named after the
 //     destination ZfsDataset's own object name (see cloneSnapshotSuffix);
@@ -102,12 +101,16 @@ func (r *ZfsDatasetReconciler) beforeDestroy(ctx context.Context, vol *storagev1
 // Each round asks ZFS which snapshots `full` still owns and which datasets
 // clone them. Every snapshot is first checked against the driver name
 // allow-list (D18); a foreign one refuses the whole delete. Every snapshot that
-// nothing clones is then destroyed (ADR-0041: with no clone it is free to go,
-// and a ZfsSnapshot that still wanted it fails loudly). If any snapshot is
-// still cloned, that clone is promoted away — which relocates the snapshot, and
-// every snapshot older than it, onto the clone — and the round restarts from
-// freshly read state, because one promote can move several snapshots and
-// re-parent several clones at once.
+// nothing clones is then destroyed with `-d` (P2). If any snapshot is still
+// cloned, one of its clones is promoted away, which relocates the snapshot and
+// every older one onto the clone, and the round restarts from freshly read
+// state, because one promote can move several snapshots and re-parent several
+// clones at once.
+//
+// Which clone (P4a): the oldest cloned snapshot first, since a promote moves it
+// and everything older, so this moves the least and avoids name conflicts; among
+// the clones of those snapshots the one labelled as a backing clone is preferred,
+// so a raw snapshot stays on its source or on its backing clone.
 //
 // For the overwhelmingly common case of a dataset with no snapshots at all this
 // is a single `zfs list` and done.
@@ -134,8 +137,9 @@ func detachAndCleanSnapshots(ctx context.Context, c client.Reader, z zpool.ZFS, 
 			}
 		}
 
-		cloned := map[string][]string{}
-		var order []string
+		type candidate struct{ snap, clone string }
+		var cands []candidate
+		clonesOf := map[string][]string{}
 		for _, snap := range snaps {
 			clones, err := z.Clones(ctx, snap)
 			if err != nil {
@@ -145,66 +149,41 @@ func detachAndCleanSnapshots(ctx context.Context, c client.Reader, z zpool.ZFS, 
 				return err
 			}
 			if len(clones) == 0 {
-				if err := z.Destroy(ctx, snap, false); err != nil {
+				if err := z.DestroySnapshotDeferred(ctx, snap); err != nil {
 					return fmt.Errorf("destroy snapshot %q: %w", snap, err)
 				}
 				logger.Info("destroyed snapshot with no clones", "snapshot", snap, "destroying", full)
 				continue
 			}
-			cloned[snap] = clones
-			order = append(order, snap)
+			clonesOf[snap] = clones
+			for _, cl := range clones {
+				cands = append(cands, candidate{snap, cl})
+			}
 		}
-		if len(order) == 0 {
+		if len(cands) == 0 {
 			return nil
 		}
 
-		snap := order[0]
-		clones := cloned[snap]
-		if err := assertKnownDatasets(ctx, c, poolGUID, poolName, snap, clones); err != nil {
+		pick := cands[0]
+		for _, cd := range cands {
+			role, err := z.Get(ctx, cd.clone, zpool.PropRole)
+			if err != nil && !errors.Is(err, zpool.ErrNotExist) {
+				return err
+			}
+			if strings.TrimSpace(role) == zpool.RoleBacking {
+				pick = cd
+				break
+			}
+		}
+		if err := assertKnownDatasets(ctx, c, poolGUID, poolName, pick.snap, clonesOf[pick.snap]); err != nil {
 			return err
 		}
-		// Promoting any one clone detaches the snapshot from all of them:
-		// ZFS re-parents the siblings onto the promoted clone as part of the
-		// same operation. The next round picks up whatever is left.
-		if err := z.Promote(ctx, clones[0]); err != nil {
-			return fmt.Errorf("promote %q away from %q: %w", clones[0], snap, err)
+		if err := z.Promote(ctx, pick.clone); err != nil {
+			return fmt.Errorf("promote %q away from %q: %w", pick.clone, pick.snap, err)
 		}
-		logger.Info("promoted dependent away", "dependent", clones[0], "detachedFrom", snap, "destroying", full)
+		logger.Info("promoted dependent away", "dependent", pick.clone, "detachedFrom", pick.snap, "destroying", full)
 	}
 	return fmt.Errorf("detaching dependents of %q did not converge after %d rounds", full, maxDetachRounds)
-}
-
-// detachSnapshotClones promotes away every clone of a single snapshot so that
-// snapshot can be destroyed on its own (D19).
-//
-// Used by ZfsSnapshotReconciler for the raw origin snapshot, which lives on the
-// still-live source volume and is therefore never reached by that volume's own
-// delete path. Promoting the first clone relocates the snapshot onto it and
-// re-parents the rest, so one pass normally suffices and the destroy that
-// follows becomes a NotExist no-op; the loop only guards against a clone
-// appearing concurrently.
-func detachSnapshotClones(ctx context.Context, c client.Reader, z zpool.ZFS, poolGUID, poolName, snap string) error {
-	logger := log.FromContext(ctx)
-	for round := 0; round < maxDetachRounds; round++ {
-		clones, err := z.Clones(ctx, snap)
-		if err != nil {
-			if errors.Is(err, zpool.ErrNotExist) {
-				return nil // already relocated elsewhere, or already destroyed
-			}
-			return err
-		}
-		if len(clones) == 0 {
-			return nil
-		}
-		if err := assertKnownDatasets(ctx, c, poolGUID, poolName, snap, clones); err != nil {
-			return err
-		}
-		if err := z.Promote(ctx, clones[0]); err != nil {
-			return fmt.Errorf("promote %q away from %q: %w", clones[0], snap, err)
-		}
-		logger.Info("promoted dependent away", "dependent", clones[0], "detachedFrom", snap)
-	}
-	return fmt.Errorf("detaching clones of %q did not converge after %d rounds", snap, maxDetachRounds)
 }
 
 // assertKnownDatasets refuses to promote anything the driver does not manage

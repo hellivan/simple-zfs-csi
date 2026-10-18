@@ -662,3 +662,40 @@ func (m *Mem) Check() error {
 	}
 	return nil
 }
+
+// Datasets returns the full names of every dataset, sorted.
+func (m *Mem) Datasets() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.ds))
+	for n := range m.ds {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Snapshots returns the full names of every snapshot on the pool, sorted.
+func (m *Mem) Snapshots() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for n, d := range m.ds {
+		for s := range d.snaps {
+			out = append(out, n+"@"+s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Deferred reports whether the snapshot is marked for deferred destruction.
+func (m *Mem) Deferred(full string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dn, sn, ok := split(full)
+	if !ok || m.ds[dn] == nil || m.ds[dn].snaps[sn] == nil {
+		return false
+	}
+	return m.ds[dn].snaps[sn].deferred
+}

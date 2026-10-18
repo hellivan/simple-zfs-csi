@@ -132,6 +132,12 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				return ctrl.Result{}, err
 			}
 			logger.Info("destroyed ZFS object", "dataset", full)
+			// P5: a direct clone created its "@clone-<name>" snapshot, so it
+			// defers that snapshot's destruction. A promote may have moved it,
+			// so it is found by name anywhere on the pool.
+			if err := r.releaseCloneOrigin(ctx, &vol, pool.Status.PoolName); err != nil {
+				return ctrl.Result{}, err
+			}
 			return ctrl.Result{}, r.releaseFinalizer(ctx, &vol)
 		case !poolFound:
 			return ctrl.Result{}, r.releaseFinalizer(ctx, &vol)
@@ -365,6 +371,21 @@ func (r *ZfsDatasetReconciler) cloneFromDataset(ctx context.Context, vol *storag
 	return r.ZFS.Clone(ctx, snapFull, dest, props)
 }
 
+// releaseCloneOrigin marks the "@clone-<name>" snapshot of a directly cloned
+// volume for deferred destruction (P2/P5): ZFS removes it at once if nothing
+// clones it, otherwise when its last clone is gone.
+func (r *ZfsDatasetReconciler) releaseCloneOrigin(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName string) error {
+	src := vol.Spec.Source
+	if src == nil || (src.Volume == "" && src.ZfsDatasetRef == nil) {
+		return nil
+	}
+	at, err := r.ZFS.FindSnapshot(ctx, poolName, "clone-"+cloneSnapshotSuffix(vol.Name))
+	if err != nil || at == "" {
+		return err
+	}
+	return r.ZFS.DestroySnapshotDeferred(ctx, at)
+}
+
 // resolveSnapshotRef returns the full name of the raw ZFS snapshot behind a
 // ZfsSnapshot, wherever promotes have put it.
 func (r *ZfsDatasetReconciler) resolveSnapshotRef(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, name string) (string, error) {
@@ -404,8 +425,7 @@ func (r *ZfsDatasetReconciler) resolveSnapshotRef(ctx context.Context, vol *stor
 // than hashed: the API server already guarantees that name is a DNS-1123
 // subdomain, which is a legal ZFS component name too, so nothing further needs
 // sanitizing. This mirrors how a ZfsSnapshot's backing clone snapshot is named
-// directly after Spec.SnapshotName (see restoreSourceSnapshotName's sibling
-// logic in zfssnapshot_controller.go) instead of a derived hash, and — because
+// directly after Spec.SnapshotName instead of a derived hash, and — because
 // this snapshot is purely internal/ephemeral and re-derived fresh on every
 // reconcile (never persisted) — keeps it unique per destination without
 // needing a new persisted field (independent-resource-naming-redesign.md, step

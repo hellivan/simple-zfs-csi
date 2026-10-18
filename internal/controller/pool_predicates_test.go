@@ -48,17 +48,3 @@ func TestDeleteShareIfPresent_NoDeleteCallWhenAbsent(t *testing.T) {
 		t.Fatalf("err=%v deletes=%d", err, deletes)
 	}
 }
-
-func TestLocateRaw_DirectHitSkipsScan(t *testing.T) {
-	z := newFakeZFS("tank/k8s/a@raw")
-	r := &ZfsSnapshotReconciler{ZFS: z}
-	got, err := r.locateRaw(context.Background(), "tank", "tank/k8s/a@raw", "raw")
-	if err != nil || got != "tank/k8s/a@raw" {
-		t.Fatalf("got %q, %v", got, err)
-	}
-	z.seedSnapshot("tank/k8s/b", "moved")
-	got, err = r.locateRaw(context.Background(), "tank", "tank/k8s/a@moved", "moved")
-	if err != nil || got != "tank/k8s/b@moved" {
-		t.Fatalf("relocated: got %q, %v", got, err)
-	}
-}

@@ -58,6 +58,7 @@ type fakeZFS struct {
 	snapshots      map[string][]string // dataset -> its own snapshot suffixes, oldest first
 	promoted       []string            // records each dataset name passed to Promote
 	promoteErr     map[string]error    // optional: force Promote to fail for a given dataset
+	deferred       []string            // snapshots marked by DestroySnapshotDeferred while they still had clones
 }
 
 func newFakeZFS(existing ...string) *fakeZFS {
@@ -136,11 +137,13 @@ func (f *fakeZFS) CreateZvol(_ context.Context, name string, sizeBytes int64, pr
 // delete path (D11) depends on. Destroying something that does not exist stays
 // a success, mirroring CLI.Destroy's isNotExist tolerance. Every call is
 // recorded, successful or not, so tests can assert the call sequence.
-// DestroySnapshotDeferred is a stub until fakeZFS is replaced by memzfs: it
-// destroys only a snapshot without clones and leaves any other in place.
+// DestroySnapshotDeferred destroys a snapshot without clones and only records
+// the mark on any other, like `zfs destroy -d`. (The lifecycle tests on memzfs
+// cover the real auto-removal.)
 func (f *fakeZFS) DestroySnapshotDeferred(ctx context.Context, name string) error {
 	for _, o := range f.origin {
 		if o == name {
+			f.deferred = append(f.deferred, name)
 			return nil
 		}
 	}
@@ -1185,8 +1188,8 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 	// the raw origin snapshot relocated onto it (older), then its own
 	// @restore-source (newer), with both restores cloning the latter.
 	z.seedSnapshot("tank/k8s/csi-snap-x", "csi-snap-x")
-	z.seedClone("tank/k8s/csi-snap-x", restoreSourceSnapshotName, "tank/k8s/pvc-r1")
-	z.seedClone("tank/k8s/csi-snap-x", restoreSourceSnapshotName, "tank/k8s/pvc-r2")
+	z.seedClone("tank/k8s/csi-snap-x", legacyRestoreSourceSnapshot, "tank/k8s/pvc-r1")
+	z.seedClone("tank/k8s/csi-snap-x", legacyRestoreSourceSnapshot, "tank/k8s/pvc-r2")
 
 	r := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-x"}}); err != nil {
@@ -1198,7 +1201,7 @@ func TestZfsDatasetReconcile_DeletePromotesMultipleRestoredDependents(t *testing
 	if !reflect.DeepEqual(z.promoted, []string{"tank/k8s/pvc-r1"}) {
 		t.Fatalf("promoted = %v, want exactly [tank/k8s/pvc-r1]", z.promoted)
 	}
-	if o, want := z.origin["tank/k8s/pvc-r2"], "tank/k8s/pvc-r1@"+restoreSourceSnapshotName; o != want {
+	if o, want := z.origin["tank/k8s/pvc-r2"], "tank/k8s/pvc-r1@"+legacyRestoreSourceSnapshot; o != want {
 		t.Errorf("pvc-r2 origin = %q, want %q (sibling re-parented onto pvc-r1)", o, want)
 	}
 	// The raw snapshot has no clone, so it is destroyed first (ADR-0041); the

@@ -107,7 +107,21 @@ Needed because under D the raw snapshot has no fixed path (see P4). The CSI laye
 - CRD, generated code and chart CRDs regenerated. Existing objects with path sources keep working unchanged.
 - Old backing clones (with `restore-source`) restore fine through the new path: the raw snapshot is still pinned by the backing clone.
 
-### S4. Strategy D in the driver (W4, W5)
+### S4. Strategy D in the driver (W4, W5) — DONE
+Implemented: the snapshot delete is `destroy -d` on the raw snapshot (found via the backing clone's origin, then the pool scan),
+then the shared promote loop empties the backing clone, then the clone is destroyed. The loop picks the oldest cloned snapshot
+first and prefers a clone labelled `backing`; every snapshot destroy is `-d`. A direct clone's delete marks its `@clone-<name>`
+snapshot (found by name anywhere). No `restore-source` is created or read; the name stays on the delete allow-list as
+`legacyRestoreSourceSnapshot` until S6 ran. A settled snapshot is Lost when its raw snapshot cannot be found.
+Tests, driving the real reconcilers on `memzfs` (`internal/controller/lifecycle_test.go`): every sequence of up to 3 creations
+(131; `LIFECYCLE_MAX_CREATES=4` gives 4705, about 80 s, run once green), 150 random walks of up to 7 creations, named scenarios
+(restore then delete snapshot pins nothing, delete source first, fan-out, chains, direct clones), the legacy `restore-source`
+layout in three delete orders, and a single failing ZFS call (`destroy`, `destroy -d`, `promote`, including P8 "dataset is
+busy") at every dataset and snapshot of a populated pool. After every step: model invariants, no live volume without dataset, every
+live snapshot restorable, no unowned dataset or unmarked unowned snapshot; at the end the pool is empty. Mutation-checked
+(dropping the deferred destroy or the clone-origin cleanup fails them). `fakeZFS` is kept for the narrow unit tests only.
+Not done: label-based selection in the delete allow-list (still the name allow-list; labels select only the promote preference).
+Original scope:
 - Scenario tests (W4): one test per row of the scenario table (25 rows plus 18 to 19b), fan-out, group snapshots, and a
   bounded property test, driving the real reconcilers on the in-memory ZFS. Assertions: no stuck delete, nothing left at the
   end, live volumes and snapshots intact, no unowned snapshot on a live volume, invariants after every step.

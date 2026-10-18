@@ -176,8 +176,6 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// Restores clone the backing clone's "@restore-source" (D5), never the raw
-	// snapshot above directly (D0/§3.1).
 	return r.reconcileBackingClone(ctx, &snap, &pool, datasetPath, full)
 }
 
@@ -240,8 +238,8 @@ func resolveDatasetPath(ctx context.Context, reader client.Reader, sourceVolume,
 
 // reconcileDelete tears down a ZfsSnapshot on the node hosting its pool.
 //
-// Order matters: the backing clone is a dependent clone of the raw snapshot, so
-// the raw snapshot cannot be destroyed while it exists (D11).
+// The raw snapshot is marked for deferred destruction first, then the backing
+// clone is emptied and destroyed (see the steps below, strategy D).
 func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -259,7 +257,34 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// Restores clone the backing clone, so promote those away before destroying it.
+
+	// Strategy D (P2/P3): this object created the raw snapshot, so it defers its
+	// destruction with `zfs destroy -d`: gone at once when nothing clones it,
+	// otherwise ZFS removes it when the last clone (the backing clone, live
+	// restores) is gone. Nothing is ever promoted onto a restore to get rid of
+	// the snapshot, and no restore can end up pinning it forever.
+	//
+	// Where the snapshot is is not where this object recorded it: a promote
+	// relocates it and nothing rewrites Spec.Dataset (ADR-0028). The backing
+	// clone's origin answers that, the pool scan is the fallback.
+	raw, err := locateRawSnapshot(ctx, r.ZFS, pool.Status.PoolName, backingFull, snap.Spec.SnapshotName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if raw != "" {
+		if raw != rawFull {
+			logger.Info("raw snapshot was relocated by an earlier promote; destroying it where it actually is",
+				"recorded", rawFull, "actual", raw)
+		}
+		if err := r.ZFS.DestroySnapshotDeferred(ctx, raw); err != nil {
+			return ctrl.Result{}, err
+		}
+		logger.Info("destroyed ZFS snapshot (deferred)", "snapshot", raw)
+	}
+
+	// The backing clone is a vessel with no snapshots of its own, unless a promote
+	// moved the raw snapshot (and older ones) onto it, or it was made by an older
+	// driver (@restore-source). The same loop as for a volume empties it.
 	if err := detachAndCleanSnapshots(ctx, r.gateReader(), r.ZFS, snap.Spec.PoolGUID, pool.Status.PoolName, backingFull); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -267,44 +292,6 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 		return ctrl.Result{}, err
 	}
 	logger.Info("destroyed backing clone", "dataset", backingFull)
-
-	// Where the raw snapshot *actually* is, which need not be where this object
-	// recorded it: `zfs promote` relocates the origin snapshot and everything
-	// older than it onto the promoted clone, and nothing rewrites Spec.Dataset
-	// when that happens. Trusting the record here used to leave the snapshot
-	// behind — Destroy is NotExist-tolerant, so a stale address silently no-ops
-	// and the finalizer is released anyway, orphaning the real snapshot on
-	// whatever dataset now holds it (ADR-0028).
-	//
-	// Deliberately done after the backing-clone wait above. A direct read at the
-	// recorded address answers the common case; the pool-wide scan only runs when
-	// the snapshot is not there any more.
-	if found, findErr := r.locateRaw(ctx, pool.Status.PoolName, rawFull, snap.Spec.SnapshotName); findErr != nil {
-		return ctrl.Result{}, findErr
-	} else if found != "" && found != rawFull {
-		logger.Info("raw snapshot was relocated by an earlier promote; destroying it where it actually is",
-			"recorded", rawFull, "actual", found)
-		rawFull = found
-	}
-
-	// Required, not best-effort (D11): a no-op (Destroy is NotExist-tolerant)
-	// when the snapshot is genuinely gone already — real work in the common case
-	// (a snapshot created and later deleted). This is the invariant that makes it
-	// safe for DeleteVolume to assume zero live ZfsSnapshots referencing a volume
-	// means zero raw snapshots remain on it either.
-	//
-	// D19: a restored PVC that was promoted while the backing clone above was
-	// being torn down is now a clone of this raw snapshot, and ZFS refuses to
-	// destroy a snapshot that still has dependent clones. Promote those away
-	// first — that relocates the snapshot onto the dependent and turns the
-	// destroy into a NotExist no-op — rather than deadlocking here forever.
-	if err := detachSnapshotClones(ctx, r.gateReader(), r.ZFS, snap.Spec.PoolGUID, pool.Status.PoolName, rawFull); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.ZFS.Destroy(ctx, rawFull, false); err != nil {
-		return ctrl.Result{}, err
-	}
-	logger.Info("destroyed ZFS snapshot", "snapshot", rawFull)
 	return ctrl.Result{}, r.releaseSnapshotFinalizer(ctx, snap)
 }
 
@@ -318,38 +305,29 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 // (ADR-0034): it never creates anything. Missing on disk means Lost; present
 // again means Ready. The recorded creation time is kept (ADR-0038).
 //
-// Only the backing clone's @restore-source is checked: it is what restores
-// use, and it keeps the raw snapshot alive as its origin.
+// Only the raw snapshot is checked: restores clone it, and it is what the
+// backing clone's origin points at.
 func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool, datasetPath string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	backingDataset := path.Join(path.Dir(strings.Trim(datasetPath, "/")), snap.Spec.SnapshotName)
-	backingFull, err := datasetName(pool.Status.PoolName, backingDataset)
+	backingFull := backingCloneFullName(pool.Status.PoolName, datasetPath, snap.Spec.SnapshotName)
+	raw, err := locateRawSnapshot(ctx, r.ZFS, pool.Status.PoolName, backingFull, snap.Spec.SnapshotName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	restoreSourceFull := backingFull + "@" + restoreSourceSnapshotName
-
-	present, err := r.restoreSourcePresent(ctx, backingFull)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	present := raw != ""
 	switch {
 	case present && snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady && snap.Status.ProvisionedAt != nil:
 		return ctrl.Result{}, nil
 	case present:
-		logger.Info("lost snapshot's restore source is back", "snapshot", restoreSourceFull)
+		logger.Info("lost snapshot's raw snapshot is back", "snapshot", raw)
 		// creationTime is recorded once (ADR-0038) and never re-read. Only an
-		// object that never recorded one (legacy) reads it now, from the raw
-		// snapshot wherever a promote left it.
+		// object that never recorded one (legacy) reads it now.
 		var creation *metav1.Time
 		if snap.Status.CreationTime == nil {
-			rawRecorded, _ := snapshotFullName(pool.Status.PoolName, datasetPath, snap.Spec.SnapshotName)
-			if raw, err := r.locateRaw(ctx, pool.Status.PoolName, rawRecorded, snap.Spec.SnapshotName); err == nil && raw != "" {
-				creation = snapshotCreationTime(ctx, r.ZFS, raw)
-			}
+			creation = snapshotCreationTime(ctx, r.ZFS, raw)
 		}
-		message := fmt.Sprintf("restore source %s is present again", restoreSourceFull)
+		message := fmt.Sprintf("raw snapshot %s is present again", raw)
 		if snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady {
 			message = snap.Status.Message // backfilling ProvisionedAt only
 		}
@@ -359,9 +337,9 @@ func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *stor
 		return ctrl.Result{RequeueAfter: lostRecheckInterval}, nil
 	}
 
-	logger.Info("ready snapshot lost its restore source; not re-creating", "snapshot", restoreSourceFull)
+	logger.Info("ready snapshot lost its raw snapshot; not re-creating", "snapshot", snap.Spec.SnapshotName)
 	if err := r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseLost, false, nil, nil,
-		"PrimitivesLost", fmt.Sprintf("%s no longer exists; a snapshot is never re-created in place", restoreSourceFull)); err != nil {
+		"PrimitivesLost", fmt.Sprintf("raw snapshot %q no longer exists; a snapshot is never re-created in place", snap.Spec.SnapshotName)); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: lostRecheckInterval}, nil
@@ -371,43 +349,10 @@ func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *stor
 // primitive that comes back (e.g. a dataset moved back) is noticed.
 const lostRecheckInterval = time.Minute
 
-// restoreSourcePresent reports whether the backing clone's @restore-source
-// still exists, wherever a promote left it. Promoting a restored PVC moves
-// @restore-source onto that PVC and makes the backing clone a clone of it, so
-// the fixed path alone would report a false Lost. ZFS keeps the backing
-// clone's `origin` pointing at the relocated snapshot, so follow it.
-func (r *ZfsSnapshotReconciler) restoreSourcePresent(ctx context.Context, backingFull string) (bool, error) {
-	ok, err := r.exists(ctx, backingFull+"@"+restoreSourceSnapshotName)
-	if err != nil || ok {
-		return ok, err
-	}
-	origin, err := r.ZFS.Get(ctx, backingFull, "origin")
-	if err != nil {
-		if errors.Is(err, zpool.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	return strings.HasSuffix(strings.TrimSpace(origin), "@"+restoreSourceSnapshotName), nil
-}
-
-func (r *ZfsSnapshotReconciler) exists(ctx context.Context, name string) (bool, error) {
-	if _, err := r.ZFS.Get(ctx, name, "type"); err != nil {
-		if errors.Is(err, zpool.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
 // reconcileBackingClone clones the raw snapshot into a flat sibling of the
-// source dataset named after Spec.SnapshotName, then takes its fixed-name
-// "@restore-source" self-snapshot (D5).
-//
-// Restores clone that self-snapshot, never the raw snapshot directly (D0/§3.1),
-// so they keep working regardless of what later happens to the source volume —
-// including a promote relocating the raw snapshot elsewhere.
+// source dataset named after Spec.SnapshotName. The clone exists only to pin the
+// raw snapshot (it is its origin) and to tell where it is; it takes no snapshot
+// of its own. Restores clone the raw snapshot directly (P4).
 func (r *ZfsSnapshotReconciler) reconcileBackingClone(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, pool *storagev1alpha1.ZfsPool, datasetPath, rawFull string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -442,23 +387,8 @@ func (r *ZfsSnapshotReconciler) reconcileBackingClone(ctx context.Context, snap 
 		return ctrl.Result{}, err
 	}
 
-	restoreSourceFull := backingFull + "@" + restoreSourceSnapshotName
-	if _, err := r.ZFS.Get(ctx, restoreSourceFull, "type"); err != nil {
-		if !errors.Is(err, zpool.ErrNotExist) {
-			return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
-				"LookupFailed", err.Error())
-		}
-		if err := r.ZFS.Snapshot(ctx, restoreSourceFull); err != nil {
-			return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
-				"SelfSnapshotFailed", err.Error())
-		}
-		logger.Info("created backing-clone self-snapshot", "snapshot", restoreSourceFull)
-	}
-
-	// The raw snapshot carries the real instant; @restore-source is taken later
-	// and, for group members, at a different moment per member (ADR-0036).
 	creation := snapshotCreationTime(ctx, r.ZFS, rawFull)
-	restore := snapshotRestoreSize(ctx, r.ZFS, restoreSourceFull)
+	restore := snapshotRestoreSize(ctx, r.ZFS, rawFull)
 	return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseReady, true, creation, restore,
 		"Ready", fmt.Sprintf("snapshot %s ready on %s (backing clone %s)", rawFull, r.NodeName, backingFull))
 }
@@ -600,18 +530,4 @@ func firstReadyTime(conds []metav1.Condition) *metav1.Time {
 	}
 	now := metav1.Now()
 	return &now
-}
-
-// locateRaw returns where the raw snapshot lives now. Short names are unique and
-// a promote moves a snapshot instead of copying it, so a snapshot that exists at
-// the recorded address is the one; only a miss needs the pool-wide scan.
-func (r *ZfsSnapshotReconciler) locateRaw(ctx context.Context, poolName, recorded, suffix string) (string, error) {
-	if recorded != "" {
-		if _, err := r.ZFS.Get(ctx, recorded, "type"); err == nil {
-			return recorded, nil
-		} else if !errors.Is(err, zpool.ErrNotExist) {
-			return "", err
-		}
-	}
-	return r.ZFS.FindSnapshot(ctx, poolName, suffix)
 }
