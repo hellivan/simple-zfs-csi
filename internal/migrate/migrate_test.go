@@ -251,3 +251,14 @@ func TestMigrateSourceType(t *testing.T) {
 		t.Errorf("empty sourceType with the source gone must block")
 	}
 }
+
+func TestWithinOneLevel(t *testing.T) {
+	for name, want := range map[string]bool{
+		"tank/k8s": true, "tank/k8s@s": true, "tank/k8s/a": true, "tank/k8s/a@s": true,
+		"tank/k8s/a/b": false, "tank/k8s/a/b@s": false, "tank/k8sx/a": false,
+	} {
+		if got := withinOneLevel(name, "tank/k8s"); got != want {
+			t.Errorf("withinOneLevel(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
