@@ -19,8 +19,33 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
+	"github.com/hellivan/simple-zfs-csi/internal/zpool"
 	"github.com/hellivan/simple-zfs-csi/internal/zpool/memzfs"
 )
+
+// lifePool is the ZFS the lifecycle harness runs on: the in-memory model, or a
+// real pool (real_lifecycle_test.go, build tag zfsreal).
+type lifePool interface {
+	zpool.ZFS
+	Datasets() []string
+	Snapshots() []string
+	Deferred(snapshot string) bool
+	// Scans is how many pool-wide snapshot searches the driver ran.
+	Scans() int
+	// Check validates the model's own invariants; a real pool has none.
+	Check() error
+}
+
+type injector interface {
+	Inject(op, name string, err error, times int)
+}
+
+// realPool is set by the real-pool test file: the sequence and walk counts
+// shrink because every step runs real zfs commands.
+var realPool bool
+
+// worldFactory builds the world a test runs in; the real-pool test file swaps it.
+var worldFactory = newMemWorld
 
 // lifeWorld drives the real ZfsDataset and ZfsSnapshot reconcilers against the
 // in-memory ZFS. It is the scenario harness for strategy D
@@ -28,35 +53,51 @@ import (
 // controller does (create or delete an object), and after every step the
 // invariants below must hold.
 type lifeWorld struct {
-	t     *testing.T
-	ctx   context.Context
-	z     *memzfs.Mem
-	c     client.Client
-	snapR *ZfsSnapshotReconciler
-	dsR   *ZfsDatasetReconciler
-	n     int
-	vols  map[string]string // volume -> "", "snapshot:<name>" or "volume:<name>"
-	snaps map[string]string // ZfsSnapshot name -> source volume
-	hist  []string
-	flaky bool // a reconcile error during delete is a retry, not a failure
+	t        *testing.T
+	ctx      context.Context
+	z        lifePool
+	pool     string   // ZFS pool name
+	base     string   // full name of the dataset all volumes live under
+	prefix   string   // base relative to the pool, as written in spec.dataset
+	baseline []string // datasets and snapshots present before the test started
+	c        client.Client
+	snapR    *ZfsSnapshotReconciler
+	dsR      *ZfsDatasetReconciler
+	n        int
+	vols     map[string]string // volume -> "", "snapshot:<name>" or "volume:<name>"
+	snaps    map[string]string // ZfsSnapshot name -> source volume
+	hist     []string
+	flaky    bool // a reconcile error during delete is a retry, not a failure
 }
 
-func newLifeWorld(t *testing.T) *lifeWorld {
+func newLifeWorld(t *testing.T) *lifeWorld { return worldFactory(t) }
+
+func newMemWorld(t *testing.T) *lifeWorld {
 	t.Helper()
 	z := memzfs.New("tank")
-	ctx := context.Background()
-	if err := z.CreateDataset(ctx, "tank/k8s", nil); err != nil {
+	if err := z.CreateDataset(context.Background(), "tank/k8s", nil); err != nil {
 		t.Fatal(err)
 	}
+	return buildWorld(t, z, "tank", "k8s")
+}
+
+// buildWorld wires the reconcilers to z. prefix is the dataset (relative to the
+// pool) that already exists and holds every volume.
+func buildWorld(t *testing.T, z lifePool, pool, prefix string) *lifeWorld {
+	t.Helper()
 	scheme := newTestScheme(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(onlinePool()).
+	zp := onlinePool()
+	zp.Status.PoolName = pool
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(zp).
 		WithStatusSubresource(&storagev1alpha1.ZfsDataset{}, &storagev1alpha1.ZfsSnapshot{}).Build()
-	return &lifeWorld{
-		t: t, ctx: ctx, z: z, c: c,
+	w := &lifeWorld{
+		t: t, ctx: context.Background(), z: z, c: c, pool: pool, base: pool + "/" + prefix, prefix: prefix,
 		snapR: &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z},
 		dsR:   &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z},
 		vols:  map[string]string{}, snaps: map[string]string{},
 	}
+	w.baseline = append(z.Datasets(), z.Snapshots()...)
+	return w
 }
 
 func (w *lifeWorld) fail(format string, a ...any) {
@@ -85,7 +126,7 @@ func (w *lifeWorld) mkVol(source *storagev1alpha1.DatasetSource, kind string) st
 	vol := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name)},
 		Spec: storagev1alpha1.ZfsDatasetSpec{
-			PoolGUID: "999", Dataset: "k8s/" + name, Type: storagev1alpha1.DatasetTypeFilesystem, Source: source,
+			PoolGUID: "999", Dataset: w.prefix + "/" + name, Type: storagev1alpha1.DatasetTypeFilesystem, Source: source,
 		},
 	}
 	if err := w.c.Create(w.ctx, vol); err != nil {
@@ -126,7 +167,7 @@ func (w *lifeWorld) snapshot(src string) string {
 	s := &storagev1alpha1.ZfsSnapshot{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID("uid-" + name)},
 		Spec: storagev1alpha1.ZfsSnapshotSpec{
-			PoolGUID: "999", Dataset: "k8s/" + src, SnapshotName: "csi-snap-" + name, SourceVolume: src,
+			PoolGUID: "999", Dataset: w.prefix + "/" + src, SnapshotName: "csi-snap-" + name, SourceVolume: src,
 			SourceType: storagev1alpha1.DatasetTypeFilesystem,
 		},
 	}
@@ -214,19 +255,22 @@ func (w *lifeWorld) verify() {
 	for _, d := range w.z.Datasets() {
 		datasets[d] = true
 	}
-	owned := map[string]bool{"tank": true, "tank/k8s": true}
+	owned := map[string]bool{}
+	for _, n := range w.baseline {
+		owned[n] = true
+	}
 	for v := range w.vols {
-		if !datasets["tank/k8s/"+v] {
+		if !datasets[w.base+"/"+v] {
 			w.fail("live volume %s lost its dataset", v)
 		}
-		owned["tank/k8s/"+v] = true
+		owned[w.base+"/"+v] = true
 	}
 	rawOwned := map[string]bool{}
 	for s := range w.snaps {
 		raw := "csi-snap-" + s
 		rawOwned[raw] = true
-		owned["tank/k8s/"+raw] = true
-		at, err := locateRawSnapshot(w.ctx, w.z, "tank/k8s/"+raw, "tank/k8s/"+w.snaps[s]+"@"+raw, raw)
+		owned[w.base+"/"+raw] = true
+		at, err := locateRawSnapshot(w.ctx, w.z, w.base+"/"+raw, w.base+"/"+w.snaps[s]+"@"+raw, raw)
 		if err != nil || at == "" {
 			w.fail("live snapshot %s lost its raw snapshot (err=%v)", s, err)
 		}
@@ -278,11 +322,12 @@ func (w *lifeWorld) drain(snapsFirst bool) {
 
 func (w *lifeWorld) requireEmpty() {
 	w.t.Helper()
-	if got := w.z.Datasets(); strings.Join(got, ",") != "tank,tank/k8s" {
-		w.fail("datasets left behind: %v", got)
-	}
-	if got := w.z.Snapshots(); len(got) != 0 {
-		w.fail("snapshots left behind: %v", got)
+	got := append(w.z.Datasets(), w.z.Snapshots()...)
+	sort.Strings(got)
+	want := append([]string{}, w.baseline...)
+	sort.Strings(want)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		w.fail("left behind: %v, want only %v", got, want)
 	}
 }
 
@@ -297,7 +342,7 @@ func TestLifecycle_RestoreThenDeleteSnapshotPinsNothing(t *testing.T) {
 	w.verify()
 	// Only the restore still depends on the data; nothing is pinned on the source.
 	for _, sn := range w.z.Snapshots() {
-		if strings.HasPrefix(sn, "tank/k8s/"+v+"@") && !w.z.Deferred(sn) {
+		if strings.HasPrefix(sn, w.base+"/"+v+"@") && !w.z.Deferred(sn) {
 			t.Errorf("source %s still owns a live snapshot %s", v, sn)
 		}
 	}
@@ -316,7 +361,7 @@ func TestLifecycle_DeleteSourceKeepsSnapshotAndRestoreWorking(t *testing.T) {
 	w.verify()
 	// Deleting the source promoted the backing clone: it now holds the raw
 	// snapshot and has no origin, so the raw snapshot is found by the pool scan.
-	bk := "tank/k8s/csi-snap-" + s
+	bk := w.base + "/csi-snap-" + s
 	if o, _ := w.z.Get(w.ctx, bk, "origin"); o != "-" {
 		t.Fatalf("precondition: backing clone origin = %q, want -", o)
 	}
@@ -387,13 +432,16 @@ func TestLifecycle_SingleFailureDuringDeleteIsRetried(t *testing.T) {
 		return w
 	}
 	probe := build()
+	if _, ok := probe.z.(injector); !ok {
+		t.Skip("this pool cannot inject failures")
+	}
 	targets := append(probe.z.Datasets(), probe.z.Snapshots()...)
 	for _, op := range []string{"destroy", "destroy-d", "promote"} {
 		for _, target := range targets {
 			for _, snapsFirst := range []bool{true, false} {
 				w := build()
 				w.flaky = true
-				w.z.Inject(op, target, errors.New("cannot destroy: dataset is busy"), 1)
+				w.z.(injector).Inject(op, target, errors.New("cannot destroy: dataset is busy"), 1)
 				w.hist = append(w.hist, "inject("+op+" "+target+")")
 				w.drain(snapsFirst)
 			}
@@ -407,7 +455,7 @@ func TestLifecycle_AllSequences(t *testing.T) {
 	// 3 creations is 131 sequences (about 2 s); 4 is 4705 (about 80 s), 5 more
 	// still. LIFECYCLE_MAX_CREATES raises the bound for a deeper manual run.
 	maxCreates := 3
-	if testing.Short() {
+	if testing.Short() || realPool {
 		maxCreates = 2
 	}
 	if v, err := strconv.Atoi(os.Getenv("LIFECYCLE_MAX_CREATES")); err == nil && v > 0 {
@@ -501,6 +549,12 @@ func TestLifecycle_RandomWalks(t *testing.T) {
 	walks := 150
 	if testing.Short() {
 		walks = 20
+	}
+	if realPool {
+		walks = 6
+		if v, err := strconv.Atoi(os.Getenv("LIFECYCLE_WALKS")); err == nil && v > 0 {
+			walks = v
+		}
 	}
 	for seed := int64(1); seed <= int64(walks); seed++ {
 		rng := rand.New(rand.NewSource(seed))

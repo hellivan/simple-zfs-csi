@@ -183,7 +183,10 @@ Steps:
 4. Verified live first on a layout built the old way (volume, snapshot, restore, clone, group) in `verify_zfs_functions`; run on the
    cluster only after the user approves the audit output.
 5. Ordering with the release: deploy the S1 driver first (new objects get labels at creation), run the script, audit clean, then the S4 driver.
-   Rollback is trivial: labels are inert properties and `destroy -d` was always the intended end state.
+   **Rollback is not trivial.** Labels are inert, but `destroy -d` on a `restore-source` that has no clone removes it at once (verified:
+   ZFS destroys a deferred snapshot immediately when nothing clones it), and the old driver restores from `restore-source`. After the
+   migration the old driver cannot restore from those snapshots. The migration is therefore one-way unless the `restore-source` step is
+   postponed: decision pending (see the open question to the user), the new driver ignores `restore-source` either way.
 
 Tests: the derivation and audit logic is Go or testable shell against the in-memory ZFS (S2), covering: unlabelled legacy layout,
 partially labelled, promoted raw (raw lives on a restore), orphan, wrong existing label, snapshot-inherited false positive.
