@@ -272,8 +272,8 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	}
 
 	// The backing clone is a vessel with no snapshots of its own, unless a promote
-	// moved the raw snapshot (and older ones) onto it, or it was made by an older
-	// driver (@restore-source). The same loop as for a volume empties it.
+	// moved the raw snapshot (and older ones) onto it. The same loop as for a
+	// volume empties it.
 	if err := detachAndCleanSnapshots(ctx, r.gateReader(), r.ZFS, snap.Spec.PoolGUID, pool.Status.PoolName, backingFull); err != nil {
 		return ctrl.Result{}, err
 	}

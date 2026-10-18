@@ -222,7 +222,7 @@ func TestZfsSnapshotReconcile_FollowsRenamedSourceDataset(t *testing.T) {
 }
 
 // TestZfsSnapshotReconcile_CreatesRawSnapshotAndBackingClone drives a full
-// create: raw snapshot -> backing ZFS clone -> "@restore-source" self-snapshot
+// create: raw snapshot -> backing ZFS clone
 // -> ZfsSnapshot Ready.
 func TestZfsSnapshotReconcile_CreatesRawSnapshotAndBackingClone(t *testing.T) {
 	scheme := newTestScheme(t)
@@ -292,242 +292,6 @@ func TestZfsSnapshotReconcile_CreatesRawSnapshotAndBackingClone(t *testing.T) {
 	}
 	if got.Status.Phase != storagev1alpha1.SnapshotPhaseReady || !got.Status.ReadyToUse {
 		t.Errorf("phase = %q readyToUse = %v, want Ready/true", got.Status.Phase, got.Status.ReadyToUse)
-	}
-}
-
-// TestZfsSnapshotReconcile_DeleteTearsDownBothHalves verifies
-// D15's delete path: deleting a ZfsSnapshot deletes its owned
-// backing-clone ZfsDataset and waits (polling) for ZfsDatasetReconciler to
-// fully remove it before doing the required raw-origin-snapshot cleanup and
-// releasing its own finalizer.
-func TestZfsSnapshotReconcile_DeleteTearsDownBothHalves(t *testing.T) {
-	scheme := newTestScheme(t)
-	now := metav1.Now()
-	snap := &storagev1alpha1.ZfsSnapshot{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "snap-1",
-			Finalizers:        []string{zfsSnapshotFinalizer},
-			DeletionTimestamp: &now,
-		},
-		Spec: storagev1alpha1.ZfsSnapshotSpec{
-			PoolGUID:     "999",
-			Dataset:      "k8s/pvc-src",
-			SnapshotName: "csi-snap-abc",
-			SourceVolume: "pvc-src",
-		},
-	}
-	c := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(onlinePool(), snap).
-		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsDataset{}).
-		Build()
-
-	z := newFakeZFS("tank/k8s/pvc-src@csi-snap-abc", "tank/k8s/csi-snap-abc")
-	z.origin["tank/k8s/csi-snap-abc"] = "tank/k8s/pvc-src@csi-snap-abc"
-	z.seedSnapshot("tank/k8s/csi-snap-abc", legacyRestoreSourceSnapshot)
-	snapR := &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	snapReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
-
-	// One pass tears down both halves: no object to delete, nothing to poll for.
-	if _, err := snapR.Reconcile(context.Background(), snapReq); err != nil {
-		t.Fatalf("snapshot reconcile: %v", err)
-	}
-
-	// An older driver's backing clone carries @restore-source: the raw snapshot
-	// is marked first, then the self-snapshot goes (it blocks the non-recursive
-	// destroy), then the clone.
-	want := []string{
-		"tank/k8s/csi-snap-abc@" + legacyRestoreSourceSnapshot,
-		"tank/k8s/csi-snap-abc",
-	}
-	if !reflect.DeepEqual(z.deferred, []string{"tank/k8s/pvc-src@csi-snap-abc"}) {
-		t.Fatalf("deferred = %v, want the raw snapshot", z.deferred)
-	}
-	if !reflect.DeepEqual(z.destroyed, want) {
-		t.Fatalf("destroyed = %v, want %v", z.destroyed, want)
-	}
-
-	var goneSnap storagev1alpha1.ZfsSnapshot
-	if err := c.Get(context.Background(), client.ObjectKey{Name: "snap-1"}, &goneSnap); !apierrors.IsNotFound(err) {
-		t.Fatalf("expected ZfsSnapshot to be gone, err = %v", err)
-	}
-}
-
-// TestZfsSnapshotReconcile_DeleteWithLiveRestore is the F2b
-// regression. Deleting a snapshot that a live restored PVC was created from
-// promotes that PVC while the backing clone is torn down, which leaves it a
-// clone of the *raw* origin snapshot on the still-live source volume. ZFS then
-// refuses to destroy that raw snapshot ("snapshot has dependent clones"), and
-// because the zfssnapshot finalizer is gated on that destroy succeeding, the
-// ZfsSnapshot used to stay Terminating forever — violating the design's own
-// "DeleteSnapshot always succeeds, never blocks" guarantee.
-//
-// D19 promotes the raw snapshot's remaining clones away first, which relocates
-// it onto the dependent and turns the destroy into a NotExist no-op.
-func TestZfsSnapshotReconcile_DeleteWithLiveRestore(t *testing.T) {
-	scheme := newTestScheme(t)
-	now := metav1.Now()
-	ctx := context.Background()
-
-	source := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-a", Finalizers: []string{zfsDatasetFinalizer}},
-		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/pvc-a", Type: storagev1alpha1.DatasetTypeFilesystem},
-	}
-	snap := &storagev1alpha1.ZfsSnapshot{
-		ObjectMeta: metav1.ObjectMeta{Name: "snap-1", Finalizers: []string{zfsSnapshotFinalizer}, DeletionTimestamp: &now},
-		Spec: storagev1alpha1.ZfsSnapshotSpec{
-			PoolGUID: "999", Dataset: "k8s/pvc-a", SnapshotName: "csi-snap-x",
-			SourceVolume: "pvc-a",
-		},
-	}
-	restored := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-r", Finalizers: []string{zfsDatasetFinalizer}},
-		Spec: storagev1alpha1.ZfsDatasetSpec{
-			PoolGUID: "999", Dataset: "k8s/pvc-r", Type: storagev1alpha1.DatasetTypeFilesystem,
-			Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-x@" + legacyRestoreSourceSnapshot},
-		},
-	}
-	c := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(onlinePool(), source, snap, restored).
-		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsDataset{}).
-		Build()
-
-	z := newFakeZFS("tank/k8s/pvc-a")
-	z.seedClone("tank/k8s/pvc-a", "csi-snap-x", "tank/k8s/csi-snap-x")
-	z.seedClone("tank/k8s/csi-snap-x", legacyRestoreSourceSnapshot, "tank/k8s/pvc-r")
-
-	snapR := &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	dsR := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	snapReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
-
-	// One pass now: promote the restore off the backing clone, destroy the clone,
-	// then deal with the raw origin snapshot the restore has inherited.
-	if _, err := snapR.Reconcile(ctx, snapReq); err != nil {
-		t.Fatalf("snapshot reconcile: %v", err)
-	}
-	var gone storagev1alpha1.ZfsSnapshot
-	if err := c.Get(ctx, client.ObjectKey{Name: "snap-1"}, &gone); !apierrors.IsNotFound(err) {
-		t.Fatalf("ZfsSnapshot should be fully deleted, err = %v", err)
-	}
-	// Legacy layout (the restore clones the backing clone's @restore-source).
-	// The raw snapshot is only marked (ZFS removes it with its last clone), and
-	// the restore was promoted off the backing clone so that could be destroyed.
-	if want := []string{"tank/k8s/pvc-a@csi-snap-x"}; !reflect.DeepEqual(z.deferred, want) {
-		t.Errorf("deferred = %v, want %v", z.deferred, want)
-	}
-	if got, want := z.snapshots["tank/k8s/pvc-r"], []string{legacyRestoreSourceSnapshot}; !reflect.DeepEqual(got, want) {
-		t.Errorf("snapshots[pvc-r] = %v, want %v", got, want)
-	}
-	// pvc-r must still be independently deletable afterwards.
-	var dep storagev1alpha1.ZfsDataset
-	if err := c.Get(ctx, client.ObjectKey{Name: "pvc-r"}, &dep); err != nil {
-		t.Fatalf("get pvc-r: %v", err)
-	}
-	if err := c.Delete(ctx, &dep); err != nil {
-		t.Fatalf("delete pvc-r: %v", err)
-	}
-	if _, err := dsR.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-r"}}); err != nil {
-		t.Fatalf("reconcile delete pvc-r: %v", err)
-	}
-	if err := c.Get(ctx, client.ObjectKey{Name: "pvc-r"}, &dep); err == nil {
-		t.Error("pvc-r still present after delete")
-	}
-}
-
-// TestZfsSnapshotReconcile_ChainedBackingClonesRemainDeletable is the F2d
-// regression, the case this project's own live-pool run documented without
-// noticing. After DeleteVolume on a source with several snapshots,
-// the backing clones end up chained to one another — each owning a real
-// snapshot that the next one clones — and none of it was ever tracked. Deleting
-// the first snapshot then failed on "snapshot has dependent clones" forever.
-func TestZfsSnapshotReconcile_ChainedBackingClonesRemainDeletable(t *testing.T) {
-	scheme := newTestScheme(t)
-	now := metav1.Now()
-	ctx := context.Background()
-
-	vol := &storagev1alpha1.ZfsDataset{
-		ObjectMeta: metav1.ObjectMeta{Name: "vol1", Finalizers: []string{zfsDatasetFinalizer}, DeletionTimestamp: &now},
-		Spec:       storagev1alpha1.ZfsDatasetSpec{PoolGUID: "999", Dataset: "k8s/vol1", Type: storagev1alpha1.DatasetTypeFilesystem},
-	}
-	objs := []client.Object{onlinePool(), vol}
-	snaps := map[string]*storagev1alpha1.ZfsSnapshot{}
-	for _, n := range []string{"1", "2"} {
-		s := &storagev1alpha1.ZfsSnapshot{
-			ObjectMeta: metav1.ObjectMeta{Name: "snap-" + n, Finalizers: []string{zfsSnapshotFinalizer}},
-			Spec: storagev1alpha1.ZfsSnapshotSpec{
-				PoolGUID: "999", Dataset: "k8s/vol1", SnapshotName: "csi-snap-" + n,
-				SourceVolume: "vol1",
-			},
-			Status: storagev1alpha1.ZfsSnapshotStatus{Phase: storagev1alpha1.SnapshotPhaseReady, ReadyToUse: true},
-		}
-		bc := &storagev1alpha1.ZfsDataset{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "csi-snap-" + n, Finalizers: []string{zfsDatasetFinalizer},
-				OwnerReferences: []metav1.OwnerReference{
-					*metav1.NewControllerRef(s, storagev1alpha1.GroupVersion.WithKind("ZfsSnapshot")),
-				},
-			},
-			Spec: storagev1alpha1.ZfsDatasetSpec{
-				PoolGUID: "999", Dataset: "k8s/csi-snap-" + n, Type: storagev1alpha1.DatasetTypeFilesystem,
-				Source: &storagev1alpha1.DatasetSource{Snapshot: "k8s/vol1@csi-snap-" + n},
-			},
-		}
-		snaps[n] = s
-		objs = append(objs, s, bc)
-	}
-	c := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(objs...).
-		WithStatusSubresource(&storagev1alpha1.ZfsSnapshot{}, &storagev1alpha1.ZfsDataset{}).
-		Build()
-
-	z := newFakeZFS("tank/k8s/vol1")
-	for _, n := range []string{"1", "2"} {
-		z.seedClone("tank/k8s/vol1", "csi-snap-"+n, "tank/k8s/csi-snap-"+n)
-		z.seedSnapshot("tank/k8s/csi-snap-"+n, legacyRestoreSourceSnapshot)
-	}
-
-	snapR := &ZfsSnapshotReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-	dsR := &ZfsDatasetReconciler{Client: c, Scheme: scheme, NodeName: "node-a", ZFS: z}
-
-	// DeleteVolume promotes both backing clones away and destroys the source.
-	if _, err := dsR.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "vol1"}}); err != nil {
-		t.Fatalf("reconcile delete vol1: %v", err)
-	}
-	// This is the chained state the live-pool run recorded: csi-snap-2 is now a
-	// clone of a snapshot owned by csi-snap-1.
-	if o, want := z.origin["tank/k8s/csi-snap-2"], "tank/k8s/csi-snap-1@csi-snap-1"; o != want {
-		t.Fatalf("csi-snap-2 origin = %q, want %q", o, want)
-	}
-
-	// Deleting the *first* snapshot must still work: its backing clone owns the
-	// snapshot the second one depends on.
-	if err := c.Delete(ctx, snaps["1"]); err != nil {
-		t.Fatalf("delete snap-1: %v", err)
-	}
-	snap1Req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
-	if _, err := snapR.Reconcile(ctx, snap1Req); err != nil {
-		t.Fatalf("snapshot reconcile 1: %v", err)
-	}
-	if _, err := dsR.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "csi-snap-1"}}); err != nil {
-		t.Fatalf("backing clone reconcile: %v", err)
-	}
-	if _, err := snapR.Reconcile(ctx, snap1Req); err != nil {
-		t.Fatalf("snapshot reconcile 2: %v", err)
-	}
-
-	var gone storagev1alpha1.ZfsSnapshot
-	if err := c.Get(ctx, client.ObjectKey{Name: "snap-1"}, &gone); !apierrors.IsNotFound(err) {
-		t.Fatalf("snap-1 should be fully deleted, err = %v", err)
-	}
-	// The surviving snapshot is untouched and still restorable.
-	var survivor storagev1alpha1.ZfsDataset
-	if err := c.Get(ctx, client.ObjectKey{Name: "csi-snap-2"}, &survivor); err != nil {
-		t.Fatalf("csi-snap-2 should survive: %v", err)
-	}
-	if !z.existing["tank/k8s/csi-snap-2@"+legacyRestoreSourceSnapshot] {
-		t.Error("csi-snap-2 lost its @restore-source snapshot")
 	}
 }
 
@@ -626,7 +390,7 @@ func TestZfsSnapshotReconcile_LostRecoversWhenPrimitiveReturns(t *testing.T) {
 }
 
 // The reported creation time comes from the raw snapshot, not the later
-// @restore-source self-snapshot (ADR-0036).
+// later backing clone (ADR-0036).
 func TestZfsSnapshotReconcile_CreationTimeComesFromRawSnapshot(t *testing.T) {
 	scheme := newTestScheme(t)
 	src := &storagev1alpha1.ZfsDataset{
@@ -647,7 +411,7 @@ func TestZfsSnapshotReconcile_CreationTimeComesFromRawSnapshot(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "snap-1"}}
 
 	// Pre-existing raw snapshot with a distinctive time; the fake stamps every
-	// snapshot it creates itself (incl. @restore-source) with 1700000000.
+	// snapshot it creates itself with 1700000000.
 	z.seedSnapshot("tank/k8s/pvc-1", "csi-snap-1")
 	z.props["tank/k8s/pvc-1@csi-snap-1"] = map[string]string{"creation": "1600000000", "referenced": "1048576"}
 	for i := 0; i < 3; i++ {

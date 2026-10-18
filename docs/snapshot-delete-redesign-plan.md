@@ -111,12 +111,10 @@ Needed because under D the raw snapshot has no fixed path (see P4). The CSI laye
 Implemented: the snapshot delete is `destroy -d` on the raw snapshot (found via the backing clone's origin or the backing clone itself),
 then the shared promote loop empties the backing clone, then the clone is destroyed. The loop picks the oldest cloned snapshot
 first and prefers a clone labelled `backing`; every snapshot destroy is `-d`. A direct clone's delete marks its `@clone-<name>`
-snapshot (first step, before any promote). Nothing scans the pool. No `restore-source` is created or read; the name stays on the delete allow-list as
-`legacyRestoreSourceSnapshot` until S6 ran. A settled snapshot is Lost when its raw snapshot cannot be found.
+snapshot (first step, before any promote). Nothing scans the pool. No `restore-source` is created or read, and the driver contains no logic for the old layout: the cluster is migrated (S6) before the new driver runs, and the delete allow-list is only `clone-*` and `csi-snap-*`, so a leftover `restore-source` would block a delete loudly. A settled snapshot is Lost when its raw snapshot cannot be found.
 Tests, driving the real reconcilers on `memzfs` (`internal/controller/lifecycle_test.go`): every sequence of up to 3 creations
 (131; `LIFECYCLE_MAX_CREATES=4` gives 4705, about 80 s, run once green), 150 random walks of up to 7 creations, named scenarios
-(restore then delete snapshot pins nothing, delete source first, fan-out, chains, direct clones), the legacy `restore-source`
-layout in three delete orders, and a single failing ZFS call (`destroy`, `destroy -d`, `promote`, including P8 "dataset is
+(restore then delete snapshot pins nothing, delete source first, fan-out, chains, direct clones), and a single failing ZFS call (`destroy`, `destroy -d`, `promote`, including P8 "dataset is
 busy") at every dataset and snapshot of a populated pool. After every step: model invariants, no live volume without dataset, every
 live snapshot restorable, no unowned dataset or unmarked unowned snapshot; at the end the pool is empty. Mutation-checked
 (dropping the deferred destroy or the clone-origin cleanup fails them). `fakeZFS` is kept for the narrow unit tests only.
@@ -139,7 +137,7 @@ Original scope:
 - `dataset is busy` is retryable (P8).
 - The uncommitted prototype (`DestroySnapshotDeferred`, `detachSnapshotClones` removed) is the starting point and is
   re-checked against these tests before it is committed.
-- Delete logic selects by label. The allow-list (`driverSnapshotSuffix`) keeps only a `restore-source` arm until S6 ran.
+- Delete logic selects by label. The allow-list (`driverSnapshotSuffix`) has no `restore-source` arm: the migration (S6) must have removed every `restore-source` before the new driver runs.
 - Remove the fixed `restore-source` creation and every code path that reads it (`restoreSourcePresent`, the self-snapshot in `reconcileBackingClone`).
 
 ### S5. Documentation
@@ -190,7 +188,7 @@ partially labelled, promoted raw (raw lives on a restore), orphan, wrong existin
 
 ### S7. Release and verify
 - The user releases. Live test on a throwaway namespace: the joplin group test, a restore, deletes in the orders of scenarios 6, 12 and 13.
-- After the migration and an audit that finds no unlabelled object and no `restore-source`: remove the allow-list.
+- The audit must find no unlabelled object and no `restore-source` before the new driver is deployed (the driver has no code for them).
 
 ### Open items outside this redesign
 Finish C9 (cross-pool `FAILED_PRECONDITION`, member restore after a member is deleted), C10, C11, D1/D3/D4/D5, E1/E2/E4 to E6,

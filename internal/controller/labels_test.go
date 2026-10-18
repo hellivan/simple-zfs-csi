@@ -73,7 +73,7 @@ func TestLabels_NewVolume(t *testing.T) {
 func TestLabels_RestoredAndClonedVolumesAreVolumes(t *testing.T) {
 	z := newFakeZFS()
 	r := datasetReconciler(t, z,
-		labelDataset("pvc-restore", &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-a@restore-source"}),
+		labelDataset("pvc-restore", &storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-a@csi-snap-a"}),
 		labelDataset("pvc-clone", &storagev1alpha1.DatasetSource{Volume: "k8s/pvc-src"}))
 	reconcileTwiceOrMore(t, r, "pvc-restore", 1)
 	reconcileTwiceOrMore(t, r, "pvc-clone", 1)

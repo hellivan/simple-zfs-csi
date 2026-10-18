@@ -242,7 +242,7 @@ func (w *lifeWorld) verify() {
 	for _, sn := range w.z.Snapshots() {
 		short := sn[strings.Index(sn, "@")+1:]
 		switch {
-		case rawOwned[short], w.z.Deferred(sn), short == legacyRestoreSourceSnapshot:
+		case rawOwned[short], w.z.Deferred(sn):
 		case strings.HasPrefix(short, "clone-") && w.vols[strings.TrimPrefix(short, "clone-")] != "":
 		default:
 			w.fail("ghost snapshot %s", sn)
@@ -398,33 +398,6 @@ func TestLifecycle_SingleFailureDuringDeleteIsRetried(t *testing.T) {
 				w.drain(snapsFirst)
 			}
 		}
-	}
-}
-
-// Objects made by older drivers: the backing clone carries @restore-source and
-// restores clone it. They must still be deletable in any order and leave nothing.
-func TestLifecycle_LegacyRestoreSourceLayout(t *testing.T) {
-	for _, order := range []string{"snapshots first", "volumes first", "restore first"} {
-		t.Run(order, func(t *testing.T) {
-			w := newLifeWorld(t)
-			v := w.newVol()
-			s := w.snapshot(v)
-			bk := "tank/k8s/csi-snap-" + s
-			if err := w.z.Snapshot(w.ctx, bk+"@"+legacyRestoreSourceSnapshot); err != nil {
-				t.Fatal(err)
-			}
-			w.hist = append(w.hist, "legacy-restore-source")
-			r1 := w.mkVol(&storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-" + s + "@" + legacyRestoreSourceSnapshot}, "legacy")
-			r2 := w.mkVol(&storagev1alpha1.DatasetSource{Snapshot: "k8s/csi-snap-" + s + "@" + legacyRestoreSourceSnapshot}, "legacy")
-			w.verify()
-			if order == "restore first" {
-				w.delVol(r1)
-				w.verify()
-				w.delVol(r2)
-				w.verify()
-			}
-			w.drain(order != "volumes first")
-		})
 	}
 }
 

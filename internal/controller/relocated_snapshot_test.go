@@ -14,39 +14,6 @@ import (
 	storagev1alpha1 "github.com/hellivan/simple-zfs-csi/api/v1alpha1"
 )
 
-// TestFakeZFSFindSnapshot_MatchesAfterAtOnly guards the one way a pool-wide
-// search by short name could go wrong: a backing clone is itself named
-// csi-snap-<uuid>, so its own "@restore-source" snapshot renders as
-// "…/csi-snap-<uuid>@restore-source". Matching must key on the part after "@",
-// never on the dataset component, or deleting a snapshot would find its own
-// backing clone's self-snapshot instead.
-func TestFakeZFSFindSnapshot_MatchesAfterAtOnly(t *testing.T) {
-	ctx := context.Background()
-	z := newFakeZFS("tank/k8s/vol1")
-	z.seedClone("tank/k8s/vol1", "csi-snap-x", "tank/k8s/csi-snap-x")
-	z.seedSnapshot("tank/k8s/csi-snap-x", legacyRestoreSourceSnapshot)
-
-	got, err := z.FindSnapshot(ctx, "tank", "csi-snap-x")
-	if err != nil {
-		t.Fatalf("FindSnapshot: %v", err)
-	}
-	if got != "tank/k8s/vol1@csi-snap-x" {
-		t.Errorf("FindSnapshot = %q, want the raw snapshot tank/k8s/vol1@csi-snap-x", got)
-	}
-
-	got, err = z.FindSnapshot(ctx, "tank", "restore-source")
-	if err != nil {
-		t.Fatalf("FindSnapshot: %v", err)
-	}
-	if got != "tank/k8s/csi-snap-x@restore-source" {
-		t.Errorf("FindSnapshot = %q, want tank/k8s/csi-snap-x@restore-source", got)
-	}
-
-	if got, err = z.FindSnapshot(ctx, "tank", "csi-snap-absent"); err != nil || got != "" {
-		t.Errorf("FindSnapshot(absent) = %q, %v; want \"\", nil", got, err)
-	}
-}
-
 // TestZfsDatasetReconcile_RecordsDeleteRefusalOnStatus is the other half of
 // ADR-0029: a refused destroy must leave the reason on the object, not only in
 // this agent's logs, or DeleteVolume has nothing to report to the CO.

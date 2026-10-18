@@ -32,8 +32,8 @@ func volumeSource(id string) *csi.VolumeContentSource {
 }
 
 func TestCreateVolume_RestoreFromSnapshot(t *testing.T) {
-	// Every snapshot owns a backing clone, and restores clone that clone's
-	// "@restore-source" self-snapshot rather than the raw snapshot (§11).
+	// Every snapshot owns a backing clone; a restore only references the
+	// ZfsSnapshot and the node resolves the raw snapshot.
 	backing := &storagev1alpha1.ZfsDataset{
 		ObjectMeta: metav1.ObjectMeta{Name: "snap-1"},
 		Spec: storagev1alpha1.ZfsDatasetSpec{

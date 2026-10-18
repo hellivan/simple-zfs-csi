@@ -38,13 +38,6 @@ import (
 // proceed at all — but those are reads of *desired* state (spec), never of
 // derived bookkeeping.
 
-// legacyRestoreSourceSnapshot is the self-snapshot older drivers took on every
-// backing clone (and restored from). Nothing creates or reads it any more
-// (strategy D, docs/snapshot-delete-redesign-plan.md); it stays on the delete
-// allow-list so objects created by those drivers can still be cleaned up until
-// the migration script has retired them.
-const legacyRestoreSourceSnapshot = "restore-source"
-
 // maxDetachRounds bounds the detach fixpoint. Each round performs exactly one
 // `zfs promote`, and every promote strictly reduces the number of snapshots
 // still owned by the dataset being destroyed, so the loop terminates in at most
@@ -55,7 +48,6 @@ const maxDetachRounds = 100
 // driverSnapshotSuffix matches the snapshot short names (the part after "@")
 // this driver creates, and only those:
 //
-//   - "restore-source" — legacy self-snapshot of a backing clone (see legacyRestoreSourceSnapshot);
 //   - "clone-<dest-name>" — the ephemeral intermediate snapshot ADR-0009's
 //     direct PVC-to-PVC clone path takes on the source dataset, named after the
 //     destination ZfsDataset's own object name (see cloneSnapshotSuffix);
@@ -67,10 +59,10 @@ const maxDetachRounds = 100
 // touch it rather than guessing. The "clone-" and "csi-snap-" arms match on
 // prefix rather than a fixed shape because both suffixes are reserved for the
 // driver by design (D1a).
-var driverSnapshotSuffix = regexp.MustCompile(`^(restore-source|clone-.+|csi-snap-.+)$`)
+var driverSnapshotSuffix = regexp.MustCompile(`^(clone-.+|csi-snap-.+)$`)
 
 // splitSnapshot splits a full ZFS snapshot name into its dataset and short
-// name, e.g. "tank/k8s/vol@restore-source" -> ("tank/k8s/vol", "restore-source").
+// name, e.g. "tank/k8s/vol@csi-snap-x" -> ("tank/k8s/vol", "csi-snap-x").
 // The suffix is empty when full is not a snapshot.
 func splitSnapshot(full string) (dataset, suffix string) {
 	if i := strings.Index(full, "@"); i >= 0 {
