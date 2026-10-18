@@ -231,12 +231,7 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 // datasetProvisioned reports whether the dataset has ever been Ready.
 func datasetProvisioned(vol *storagev1alpha1.ZfsDataset) bool {
-	// The phase checks are the one-off migration for objects that predate
-	// ProvisionedAt; they are backfilled on their next reconcile and the checks
-	// are removed afterwards (TODO.md).
-	return vol.Status.ProvisionedAt != nil ||
-		vol.Status.Phase == storagev1alpha1.DatasetPhaseReady ||
-		vol.Status.Phase == storagev1alpha1.DatasetPhaseLost
+	return vol.Status.ProvisionedAt != nil
 }
 
 // releaseFinalizer removes the agent finalizer, allowing the API server to
@@ -625,7 +620,7 @@ func (r *ZfsDatasetReconciler) setStatusAt(ctx context.Context, vol *storagev1al
 		patched.Status.CreationTime = creation
 	}
 	if phase == storagev1alpha1.DatasetPhaseReady && patched.Status.ProvisionedAt == nil {
-		patched.Status.ProvisionedAt = firstReadyTime(patched.Status.Conditions)
+		patched.Status.ProvisionedAt = nowTime()
 	}
 
 	condStatus := metav1.ConditionTrue

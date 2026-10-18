@@ -128,11 +128,8 @@ func (r *ZfsSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// A snapshot that has been Ready is never (re-)created (ADR-0034). The phase
-	// checks are the one-off migration for objects that predate ProvisionedAt;
-	// reconcileSettled backfills them and the checks are removed afterwards
-	// (TODO.md).
-	if snap.Status.ProvisionedAt != nil || snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady || snap.Status.Phase == storagev1alpha1.SnapshotPhaseLost {
+	// A snapshot that has been Ready is never (re-)created (ADR-0034).
+	if snap.Status.ProvisionedAt != nil {
 		return r.reconcileSettled(ctx, &snap, &pool, datasetPath)
 	}
 
@@ -330,22 +327,12 @@ func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *stor
 	}
 	present := raw != ""
 	switch {
-	case present && snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady && snap.Status.ProvisionedAt != nil:
+	case present && snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady:
 		return ctrl.Result{}, nil
 	case present:
 		logger.Info("lost snapshot's raw snapshot is back", "snapshot", raw)
-		// creationTime is recorded once (ADR-0038) and never re-read. Only an
-		// object that never recorded one (legacy) reads it now.
-		var creation *metav1.Time
-		if snap.Status.CreationTime == nil {
-			creation = snapshotCreationTime(ctx, r.ZFS, raw)
-		}
-		message := fmt.Sprintf("raw snapshot %s is present again", raw)
-		if snap.Status.Phase == storagev1alpha1.SnapshotPhaseReady {
-			message = snap.Status.Message // backfilling ProvisionedAt only
-		}
-		return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseReady, true, creation, nil,
-			"Ready", message)
+		return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseReady, true, nil, nil,
+			"Ready", fmt.Sprintf("raw snapshot %s is present again", raw))
 	case snap.Status.Phase == storagev1alpha1.SnapshotPhaseLost:
 		return ctrl.Result{RequeueAfter: lostRecheckInterval}, nil
 	}
@@ -379,9 +366,8 @@ func (r *ZfsSnapshotReconciler) reconcileBackingClone(ctx context.Context, snap 
 
 	sourceType := snap.Spec.SourceType
 	if sourceType == "" {
-		// Legacy fallback only: SourceType is always set for snapshots created
-		// after ADR-0017. Default to filesystem rather than fail outright.
-		sourceType = storagev1alpha1.DatasetTypeFilesystem
+		return ctrl.Result{}, r.setSnapshotStatus(ctx, snap, storagev1alpha1.SnapshotPhaseError, false, nil, nil,
+			"InvalidSnapshot", "spec.sourceType is required")
 	}
 
 	if _, err := r.ZFS.Get(ctx, backingFull, "type"); err != nil {
@@ -471,7 +457,7 @@ func (r *ZfsSnapshotReconciler) setSnapshotStatus(ctx context.Context, snap *sto
 		patched.Status.CreationTime = creation
 	}
 	if phase == storagev1alpha1.SnapshotPhaseReady && patched.Status.ProvisionedAt == nil {
-		patched.Status.ProvisionedAt = firstReadyTime(patched.Status.Conditions)
+		patched.Status.ProvisionedAt = nowTime()
 	}
 	if restore != nil {
 		patched.Status.RestoreSize = restore
@@ -532,15 +518,8 @@ func (r *ZfsSnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// firstReadyTime is the value for a new ProvisionedAt. An object that is Ready
-// but predates the field is backfilled from its Ready condition's transition
-// time, which for a continuously Ready object is the real first-Ready time; in
-// every other case it is now.
-func firstReadyTime(conds []metav1.Condition) *metav1.Time {
-	if c := meta.FindStatusCondition(conds, "Ready"); c != nil && c.Status == metav1.ConditionTrue && !c.LastTransitionTime.IsZero() {
-		t := c.LastTransitionTime
-		return &t
-	}
+// nowTime is the value for a new ProvisionedAt.
+func nowTime() *metav1.Time {
 	now := metav1.Now()
 	return &now
 }

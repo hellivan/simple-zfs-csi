@@ -96,6 +96,7 @@ func TestLabels_ProvisionedVolumeIsNotTouched(t *testing.T) {
 	z := newFakeZFS("tank/k8s/pvc-old")
 	vol := labelDataset("pvc-old", nil)
 	vol.Status.Phase = storagev1alpha1.DatasetPhaseReady
+	vol.Status.ProvisionedAt = provisionedAtFor(true)
 	r := datasetReconciler(t, z, vol)
 	reconcileTwiceOrMore(t, r, "pvc-old", 2)
 	for _, s := range z.setProps {

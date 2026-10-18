@@ -186,6 +186,11 @@ Steps:
 Tests: the derivation and audit logic is Go or testable shell against the in-memory ZFS (S2), covering: unlabelled legacy layout,
 partially labelled, promoted raw (raw lives on a restore), orphan, wrong existing label, snapshot-inherited false positive.
 
+The driver also has no backfill for objects that predate `status.provisionedAt` (a Ready or Lost phase alone no longer counts as
+provisioned), no read of a missing `creationTime`, and no default for an empty `spec.sourceType` (the snapshot goes to Error). The
+migration must therefore stamp `status.provisionedAt` on every Ready or Lost ZfsDataset and ZfsSnapshot, and must reject or fix a
+ZfsSnapshot without `sourceType` before the new driver runs.
+
 ### S7. Release and verify
 - The user releases. Live test on a throwaway namespace: the joplin group test, a restore, deletes in the orders of scenarios 6, 12 and 13.
 - The audit must find no unlabelled object and no `restore-source` before the new driver is deployed (the driver has no code for them).

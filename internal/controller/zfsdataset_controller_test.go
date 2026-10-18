@@ -1313,7 +1313,7 @@ func datasetStatus(t *testing.T, c client.Client) storagev1alpha1.ZfsDatasetStat
 
 // ADR-0037: a Ready dataset that vanished is Lost, never recreated.
 func TestZfsDatasetReconcile_ReadyDatasetGoneBecomesLost(t *testing.T) {
-	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseReady, false)
+	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseReady, true)
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatal(err)
@@ -1416,33 +1416,5 @@ func TestZfsDatasetReconcile_ProvisionedAtIsWriteOnce(t *testing.T) {
 	}
 	if st.CreationTime == nil || st.CreationTime.Unix() == 1800000000 {
 		t.Errorf("creationTime = %v, must stay as first recorded across Error and back to Ready", st.CreationTime)
-	}
-}
-
-// A legacy Ready object (no ProvisionedAt) is backfilled from its Ready
-// condition's transition time, not from the ZFS creation time.
-func TestZfsDatasetReconcile_LegacyReadyIsBackfilled(t *testing.T) {
-	c, r, z := provisionedDatasetFixture(t, storagev1alpha1.DatasetPhaseReady, false)
-	var cur storagev1alpha1.ZfsDataset
-	if err := c.Get(context.Background(), client.ObjectKey{Name: "pvc-1"}, &cur); err != nil {
-		t.Fatal(err)
-	}
-	since := metav1.NewTime(time.Unix(1650000000, 0))
-	cur.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready", LastTransitionTime: since}}
-	if err := c.Status().Update(context.Background(), &cur); err != nil {
-		t.Fatal(err)
-	}
-	z.existing["tank/k8s/pvc-1"] = true
-	z.props["tank/k8s/pvc-1"] = map[string]string{"creation": "1600000000", "refquota": "0"}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-1"}}
-	if _, err := r.Reconcile(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-	st := datasetStatus(t, c)
-	if st.ProvisionedAt == nil || st.ProvisionedAt.Unix() != 1650000000 {
-		t.Errorf("provisionedAt = %v, want 1650000000 from the Ready condition", st.ProvisionedAt)
-	}
-	if st.CreationTime == nil || st.CreationTime.Unix() != 1600000000 {
-		t.Errorf("creationTime = %v, want 1600000000 from ZFS", st.CreationTime)
 	}
 }
