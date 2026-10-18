@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,6 +36,10 @@ type lifePool interface {
 	// Check validates the model's own invariants; a real pool has none.
 	Check() error
 }
+
+// The reconcilers log through controller-runtime, which prints a stack trace
+// when no logger is set. The harness has no use for the logs.
+func init() { ctrl.SetLogger(logr.Discard()) }
 
 type injector interface {
 	Inject(op, name string, err error, times int)
