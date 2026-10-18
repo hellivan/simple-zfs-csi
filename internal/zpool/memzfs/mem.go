@@ -699,3 +699,32 @@ func (m *Mem) Deferred(full string) bool {
 	}
 	return m.ds[dn].snaps[sn].deferred
 }
+
+// Local returns the value of a user property set directly on the object (not
+// inherited), or "" when it is unset or the object does not exist.
+func (m *Mem) Local(name, prop string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dn, sn, isSnap := split(name)
+	d := m.ds[dn]
+	if d == nil {
+		return ""
+	}
+	if isSnap {
+		if s := d.snaps[sn]; s != nil {
+			return s.props[prop]
+		}
+		return ""
+	}
+	return d.props[prop]
+}
+
+// Origin returns a dataset's origin snapshot, or "".
+func (m *Mem) Origin(name string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d := m.ds[name]; d != nil {
+		return d.origin
+	}
+	return ""
+}
