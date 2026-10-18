@@ -267,7 +267,7 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	// Where the snapshot is is not where this object recorded it: a promote
 	// relocates it and nothing rewrites Spec.Dataset (ADR-0028). The backing
 	// clone's origin answers that, the pool scan is the fallback.
-	raw, err := locateRawSnapshot(ctx, r.ZFS, pool.Status.PoolName, backingFull, snap.Spec.SnapshotName)
+	raw, err := locateRawSnapshot(ctx, r.ZFS, backingFull, rawFull, snap.Spec.SnapshotName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -311,7 +311,8 @@ func (r *ZfsSnapshotReconciler) reconcileSettled(ctx context.Context, snap *stor
 	logger := log.FromContext(ctx)
 
 	backingFull := backingCloneFullName(pool.Status.PoolName, datasetPath, snap.Spec.SnapshotName)
-	raw, err := locateRawSnapshot(ctx, r.ZFS, pool.Status.PoolName, backingFull, snap.Spec.SnapshotName)
+	recorded, _ := snapshotFullName(pool.Status.PoolName, datasetPath, snap.Spec.SnapshotName)
+	raw, err := locateRawSnapshot(ctx, r.ZFS, backingFull, recorded, snap.Spec.SnapshotName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

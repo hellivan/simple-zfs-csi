@@ -25,9 +25,9 @@ Target strategy: **D (raw-only)**, see [snapshot-delete-scenarios.md](snapshot-d
 | P1 | **Labels, in phase 1.** Every dataset and snapshot the driver creates carries `simple-zfs-csi:role` (`volume`, `raw`, `backing`, `clone-origin`) and `simple-zfs-csi:owner` (UID of the owning `ZfsDataset`/`ZfsSnapshot`). Delete and promote selection use these instead of name matching. Old objects are labelled by the one-time script (P7). | approved |
 | P2 | **Rule: whoever creates a snapshot defers its destruction, always with `zfs destroy -d`.** The snapshot, the direct clone and the volume delete only mark what they created. A restore creates nothing and never touches the raw snapshot. | approved |
 | P3 | **Snapshot delete flow (D, raw-only):** `destroy -d` the raw snapshot, promote every clone of it off whichever dataset holds it (the loop in `detachAndCleanSnapshots`), then destroy the empty backing clone. No `restore-source`/`rs-*` snapshot exists any more. No tombstones, no reaper. Verified in the model (up to 6 creations) and live on ZFS 2.4.3 (116 scenarios, 740 steps). | approved |
-| P4 | **Restore finds the raw snapshot through the backing clone's `origin` property**: either the origin is the raw snapshot, or the backing clone itself holds it (it was promoted). Always verify the snapshot exists; if the backing clone is missing (creation or delete interrupted, manual change), fall back to the pool-wide scan by name. Restores clone the raw snapshot directly. | approved, origin rule derived from promote semantics, to be checked in W3 |
+| P4 | **Restore finds the raw snapshot through the backing clone's `origin` property**: either the origin is the raw snapshot, or the backing clone itself holds it (it was promoted). Always verify the snapshot exists. No pool scan: a promote only moves a snapshot to a clone of it, so it is the backing clone's origin, or a snapshot of the backing clone (when that was promoted; its origin is then unrelated), or, with no backing clone (interrupted create, manual change), still on the source dataset. Restores clone the raw snapshot directly. | approved, origin rule derived from promote semantics, to be checked in W3 |
 | P4a | **Promote loop rule:** oldest pinned snapshot first (a promote moves the origin and all older snapshots, so this moves the least and avoids name conflicts); among the clones of that snapshot prefer the backing clone, selected by label, so the raw snapshot stays on the source or its backing clone. Every W4 scenario checks "the raw snapshot is on the source or its backing clone" after every step. | approved |
-| P5 | **`clone-origin` cleanup.** Deleting a direct clone marks the `@clone-<name>` snapshot it came from (found by name anywhere, since a promote may have moved it). | approved |
+| P5 | **`clone-origin` cleanup.** Deleting a direct clone marks the `@clone-<name>` snapshot it came from, as the very first step, before any promote: then it is the volume's origin or a snapshot of the volume. (Reading the origin after the promote loop is wrong: found by the lifecycle test, clone of a clone.) No scan. | approved |
 | P6 | **No sweeper and no reaper.** Consistent deferred deletes cover every modelled case. Existing objects are migrated instead (P7). | approved |
 | P7 | **One-time migration script** (not driver code): labels old objects and runs `destroy -d` on every `restore-source` (W6a). Dry run by default, read-only audit first, explicit approval before it touches the cluster. | approved |
 | P8 | **`dataset is busy` is retryable.** A zvol destroyed right after create fails with it about 40 percent of the time and succeeds a second later. | found 2026-10-13 |
@@ -83,12 +83,12 @@ Original scope:
 ### S3. Source references (API change) — DONE
 Implemented: `DatasetSource` gained `zfsSnapshotRef` / `zfsDatasetRef` (`ObjectRef{name}`), CEL "exactly one of the four", CRD
 regenerated. The CSI controller now sets the references (no backing-clone path, no `restore-source` name). The `ZfsDataset`
-reconciler resolves them: snapshot ref via `locateRawSnapshot` (backing clone's `origin`, verified, then the pool scan),
+reconciler resolves them: snapshot ref via `locateRawSnapshot` (backing clone's `origin`, or on the backing clone, or on the source; verified, no pool scan),
 dataset ref via `@clone-<name>`; a missing, terminating or not-Ready source gives `SourceNotReady` and a 10 s retry, never another
 source; a pool mismatch fails hard. RBAC needed no change (the agent role already reads `zfssnapshots` and `zfsdatasets`).
 Verified on the cluster's API server with a throwaway CRD (deleted again): the rule accepts each single field and rejects two
 fields, none and an empty name. Tests: `internal/controller/source_ref_test.go` (on the in-memory ZFS, including "the origin was
-enough, no scan" and "scan exactly once when the backing clone was promoted"), `internal/csi/clone_test.go`.
+enough, no scan" and "no scan when the backing clone was promoted"), `internal/csi/clone_test.go`.
 `spec.source` is now enforced immutable by a CEL rule on `ZfsDatasetSpec` (cannot be changed, set or cleared; verified on the API server with a throwaway CRD, unrelated spec updates still pass); see api-conventions §5.
 Original scope:
 Needed because under D the raw snapshot has no fixed path (see P4). The CSI layer must pass intent, not a path.
@@ -100,7 +100,7 @@ Needed because under D the raw snapshot has no fixed path (see P4). The CSI laye
 - CSI (`internal/csi/clone.go`): fills the references, keeps the existing checks (same pool, type compatible, same prefix,
   snapshot not terminating and Ready). Stops deriving the backing-clone path.
 - `ZfsDataset` reconciler: resolves a reference on the node. Snapshot ref: read the `ZfsSnapshot`, find the raw snapshot
-  (P4, origin lookup, scan as fallback), `zfs clone` it. Dataset ref: read the `ZfsDataset`, snapshot it as `@clone-<name>`
+  (P4, origin lookup, no scan), `zfs clone` it. Dataset ref: read the `ZfsDataset`, snapshot it as `@clone-<name>`
   and clone. A path source behaves as today. A missing or terminating referenced object means wait or report, never clone
   something else.
 - RBAC: check that the role running the `ZfsDataset` reconciler can `get` `zfssnapshots` and `zfsdatasets`; update chart roles.
@@ -108,10 +108,10 @@ Needed because under D the raw snapshot has no fixed path (see P4). The CSI laye
 - Old backing clones (with `restore-source`) restore fine through the new path: the raw snapshot is still pinned by the backing clone.
 
 ### S4. Strategy D in the driver (W4, W5) — DONE
-Implemented: the snapshot delete is `destroy -d` on the raw snapshot (found via the backing clone's origin, then the pool scan),
+Implemented: the snapshot delete is `destroy -d` on the raw snapshot (found via the backing clone's origin or the backing clone itself),
 then the shared promote loop empties the backing clone, then the clone is destroyed. The loop picks the oldest cloned snapshot
 first and prefers a clone labelled `backing`; every snapshot destroy is `-d`. A direct clone's delete marks its `@clone-<name>`
-snapshot (found by name anywhere). No `restore-source` is created or read; the name stays on the delete allow-list as
+snapshot (first step, before any promote). Nothing scans the pool. No `restore-source` is created or read; the name stays on the delete allow-list as
 `legacyRestoreSourceSnapshot` until S6 ran. A settled snapshot is Lost when its raw snapshot cannot be found.
 Tests, driving the real reconcilers on `memzfs` (`internal/controller/lifecycle_test.go`): every sequence of up to 3 creations
 (131; `LIFECYCLE_MAX_CREATES=4` gives 4705, about 80 s, run once green), 150 random walks of up to 7 creations, named scenarios
@@ -126,7 +126,7 @@ Original scope:
   bounded property test, driving the real reconcilers on the in-memory ZFS. Assertions: no stuck delete, nothing left at the
   end, live volumes and snapshots intact, no unowned snapshot on a live volume, invariants after every step.
 - Snapshot create: raw snapshot, backing clone (labelled), no `restore-source`.
-- Restore: resolve the raw snapshot via the backing clone's `origin` (P4), verify it, fall back to the scan.
+- Restore: resolve the raw snapshot via the backing clone's `origin` (P4), verify it; no scan.
 - Snapshot delete (P3): `destroy -d` the raw, promote clones of it off whichever dataset holds it, destroy the empty backing clone.
 - Promote loop `detachAndCleanSnapshots` (P4a): oldest pinned snapshot first; among its clones prefer the one labelled
   `backing`; bounded rounds, re-check after each promote. Every snapshot destroy is `-d`.
@@ -164,7 +164,7 @@ Derivation of labels (CR to object):
 | Object | Found via | role | owner |
 |---|---|---|---|
 | volume dataset/zvol | `ZfsDataset` status/spec dataset path | `volume` | CR UID |
-| raw snapshot | `ZfsSnapshot` `spec.dataset@spec.snapshotName` (follow the origin chain if it was promoted: pool-wide scan by name) | `raw` | CR UID |
+| raw snapshot | `ZfsSnapshot` `spec.dataset@spec.snapshotName` (if promoted: the backing clone's origin, or a snapshot of the backing clone; no scan) | `raw` | CR UID |
 | backing clone | `ZfsSnapshot` name to `<parent>/csi-snap-<uuid>` of the raw snapshot | `backing` | CR UID |
 | `@clone-<name>` snapshot | `ZfsDataset <name>` exists | `clone-origin` | CR UID |
 | `@restore-source` | (old layout) | not labelled; `zfs destroy -d` (removed at once, or when the last old restore depending on it is gone; the mark survives promotes) | |

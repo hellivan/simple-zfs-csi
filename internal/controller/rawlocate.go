@@ -16,27 +16,46 @@ func backingCloneFullName(poolName, sourceDataset, snapshotName string) string {
 }
 
 // locateRawSnapshot returns where the raw snapshot with the given short name
-// lives now, or "" when it cannot be found. A promote moves a snapshot between
-// datasets, so no fixed address is assumed:
+// lives now, or "" when it cannot be found. It never scans the pool: a promote
+// only ever moves the snapshot to a clone of it, so the places are known.
 //
-//  1. The backing clone was cloned from the raw snapshot, so its origin names the
-//     snapshot as long as the backing clone itself has not been promoted. One
-//     property read, verified against the snapshot's existence.
-//  2. Otherwise (backing clone missing or promoted, origin empty or stale) the
-//     pool-wide scan finds it by short name, which is unique.
-func locateRawSnapshot(ctx context.Context, z zpool.ZFS, poolName, backingFull, suffix string) (string, error) {
+//  1. The backing clone was cloned from the raw snapshot, so while the snapshot
+//     is on another dataset the backing clone's origin names it (and follows it
+//     through promotes of other clones).
+//  2. Once the backing clone itself was promoted, the snapshot is on the backing
+//     clone. Its origin may then be anything (the source's former origin), so
+//     only the name decides.
+//  3. Without a backing clone (interrupted create, manual change) the snapshot
+//     has not left the source dataset.
+//
+// Every candidate is verified to exist.
+func locateRawSnapshot(ctx context.Context, z zpool.ZFS, backingFull, recordedRaw, suffix string) (string, error) {
+	exists := func(name string) (bool, error) {
+		if _, err := z.Get(ctx, name, "type"); err != nil {
+			if errors.Is(err, zpool.ErrNotExist) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
 	origin, err := z.Get(ctx, backingFull, "origin")
 	switch {
 	case err == nil:
-		if origin = strings.TrimSpace(origin); origin != "" && origin != "-" && strings.HasSuffix(origin, "@"+suffix) {
-			if _, gerr := z.Get(ctx, origin, "type"); gerr == nil {
-				return origin, nil
-			} else if !errors.Is(gerr, zpool.ErrNotExist) {
-				return "", gerr
+		if origin = strings.TrimSpace(origin); strings.HasSuffix(origin, "@"+suffix) {
+			if ok, err := exists(origin); err != nil || ok {
+				return origin, err
 			}
 		}
 	case !errors.Is(err, zpool.ErrNotExist):
 		return "", err
 	}
-	return z.FindSnapshot(ctx, poolName, suffix)
+	for _, cand := range []string{backingFull + "@" + suffix, recordedRaw} {
+		if ok, err := exists(cand); err != nil {
+			return "", err
+		} else if ok {
+			return cand, nil
+		}
+	}
+	return "", nil
 }

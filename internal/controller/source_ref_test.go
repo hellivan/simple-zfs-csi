@@ -146,31 +146,31 @@ func TestSourceRef_RestoreFollowsRawAfterAnotherRestoreWasPromoted(t *testing.T)
 	w := newRefWorld(t, readySnapshot())
 	w.provision("pvc-r1", snapRef("snap-1"))
 	w.mustZ(w.z.Promote(w.ctx, "tank/k8s/pvc-r1")) // raw now lives on pvc-r1
-	if s, _ := w.z.FindSnapshot(w.ctx, "tank", rawName); s != "tank/k8s/pvc-r1@"+rawName {
-		t.Fatalf("setup: raw is at %q", s)
+	if !w.exists("tank/k8s/pvc-r1@" + rawName) {
+		t.Fatal("setup: raw should be on pvc-r1")
 	}
 	w.provision("pvc-r2", snapRef("snap-1"))
 	if want := "tank/k8s/pvc-r1@" + rawName; w.origin("tank/k8s/pvc-r2") != want {
 		t.Errorf("origin = %q, want %q", w.origin("tank/k8s/pvc-r2"), want)
 	}
-	if w.z.Scans() != 1 { // the one scan is the setup check above
+	if w.z.Scans() != 0 {
 		t.Errorf("the backing clone's origin must follow the promoted raw snapshot, scans = %d", w.z.Scans())
 	}
 }
 
-func TestSourceRef_RestoreFindsRawByScanWhenTheBackingCloneWasPromoted(t *testing.T) {
+func TestSourceRef_RestoreFindsRawOnThePromotedBackingClone(t *testing.T) {
 	w := newRefWorld(t, readySnapshot())
 	w.mustZ(w.z.Promote(w.ctx, "tank/k8s/"+rawName)) // origin of the backing clone is now empty
 	w.provision("pvc-r1", snapRef("snap-1"))
-	if w.z.Scans() != 1 {
-		t.Errorf("a promoted backing clone has no origin, so exactly one scan is needed, got %d", w.z.Scans())
+	if w.z.Scans() != 0 {
+		t.Errorf("a promoted backing clone holds the raw snapshot itself, no scan needed, got %d", w.z.Scans())
 	}
 	if want := "tank/k8s/" + rawName + "@" + rawName; w.origin("tank/k8s/pvc-r1") != want {
 		t.Errorf("origin = %q, want %q", w.origin("tank/k8s/pvc-r1"), want)
 	}
 }
 
-func TestSourceRef_RestoreFindsRawByScanWhenTheBackingCloneIsGone(t *testing.T) {
+func TestSourceRef_RestoreFindsRawOnTheSourceWhenTheBackingCloneIsGone(t *testing.T) {
 	w := newRefWorld(t, readySnapshot())
 	w.mustZ(w.z.Destroy(w.ctx, "tank/k8s/"+rawName, false))
 	w.provision("pvc-r1", snapRef("snap-1"))

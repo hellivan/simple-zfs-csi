@@ -207,6 +207,9 @@ func (w *lifeWorld) verify() {
 	if err := w.z.Check(); err != nil {
 		w.fail("invariant: %v", err)
 	}
+	if n := w.z.Scans(); n != 0 {
+		w.fail("the driver scanned the pool %d times; every snapshot is found through its backing clone or its dataset", n)
+	}
 	datasets := map[string]bool{}
 	for _, d := range w.z.Datasets() {
 		datasets[d] = true
@@ -223,7 +226,7 @@ func (w *lifeWorld) verify() {
 		raw := "csi-snap-" + s
 		rawOwned[raw] = true
 		owned["tank/k8s/"+raw] = true
-		at, err := locateRawSnapshot(w.ctx, w.z, "tank", "tank/k8s/"+raw, raw)
+		at, err := locateRawSnapshot(w.ctx, w.z, "tank/k8s/"+raw, "tank/k8s/"+w.snaps[s]+"@"+raw, raw)
 		if err != nil || at == "" {
 			w.fail("live snapshot %s lost its raw snapshot (err=%v)", s, err)
 		}
