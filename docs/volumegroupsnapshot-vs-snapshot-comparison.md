@@ -1,5 +1,8 @@
 # Single `ZfsSnapshot` vs. `VolumeGroupSnapshot`: side-by-side comparison
 
+> **Update (2026-10):** the delete design in this document was replaced by strategy D, see [ADR-0042](design-decisions.md) and [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Mentions of `@restore-source` and `detachSnapshotClones` are historical.
+
+
 > **Note (2026-10-07):** the group lifecycle was revised, see ADR-0038/0039 in
 > [design-decisions.md](design-decisions.md). Where this comparison says a group uses an
 > ownerReference cascade or has no finalizer, or that a child delete is guarded, the ADRs win:

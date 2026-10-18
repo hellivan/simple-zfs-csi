@@ -1,5 +1,8 @@
 # ZFS conformance checklist
 
+> **Update (2026-10):** the delete design in this document was replaced by strategy D, see [ADR-0042](design-decisions.md) and [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Mentions of `@restore-source` and `detachSnapshotClones` are historical.
+
+
 Status: **sections 1 to 3 and most of 4 and 5 verified on `zfs-2.4.3-1` (2026-10-13)**, test dataset `spinning-archive/verify_zfs_functions` (unmounted, removed afterwards), scripts in the session folder. Untested rows are still empty. Every item is an assumption of the model in
 [snapshot-delete-scenarios.md](snapshot-delete-scenarios.md) or of the plan in
 [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Each one must be checked on a real pool before

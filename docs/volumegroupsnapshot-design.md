@@ -1,5 +1,8 @@
 # VolumeGroupSnapshot Support — Design & Implementation Plan
 
+> **Update (2026-10):** the delete design in this document was replaced by strategy D, see [ADR-0042](design-decisions.md) and [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Mentions of `@restore-source` and `detachSnapshotClones` are historical.
+
+
 **Status: design, not yet implemented.** This document is the reviewable plan
 before any code is written; see the SQL-tracked `vgs-*` todos for the
 implementation breakdown once approved.

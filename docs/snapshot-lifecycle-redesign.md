@@ -1,5 +1,8 @@
 # ZFS Snapshot/Clone Lifecycle Redesign — Research & Decision Log
 
+> **Update (2026-10):** the delete design in this document was replaced by strategy D, see [ADR-0042](design-decisions.md) and [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Mentions of `@restore-source` and `detachSnapshotClones` are historical.
+
+
 **Status: implemented (2026-08-03), see [ADR-0019](design-decisions.md).**
 D0-D16 (promote-based `DeleteVolume`/`DeleteSnapshot`, standalone/integrated dual mode,
 D12's generalized dependent tracking, D6's cross-prefix rejection) and D10 (property/fsType

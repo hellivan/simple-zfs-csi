@@ -1,5 +1,8 @@
 # Snapshot / restore / clone delete scenarios
 
+> **Update (2026-10):** the delete design in this document was replaced by strategy D, see [ADR-0042](design-decisions.md) and [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Mentions of `@restore-source` and `detachSnapshotClones` are historical.
+
+
 Status: **analysis, model-based** (2026-10). Nothing in this file has been confirmed on real ZFS yet.
 
 ## Why this exists

@@ -11,7 +11,36 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0042 — Snapshot delete strategy D: mark with `destroy -d`, promote clones off, destroy the empty backing clone
+
+**Status:** Accepted and implemented (2026-10) · **Scope:** `internal/controller/{promote,rawlocate,zfssnapshot_controller,zfsdataset_controller}.go` · **Amends:** ADR-0020, ADR-0028, ADR-0030, ADR-0041 (everything about `@restore-source`) · **Plan:** [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md)
+
+### Context
+
+A live `VolumeGroupSnapshot` test showed that deleting a snapshot whose restore had been promoted left `@csi-snap-*` snapshots on the
+source volumes. The old design kept a second `@restore-source` self-snapshot on the backing clone and restores cloned that. Promotes
+moved snapshots between datasets, and name or position based cleanup could miss them.
+
+### Decision
+
+- A snapshot is one raw snapshot (`<source>@csi-snap-*`) plus a backing clone. There is no `@restore-source`. Restores clone the raw snapshot.
+- Every driver snapshot destroy is `zfs destroy -d`. ZFS keeps a marked snapshot while clones exist and removes it with the last clone, and the mark survives promotes (verified on OpenZFS 2.4.3).
+- Snapshot delete: mark the raw snapshot, promote the clones of pinned snapshots off the backing clone (oldest first, preferring the `backing`-labelled one), destroy the backing clone, release the finalizer.
+- Volume delete: first mark the clone-origin snapshot (`@clone-<name>`), then the same promote loop, then destroy.
+- Nothing scans the pool. The raw snapshot is found from the backing clone's origin, a snapshot of the backing clone (if promoted), or the source. The rule is valid only before any promote of the same operation, hence mark first.
+- Deletes are resumable: not finding a snapshot means it was already handled. The loud failure is the final dataset destroy, which ZFS refuses while snapshots or clones remain. `dataset is busy` is retried by the reconcile.
+- No legacy handling in the driver: the cluster is migrated (S6) before the new driver runs. The allow-list is `clone-*|csi-snap-*`.
+- Selecting delete targets by label is a possible future improvement (see the plan), not done.
+
+### Consequences
+
+Fewer ZFS objects per snapshot, no unreachable snapshots in the verified scenarios, and the behaviour is covered by exhaustive and random sequence tests on the in-memory ZFS (`lifecycle_test.go`) and by the conformance suite. Unverified: deep chains, processes holding mountpoints, other ZFS versions. Residual risk: an outside change to the clone graph before the first delete attempt can leave a snapshot unmarked.
+
+---
+
 ## ADR-0041 — Volume deletion looks only at ZFS: drop D3 (wait for in-flight snapshots) and the CR-claim check; destroy clone-free driver snapshots before promoting
+
+**Superseded in part by [ADR-0042](#adr-0042--snapshot-delete-strategy-d-mark-with-destroy--d-promote-clones-off-destroy-the-empty-backing-clone):** `@restore-source` and its handling no longer exist.
 
 **Status:** Accepted (decided 2026-10-08; code to follow, see TODO.md) · **Scope:** `internal/controller/promote.go` (`checkSnapshotDependents`, `checkPendingCloneDependents`, `detachAndCleanSnapshots`, `assertDriverSnapshot`), `ZfsDatasetReconciler` delete path · **Amends:** D3 and D21 in `snapshot-lifecycle-redesign.md` · **Related:** ADR-0038, ADR-0039, ADR-0040.
 
@@ -948,6 +977,8 @@ since the aggregator and the two other reconcilers that already read
 
 ## ADR-0030 — The backing clone is a ZFS clone, not a Kubernetes object
 
+**Superseded in part by [ADR-0042](#adr-0042--snapshot-delete-strategy-d-mark-with-destroy--d-promote-clones-off-destroy-the-empty-backing-clone):** `@restore-source` and its handling no longer exist.
+
 **Status:** Accepted (2026-08-07) · **Scope:** `internal/controller/{zfssnapshot_controller,promote}.go`, `internal/csi/{clone,snapshot}.go`, chart RBAC, README · **Supersedes:** D15, D26, D27 · **Related:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §10.
 
 ### Context
@@ -1123,6 +1154,8 @@ is what external-provisioner does, while keeping the PV.
 ---
 
 ## ADR-0028 — The raw snapshot is located by asking ZFS, not by trusting the address recorded on the `ZfsSnapshot`
+
+**Superseded in part by [ADR-0042](#adr-0042--snapshot-delete-strategy-d-mark-with-destroy--d-promote-clones-off-destroy-the-empty-backing-clone):** `@restore-source` and its handling no longer exist.
 
 **Status:** Accepted (2026-08-06) · **Scope:** `internal/zpool/zfs.go`, `internal/controller/zfssnapshot_controller.go` · **Related:** completes [ADR-0020](#adr-0020--the-zfs-clone-graph-is-the-source-of-truth), [known-pitfalls.md](known-pitfalls.md) #17, [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) §12.
 
@@ -1665,6 +1698,8 @@ fallback path meaningful.
 ---
 
 ## ADR-0020 — The live ZFS clone graph is the source of truth for delete-path dependents
+
+**Superseded in part by [ADR-0042](#adr-0042--snapshot-delete-strategy-d-mark-with-destroy--d-promote-clones-off-destroy-the-empty-backing-clone):** `@restore-source` and its handling no longer exist.
 
 **Status:** Accepted (2026-08-03) · **Scope:** `internal/zpool` (`ZFS.ListSnapshots`, `ZFS.Clones`), `internal/controller` (`promote.go` rewritten, `zfsdataset_controller.go`, `zfssnapshot_controller.go`), `internal/csi` (`clone.go`, `snapshot.go`) · **Supersedes:** the `promoted-onto.<name>`/`restored-by.<name>` finalizer mechanism described in ADR-0019's Decision section (that ADR is otherwise unchanged and still describes the modes, the backing clone, and `zfs promote` as the core primitive) · **Full record:** [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) D17–D26 and §9.
 

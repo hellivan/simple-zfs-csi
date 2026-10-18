@@ -1,5 +1,8 @@
 # Lifecycle protection matrix: who stops you from deleting something that is still needed
 
+> **Update (2026-10):** the delete design in this document was replaced by strategy D, see [ADR-0042](design-decisions.md) and [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Mentions of `@restore-source` and `detachSnapshotClones` are historical.
+
+
 **Status:** reference. Cross-verified 2026-08-06 against upstream source code and
 this repository's source code.
 

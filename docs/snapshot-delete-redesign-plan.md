@@ -140,7 +140,7 @@ Original scope:
 - Delete logic selects by label. The allow-list (`driverSnapshotSuffix`) has no `restore-source` arm: the migration (S6) must have removed every `restore-source` before the new driver runs.
 - Remove the fixed `restore-source` creation and every code path that reads it (`restoreSourcePresent`, the self-snapshot in `reconcileBackingClone`).
 
-### S5. Documentation
+### S5. Documentation (DONE: ADR-0042, supersession notes on ADR-0020/0028/0030/0041 and on the historical docs, progress log)
 - Revise ADR-0028, ADR-0030, ADR-0041, ADR-0009 (source references) and D0/D5/D15/D19 text that mentions `detachSnapshotClones`
   or `restore-source`; add an ADR for strategy D. Update `lifecycle-protection-matrix.md`,
   `delete-path-verification-2026-08-03.md`, `IMPLEMENTATION_PROGRESS.md`, and the scenario doc (D column).

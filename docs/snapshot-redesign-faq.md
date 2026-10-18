@@ -1,5 +1,8 @@
 # Snapshot/Volume Independence Redesign — FAQ
 
+> **Update (2026-10):** the delete design in this document was replaced by strategy D, see [ADR-0042](design-decisions.md) and [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md). Mentions of `@restore-source` and `detachSnapshotClones` are historical.
+
+
 A running log of questions asked during the snapshot-lifecycle/naming redesign work and
 the answers/decisions that came out of them. Meant to be picked up later — by you or
 anyone else — without needing to re-derive the reasoning from scratch. Each entry links
