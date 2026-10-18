@@ -123,7 +123,7 @@ already got past that step (the promote loop moved or destroyed it), so the dele
 clone itself, which ZFS refuses while the clone still has snapshots or dependent clones (after a clean cleanup that never happens;
 if it does, something went wrong and the object stays Terminating with `DeleteBlocked`). Residual risk, accepted: if someone changes
 the clone graph from outside the driver before the first attempt, the snapshot is not found and stays behind unmarked.
-Not done: label-based selection in the delete allow-list (still the name allow-list; labels select only the promote preference).
+Deliberately not done (future improvement, benefit unproven): label-based selection in the delete path. It still uses the name allow-list and positional lookup; labels select only the promote preference.
 Original scope:
 - Scenario tests (W4): one test per row of the scenario table (25 rows plus 18 to 19b), fan-out, group snapshots, and a
   bounded property test, driving the real reconcilers on the in-memory ZFS. Assertions: no stuck delete, nothing left at the
@@ -194,6 +194,11 @@ ZfsSnapshot without `sourceType` before the new driver runs.
 ### S7. Release and verify
 - The user releases. Live test on a throwaway namespace: the joplin group test, a restore, deletes in the orders of scenarios 6, 12 and 13.
 - The audit must find no unlabelled object and no `restore-source` before the new driver is deployed (the driver has no code for them).
+
+### Future improvements
+- Select delete targets by label instead of name: destroy a snapshot only if its `role` is `raw` or `clone-origin` and its `owner` equals the
+  UID of the object being deleted, replacing the `driverSnapshotSuffix` regex. Safe only after the S6 migration labelled everything.
+  Not done because the current name allow-list works and the gain is unproven.
 
 ### Open items outside this redesign
 Finish C9 (cross-pool `FAILED_PRECONDITION`, member restore after a member is deleted), C10, C11, D1/D3/D4/D5, E1/E2/E4 to E6,
