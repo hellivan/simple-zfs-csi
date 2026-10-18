@@ -146,6 +146,8 @@ Original scope:
   `delete-path-verification-2026-08-03.md`, `IMPLEMENTATION_PROGRESS.md`, and the scenario doc (D column).
 
 ### S6. One-time migration script (P7)
+**Status:** implemented as `cmd/zfs-migrate` (`internal/migrate`). Dry run by default, `--apply` to change; it uses the current kube context and runs zfs in the toolbox pod. Verified: unit tests on memzfs; a read-only dry run on the real cluster (617 actions: 265 objects labelled, 87 `restore-source` marked, no findings); `--apply` on an old-style layout built under `verify_zfs_functions` (`go test -tags zfsreal ./internal/migrate`, guarded to that root, never contacts Kubernetes). Not yet run with `--apply` on the cluster: needs the user's approval.
+
 Why: from S4 on the driver selects objects by label (see `labels.md`). Objects created before S1 (and any created by a
 pre-S1 driver while the new one rolls out) carry no labels. Labels are not optional for correctness: an unlabelled raw
 snapshot or backing clone must never be misclassified.
