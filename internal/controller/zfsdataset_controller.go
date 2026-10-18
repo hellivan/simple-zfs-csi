@@ -109,14 +109,6 @@ func (r *ZfsDatasetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			// P5: a direct clone created its "@clone-<name>" snapshot, so it
-			// defers that snapshot's destruction, first of all: while this volume
-			// is still untouched the snapshot is either its origin or on the
-			// volume itself (it was promoted). The promote loop below moves
-			// snapshots around and makes that unreliable, and a mark persists.
-			if err := r.releaseCloneOrigin(ctx, &vol, full); err != nil {
-				return ctrl.Result{}, err
-			}
 			// D17/D18, ADR-0041: look only at ZFS. Detach whatever it reports as
 			// depending on this dataset and destroy the driver-owned snapshots
 			// nothing clones, so the dataset is guaranteed to have zero snapshots
@@ -376,26 +368,53 @@ func (r *ZfsDatasetReconciler) cloneFromDataset(ctx context.Context, vol *storag
 // releaseCloneOrigin marks the "@clone-<name>" snapshot of a directly cloned
 // volume for deferred destruction (P2/P5): ZFS removes it with its last clone,
 // which is this volume. It must run before anything is promoted. Then the
-// snapshot is the volume's origin, or, when the volume itself was promoted,
-// a snapshot of the volume. No pool scan is needed.
+// snapshot is a snapshot of the volume (the volume was promoted) or the volume's
+// origin. No pool scan is needed.
+//
+// Anything else is unforeseen (a promote or a rename from outside) and fails
+// loudly: the delete stays blocked and is retried, rather than leaving an
+// unmarked snapshot behind. A retry after the mark was set is recognised by
+// PropOriginReleased, since the promote loop may have moved the snapshot
+// away from the volume by then.
 func (r *ZfsDatasetReconciler) releaseCloneOrigin(ctx context.Context, vol *storagev1alpha1.ZfsDataset, full string) error {
 	src := vol.Spec.Source
 	if src == nil || (src.Volume == "" && src.ZfsDatasetRef == nil) {
 		return nil
 	}
-	suffix := "@clone-" + cloneSnapshotSuffix(vol.Name)
-	origin, err := r.ZFS.Get(ctx, full, "origin")
+	done, err := r.ZFS.Get(ctx, full, zpool.PropOriginReleased)
 	if err != nil {
 		if errors.Is(err, zpool.ErrNotExist) {
 			return nil
 		}
 		return err
 	}
-	target := full + suffix
-	if o := strings.TrimSpace(origin); strings.HasSuffix(o, suffix) {
-		target = o
+	if strings.TrimSpace(done) == "true" {
+		return nil
 	}
-	return r.ZFS.DestroySnapshotDeferred(ctx, target)
+	suffix := "@clone-" + cloneSnapshotSuffix(vol.Name)
+	var target string
+	own := full + suffix
+	if _, err := r.ZFS.Get(ctx, own, "type"); err == nil {
+		target = own
+	} else if !errors.Is(err, zpool.ErrNotExist) {
+		return err
+	} else {
+		origin, err := r.ZFS.Get(ctx, full, "origin")
+		if err != nil {
+			return err
+		}
+		if o := strings.TrimSpace(origin); strings.HasSuffix(o, suffix) {
+			target = o
+		}
+	}
+	if target == "" {
+		return fmt.Errorf("the clone-origin snapshot %q of %s is neither a snapshot of the volume nor its origin; "+
+			"something changed the clone graph from outside the driver, resolve it manually", suffix, full)
+	}
+	if err := r.ZFS.DestroySnapshotDeferred(ctx, target); err != nil {
+		return err
+	}
+	return r.ZFS.SetProperty(ctx, full, zpool.PropOriginReleased, "true")
 }
 
 // resolveSnapshotRef returns the full name of the raw ZFS snapshot behind a

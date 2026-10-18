@@ -18,6 +18,14 @@ const (
 	PropOwner = "simple-zfs-csi:owner"
 )
 
+// PropOriginReleased is set on a clone (a directly cloned volume, or a
+// snapshot's backing clone) once the snapshot it was made from has been marked
+// for destruction during the clone's delete. The promote loop that follows moves
+// snapshots around, so a retry can no longer find that snapshot from the clone;
+// this tells the retry the step is done, so that "not found" can otherwise be an
+// error.
+const PropOriginReleased = "simple-zfs-csi:origin-released"
+
 const (
 	// RoleVolume is a volume dataset, including one created as a restore or clone.
 	RoleVolume = "volume"

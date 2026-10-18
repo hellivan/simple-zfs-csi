@@ -8,6 +8,7 @@ name pattern. Code: `internal/zpool/labels.go`.
 |---|---|---|
 | `simple-zfs-csi:role` | one of the roles below | what the object is for |
 | `simple-zfs-csi:owner` | UID of the owning Kubernetes object | which CR owns it; omitted when unknown |
+| `simple-zfs-csi:origin-released` | `true` | set on a direct clone or a backing clone during its delete, after the snapshot it was made from was marked for destruction (so a retry knows that step is done). Not a label; it is delete-time state. |
 
 ## Roles
 

@@ -92,6 +92,10 @@ func datasetPathOf(poolName, full string) string {
 // group snapshot is complete only when it is Ready; deleting its source earlier
 // is the caller's responsibility, so nothing here waits for unfinished work.
 func (r *ZfsDatasetReconciler) beforeDestroy(ctx context.Context, vol *storagev1alpha1.ZfsDataset, poolName, full string) error {
+	// P5, first of all: see releaseCloneOrigin.
+	if err := r.releaseCloneOrigin(ctx, vol, full); err != nil {
+		return err
+	}
 	return detachAndCleanSnapshots(ctx, r.gateReader(), r.ZFS, vol.Spec.PoolGUID, poolName, full)
 }
 

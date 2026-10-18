@@ -266,20 +266,9 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	//
 	// Where the snapshot is is not where this object recorded it: a promote
 	// relocates it and nothing rewrites Spec.Dataset (ADR-0028). The backing
-	// clone's origin answers that, the pool scan is the fallback.
-	raw, err := locateRawSnapshot(ctx, r.ZFS, backingFull, rawFull, snap.Spec.SnapshotName)
-	if err != nil {
+	// clone answers that: its origin, or one of its own snapshots.
+	if err := r.releaseRaw(ctx, snap, backingFull, rawFull); err != nil {
 		return ctrl.Result{}, err
-	}
-	if raw != "" {
-		if raw != rawFull {
-			logger.Info("raw snapshot was relocated by an earlier promote; destroying it where it actually is",
-				"recorded", rawFull, "actual", raw)
-		}
-		if err := r.ZFS.DestroySnapshotDeferred(ctx, raw); err != nil {
-			return ctrl.Result{}, err
-		}
-		logger.Info("destroyed ZFS snapshot (deferred)", "snapshot", raw)
 	}
 
 	// The backing clone is a vessel with no snapshots of its own, unless a promote
@@ -293,6 +282,56 @@ func (r *ZfsSnapshotReconciler) reconcileDelete(ctx context.Context, snap *stora
 	}
 	logger.Info("destroyed backing clone", "dataset", backingFull)
 	return ctrl.Result{}, r.releaseSnapshotFinalizer(ctx, snap)
+}
+
+// releaseRaw marks the raw snapshot for deferred destruction, before anything is
+// promoted. While the backing clone exists the snapshot is its origin or one of
+// its own snapshots, so not finding it is unforeseen (a promote or a rename from
+// outside) and fails loudly: the delete stays blocked and is retried. A retry
+// after the mark was set is recognised by PropOriginReleased on the backing
+// clone, because the promote loop that follows may have destroyed or moved the
+// snapshot by then. Without a backing clone (interrupted create) the snapshot
+// can only still be on its source, and a snapshot that is not there is not an
+// error.
+func (r *ZfsSnapshotReconciler) releaseRaw(ctx context.Context, snap *storagev1alpha1.ZfsSnapshot, backingFull, rawFull string) error {
+	logger := log.FromContext(ctx)
+	_, gerr := r.ZFS.Get(ctx, backingFull, "type")
+	if gerr != nil && !errors.Is(gerr, zpool.ErrNotExist) {
+		return gerr
+	}
+	hasBacking := gerr == nil
+	if hasBacking {
+		done, err := r.ZFS.Get(ctx, backingFull, zpool.PropOriginReleased)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(done) == "true" {
+			return nil
+		}
+	}
+	raw, err := locateRawSnapshot(ctx, r.ZFS, backingFull, rawFull, snap.Spec.SnapshotName)
+	if err != nil {
+		return err
+	}
+	if raw == "" {
+		if hasBacking {
+			return fmt.Errorf("raw snapshot %q was not found although its backing clone %s exists; "+
+				"something changed the clone graph from outside the driver, resolve it manually", snap.Spec.SnapshotName, backingFull)
+		}
+		return nil
+	}
+	if raw != rawFull {
+		logger.Info("raw snapshot was relocated by an earlier promote; destroying it where it actually is",
+			"recorded", rawFull, "actual", raw)
+	}
+	if err := r.ZFS.DestroySnapshotDeferred(ctx, raw); err != nil {
+		return err
+	}
+	logger.Info("destroyed ZFS snapshot (deferred)", "snapshot", raw)
+	if hasBacking {
+		return r.ZFS.SetProperty(ctx, backingFull, zpool.PropOriginReleased, "true")
+	}
+	return nil
 }
 
 // reconcileSettled handles a snapshot that already reached Ready (or Lost).
