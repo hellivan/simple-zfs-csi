@@ -186,7 +186,7 @@ Steps:
    **Rollback is not trivial.** Labels are inert, but `destroy -d` on a `restore-source` that has no clone removes it at once (verified:
    ZFS destroys a deferred snapshot immediately when nothing clones it), and the old driver restores from `restore-source`. After the
    migration the old driver cannot restore from those snapshots. The migration is therefore one-way unless the `restore-source` step is
-   postponed: decision pending (see the open question to the user), the new driver ignores `restore-source` either way.
+   postponed. **Decision (user): keep it in the migration, accept that it is one-way.**
 
 Tests: the derivation and audit logic is Go or testable shell against the in-memory ZFS (S2), covering: unlabelled legacy layout,
 partially labelled, promoted raw (raw lives on a restore), orphan, wrong existing label, snapshot-inherited false positive.
