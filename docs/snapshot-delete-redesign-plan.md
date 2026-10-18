@@ -120,7 +120,11 @@ layout in three delete orders, and a single failing ZFS call (`destroy`, `destro
 busy") at every dataset and snapshot of a populated pool. After every step: model invariants, no live volume without dataset, every
 live snapshot restorable, no unowned dataset or unmarked unowned snapshot; at the end the pool is empty. Mutation-checked
 (dropping the deferred destroy or the clone-origin cleanup fails them). `fakeZFS` is kept for the narrow unit tests only.
-Failure policy: anything unforeseen in the clone graph (the origin or clone-origin snapshot cannot be found from its clone, or a foreign snapshot/clone) fails the delete loudly: the object stays Terminating, the volume publishes `DeleteBlocked`, and the retry decides. A retry after the snapshot was already marked is recognised by the ZFS property `simple-zfs-csi:origin-released` on the clone, because the promote loop may have moved or destroyed the snapshot by then.
+Failure policy: a delete must be resumable. Not finding the origin or clone-origin snapshot of a clone means an earlier attempt
+already got past that step (the promote loop moved or destroyed it), so the delete goes on. The loud failure is the destroy of the
+clone itself, which ZFS refuses while the clone still has snapshots or dependent clones (after a clean cleanup that never happens;
+if it does, something went wrong and the object stays Terminating with `DeleteBlocked`). Residual risk, accepted: if someone changes
+the clone graph from outside the driver before the first attempt, the snapshot is not found and stays behind unmarked.
 Not done: label-based selection in the delete allow-list (still the name allow-list; labels select only the promote preference).
 Original scope:
 - Scenario tests (W4): one test per row of the scenario table (25 rows plus 18 to 19b), fan-out, group snapshots, and a
