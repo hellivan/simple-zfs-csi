@@ -311,10 +311,18 @@ func TestLifecycle_DeleteSourceKeepsSnapshotAndRestoreWorking(t *testing.T) {
 	s := w.snapshot(v)
 	w.delVol(v)
 	w.verify()
-	r := w.restore(s)
+	// Deleting the source promoted the backing clone: it now holds the raw
+	// snapshot and has no origin, so the raw snapshot is found by the pool scan.
+	bk := "tank/k8s/csi-snap-" + s
+	if o, _ := w.z.Get(w.ctx, bk, "origin"); o != "-" {
+		t.Fatalf("precondition: backing clone origin = %q, want -", o)
+	}
+	if got := w.z.Snapshots(); len(got) != 1 || got[0] != bk+"@csi-snap-"+s {
+		t.Fatalf("precondition: raw snapshot should sit on the backing clone, got %v", got)
+	}
+	w.restore(s)
 	w.verify()
 	w.drain(true)
-	_ = r
 }
 
 func TestLifecycle_FanOutRestoresOfOneSnapshot(t *testing.T) {
