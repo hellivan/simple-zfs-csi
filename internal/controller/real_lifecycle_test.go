@@ -56,10 +56,9 @@ func init() {
 
 type realLifePool struct {
 	*zpool.CLI
-	root  string
-	base  string
-	mu    sync.Mutex
-	scans int
+	root string
+	base string
+	mu   sync.Mutex
 }
 
 // guarded runs zfs, and only zfs, on names inside the root.
@@ -95,15 +94,6 @@ func (p *realLifePool) guarded(ctx context.Context, name string, args ...string)
 	return string(out), nil
 }
 
-// FindSnapshot counts the pool-wide searches the driver must not run.
-func (p *realLifePool) FindSnapshot(ctx context.Context, pool, suffix string) (string, error) {
-	p.mu.Lock()
-	p.scans++
-	p.mu.Unlock()
-	return p.CLI.FindSnapshot(ctx, pool, suffix)
-}
-
-func (p *realLifePool) Scans() int   { return p.scans }
 func (p *realLifePool) Check() error { return nil }
 
 func (p *realLifePool) list(kind string) []string {

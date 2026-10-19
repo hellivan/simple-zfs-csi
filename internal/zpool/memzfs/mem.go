@@ -51,7 +51,6 @@ type Mem struct {
 	// freshZvol holds zvols that were created and not yet destroyed once.
 	freshZvol map[string]bool
 	owner     []string
-	scans     int
 }
 
 var _ zpool.ZFS = (*Mem)(nil)
@@ -70,14 +69,6 @@ func (m *Mem) Log() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]string(nil), m.log...)
-}
-
-// Scans returns how many pool-wide snapshot scans (FindSnapshot) were made, so
-// tests can assert that a cheaper lookup was enough.
-func (m *Mem) Scans() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.scans
 }
 
 // Inject makes the next `times` calls of op (create, snapshot, clone, destroy,
@@ -460,26 +451,6 @@ func (m *Mem) Clones(_ context.Context, snap string) ([]string, error) {
 		return nil, fmt.Errorf("%w: %s", zpool.ErrNotExist, snap)
 	}
 	return m.clonesOf(snap), nil
-}
-
-// FindSnapshot implements zpool.ZFS.
-func (m *Mem) FindSnapshot(_ context.Context, pool, suffix string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.scans++
-	names := make([]string, 0, len(m.ds))
-	for n := range m.ds {
-		if n == pool || strings.HasPrefix(n, pool+"/") {
-			names = append(names, n)
-		}
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		if m.ds[n].snaps[suffix] != nil {
-			return n + "@" + suffix, nil
-		}
-	}
-	return "", nil
 }
 
 func isUser(prop string) bool { return strings.Contains(prop, ":") }

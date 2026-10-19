@@ -347,7 +347,7 @@ var cases = []testCase{
 		e.eq("a gone", e.exists(a), false)
 	}},
 	// 4. Listing, snapshots, clone properties
-	{"snapshot-list-order-and-find-after-promote", false, func(e *env) {
+	{"snapshot-list-order-after-promote", false, func(e *env) {
 		a := e.mk()
 		for _, s := range []string{"s1", "s2", "s3"} {
 			e.snap(a, s)
@@ -358,12 +358,6 @@ var cases = []testCase{
 		l, err := e.z.ListSnapshots(e.ctx, c)
 		e.must(err)
 		e.eq("oldest first", l, []string{c + "@s1", c + "@s2"})
-		got, err := e.z.FindSnapshot(e.ctx, e.root, "s1")
-		e.must(err)
-		e.eq("find", got, c+"@s1")
-		got, err = e.z.FindSnapshot(e.ctx, e.root, "absent")
-		e.must(err)
-		e.eq("find absent", got, "")
 	}},
 	{"atomic-multi-snapshot", false, func(e *env) {
 		a, b := e.mk(), e.mk()
@@ -435,21 +429,16 @@ var cases = []testCase{
 		e.snap(src, "raw")
 		bk := e.clone(src + "@raw")
 		r1, r2 := e.clone(src+"@raw"), e.clone(src+"@raw")
-		raw := func() string {
-			s, err := e.z.FindSnapshot(e.ctx, e.root, "raw")
-			e.must(err)
-			return s
-		}
 		e.eq("initially on the source", e.origin(bk), src+"@raw")
 		e.must(e.z.DestroySnapshotDeferred(e.ctx, src+"@raw"))
 		e.must(e.z.Promote(e.ctx, r1))
 		e.eq("after promoting a restore", e.origin(bk), r1+"@raw")
-		e.eq("origin names the real location", e.origin(bk), raw())
 		e.must(e.z.Promote(e.ctx, r2))
 		e.eq("after promoting another restore", e.origin(bk), r2+"@raw")
-		e.eq("origin names the real location", e.origin(bk), raw())
 		e.must(e.z.Promote(e.ctx, bk))
-		e.eq("promoted backing clone has no origin; the scan finds the snapshot on it", raw(), bk+"@raw")
+		l, err := e.z.ListSnapshots(e.ctx, bk)
+		e.must(err)
+		e.eq("the raw snapshot moved onto the promoted backing clone", l, []string{bk + "@raw"})
 		e.eq("backing origin is empty", e.origin(bk), "")
 	}},
 }

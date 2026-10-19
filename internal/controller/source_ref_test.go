@@ -134,9 +134,6 @@ func TestSourceRef_RestoreFindsRawOnTheSource(t *testing.T) {
 	if got.Status.Phase != storagev1alpha1.DatasetPhaseReady {
 		t.Errorf("phase = %q (%s)", got.Status.Phase, got.Status.Message)
 	}
-	if w.z.Scans() != 0 {
-		t.Errorf("the backing clone's origin must be enough, but the pool was scanned %d times", w.z.Scans())
-	}
 	if w.z.Check() != nil {
 		t.Fatal(w.z.Check())
 	}
@@ -153,18 +150,12 @@ func TestSourceRef_RestoreFollowsRawAfterAnotherRestoreWasPromoted(t *testing.T)
 	if want := "tank/k8s/pvc-r1@" + rawName; w.origin("tank/k8s/pvc-r2") != want {
 		t.Errorf("origin = %q, want %q", w.origin("tank/k8s/pvc-r2"), want)
 	}
-	if w.z.Scans() != 0 {
-		t.Errorf("the backing clone's origin must follow the promoted raw snapshot, scans = %d", w.z.Scans())
-	}
 }
 
 func TestSourceRef_RestoreFindsRawOnThePromotedBackingClone(t *testing.T) {
 	w := newRefWorld(t, readySnapshot())
 	w.mustZ(w.z.Promote(w.ctx, "tank/k8s/"+rawName)) // origin of the backing clone is now empty
 	w.provision("pvc-r1", snapRef("snap-1"))
-	if w.z.Scans() != 0 {
-		t.Errorf("a promoted backing clone holds the raw snapshot itself, no scan needed, got %d", w.z.Scans())
-	}
 	if want := "tank/k8s/" + rawName + "@" + rawName; w.origin("tank/k8s/pvc-r1") != want {
 		t.Errorf("origin = %q, want %q", w.origin("tank/k8s/pvc-r1"), want)
 	}

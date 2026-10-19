@@ -31,8 +31,6 @@ type lifePool interface {
 	Datasets() []string
 	Snapshots() []string
 	Deferred(snapshot string) bool
-	// Scans is how many pool-wide snapshot searches the driver ran.
-	Scans() int
 	// Check validates the model's own invariants; a real pool has none.
 	Check() error
 }
@@ -252,9 +250,6 @@ func (w *lifeWorld) verify() {
 	w.t.Helper()
 	if err := w.z.Check(); err != nil {
 		w.fail("invariant: %v", err)
-	}
-	if n := w.z.Scans(); n != 0 {
-		w.fail("the driver scanned the pool %d times; every snapshot is found through its backing clone or its dataset", n)
 	}
 	datasets := map[string]bool{}
 	for _, d := range w.z.Datasets() {
