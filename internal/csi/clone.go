@@ -32,13 +32,18 @@ func normalizedDatasetPrefix(prefix string) string {
 // clone/restore whose origin lives under a different datasetPrefix than the new
 // volume would leave that volume's clone-origin outside its own replicated
 // subtree, silently breaking `zfs send -R <prefix>` backup replication (§2.5).
-// Reject it outright rather than letting the footgun exist.
+// Rejecting is opt-in (rejectCrossPrefixClones): setups that do not replicate
+// with `zfs send -R` (e.g. Velero/Kopia backups) legitimately need cross-prefix
+// restores into scratch classes.
 //
 // D6 says this applies to direct PVC-to-PVC clones too — the clone's origin
 // snapshot lives under the source's prefix there as well. sourceDataset is
 // whichever dataset physically holds the origin: the snapshot's backing clone
 // for a restore, the source volume itself for a volume clone.
 func checkSamePrefix(rp *ResolvedParams, sourceDataset, kind, id string) error {
+	if !rp.RejectCrossPrefixClones {
+		return nil
+	}
 	srcPrefix := path.Dir(strings.Trim(sourceDataset, "/"))
 	if want := normalizedDatasetPrefix(rp.DatasetPrefix); srcPrefix != want {
 		return status.Errorf(codes.InvalidArgument,

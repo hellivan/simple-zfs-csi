@@ -11,6 +11,38 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0043 — Cross-`datasetPrefix` clones and restores are allowed by default; `rejectCrossPrefixClones` opts in to the D6 rejection, checked on the destination only
+
+**Status:** Accepted and implemented (2026-10) · **Scope:** `internal/csi/{params,clone}.go` · **Amends:** D6 in [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) and the cross-prefix sentence in ADR-0019
+
+### Context
+
+D6 rejected every clone or restore whose source lived under a different `datasetPrefix` than the new volume. Its only reason was `zfs send -R <prefix>` replication: the new volume's clone origin lives under the source's prefix, so replicating the destination prefix alone is incomplete.
+
+In practice `zfs send` does not work as a backup strategy for the dataset structure this driver builds. Clones, promotes and relocated origin snapshots make a replicated stream unreliable to keep in sync. The backup path that works is Velero with Kopia, which copies file data and does not care where a clone's origin lives. Meanwhile the rejection blocks legitimate workflows: temporary restores, Velero restores and data-moving backups that use a scratch StorageClass with a different prefix.
+
+### Decision
+
+- Cross-prefix clones and restores are **allowed by default**.
+- A new parameter `rejectCrossPrefixClones` (boolean, default `false`) restores the D6 rejection (`InvalidArgument`). It is a normal parameter that inherits through all three layers (provisioner defaults < StorageClass < PVC annotation). It is deliberately not StorageClass-only (unlike ADR-0002's `poolGUID`/`datasetPrefix`): it only makes the driver stricter and moves no data, so a tenant cannot use it to escape any placement rule.
+- The flag is read from the **destination** volume's resolved parameters only. It is applied to all three paths (standalone restore, integrated restore, direct volume clone) through `checkSamePrefix`.
+- Pool, dataset type, volblocksize, fsType and property checks (D10) are unchanged and still apply to cross-prefix requests.
+
+### Options weighed
+
+- **Keep D6 always on.** Rejected: blocks the scratch-class workflows above and protects a replication scheme that does not work here.
+- **Remove the check entirely.** Rejected: someone who does replicate per prefix still gets a safety net by setting the flag.
+- **Opt-out flag (`allowCrossPrefixClone`, default off).** Rejected: the default should match how the driver is actually used, so the guard is the opt-in.
+- **Require both source and destination to allow it.** Rejected. The harm D6 guards against falls on the destination's replication, so the destination's policy owner is the right decision maker. A source veto adds little, because replicating the source prefix still works with a dependent clone elsewhere, and deleting the source is already covered by dependent tracking (D12). It would also need the source's resolved flag recorded on `ZfsDataset`, `ZfsSnapshot` and group snapshot members, with defaults for old objects, and it would make a restore fail because of a setting the person restoring may not control. If protecting a source prefix from outside clones is ever needed, it should be a separate source-side flag.
+
+### Consequences
+
+- A volume restored across prefixes is not self-contained under its own prefix. Replicating only the destination prefix with `zfs send -R` is incomplete. This is accepted.
+- The backing-clone and raw-snapshot path logic needed no change: it derives paths from the source dataset's own parent, so cross-prefix restores work in the controller already.
+- Existing StorageClasses that relied on the rejection must set `rejectCrossPrefixClones: "true"` (or set it in the provisioner defaults to restore it cluster-wide).
+
+---
+
 ## ADR-0042 — Snapshot delete strategy D: mark with `destroy -d`, promote clones off, destroy the empty backing clone
 
 **Status:** Accepted and implemented (2026-10) · **Scope:** `internal/controller/{promote,rawlocate,zfssnapshot_controller,zfsdataset_controller}.go` · **Amends:** ADR-0020, ADR-0028, ADR-0030, ADR-0041 (everything about `@restore-source`) · **Plan:** [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md)
@@ -1225,7 +1257,7 @@ object. Covered by a dedicated test.
 - **Accepted cost:** the listing is pool-wide, so it scales with the pool's total
   snapshot count. Recorded optimisation, deliberately not taken: a relocated
   snapshot can only land on a dataset in its own clone lineage and cross-prefix
-  restores are rejected (D6), so `-r <pool>/<prefix>` would be provably
+  restores are rejected when `rejectCrossPrefixClones` is set (D6, ADR-0043; no longer guaranteed), so `-r <pool>/<prefix>` would be provably
   sufficient. Pool-wide was chosen because it is unconditionally correct and does
   not depend on that invariant holding; the narrowing is a one-line change if
   profiling ever justifies it.
@@ -1840,8 +1872,9 @@ unconditionally on `DeleteVolume`, no mode toggle. A generalized `promoted-onto.
 promote machinery creates (e.g. two simultaneous restores from one snapshot — promoting
 one reparents the other onto it instead of freeing it, per real, documented ZFS behavior),
 so every object stays independently deletable in any order. Cross-`datasetPrefix` restores
-are rejected outright (`InvalidArgument`) since a backing clone's origin must stay inside
-the same replicated subtree for `zfs send -R` backup compatibility.
+were originally rejected outright (`InvalidArgument`) to keep a backing clone's origin inside
+the same replicated subtree for `zfs send -R` compatibility; that is now opt-in via
+`rejectCrossPrefixClones` (ADR-0043).
 
 ### Consequences
 

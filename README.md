@@ -257,6 +257,7 @@ chart defaultParameters  <  StorageClass.parameters  <  PVC annotations
 | `volblocksize` | any layer | zvol block size (NVMe-oF only) |
 | `uid` / `gid` | any layer | POSIX owner applied once to the dataset root at creation (NFS/filesystem only; ignored for NVMe-oF) |
 | `mode` | any layer | octal permission bits (e.g. `0770`) applied once to the dataset root at creation (NFS/filesystem only) |
+| `rejectCrossPrefixClones` | any layer | `true` rejects clones/restores whose source lives under a different `datasetPrefix` (default `false`: allowed) |
 | `property.<name>` | any layer | passed through as a ZFS `-o` property |
 
 > NFS client allow-lists and NVMe-oF host NQNs are **not** parameters — they are

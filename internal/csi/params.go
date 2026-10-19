@@ -26,6 +26,11 @@ const (
 	ParamDatasetPrefix = "datasetPrefix"
 	ParamVolblocksize  = "volblocksize"
 
+	// ParamRejectCrossPrefixClones makes clones/restores whose origin lives under a
+	// different datasetPrefix fail (D6). Off by default; unlike poolGUID and
+	// datasetPrefix it inherits through all three layers.
+	ParamRejectCrossPrefixClones = "rejectCrossPrefixClones"
+
 	// UID, GID and Mode set the POSIX ownership/permissions of a filesystem
 	// dataset's root directory at provision time (applied once by the agent with
 	// chown/chmod). They are the NFS analogue of kubelet's fsGroup, which does not
@@ -66,8 +71,10 @@ type ResolvedParams struct {
 	Protocol      storagev1alpha1.Protocol
 	DatasetType   storagev1alpha1.DatasetType
 	DatasetPrefix string
-	Volblocksize  string
-	Properties    map[string]string
+	// RejectCrossPrefixClones enables the D6 same-prefix check.
+	RejectCrossPrefixClones bool
+	Volblocksize            string
+	Properties              map[string]string
 
 	// UID/GID/Mode carry the optional provision-time root ownership for
 	// filesystem datasets. They are nil/"" when unset and are only populated for
@@ -142,6 +149,13 @@ func ParseParams(p map[string]string) (*ResolvedParams, error) {
 
 	rp.DatasetPrefix = strings.Trim(strings.TrimSpace(p[ParamDatasetPrefix]), "/")
 	rp.Volblocksize = strings.TrimSpace(p[ParamVolblocksize])
+	if v := strings.TrimSpace(p[ParamRejectCrossPrefixClones]); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %q must be a boolean, got %q", ParamRejectCrossPrefixClones, v)
+		}
+		rp.RejectCrossPrefixClones = b
+	}
 
 	// Root ownership/permissions apply only to filesystem (nfs) datasets. For
 	// nvmeof they are silently ignored rather than rejected, so a cluster-wide

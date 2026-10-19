@@ -352,7 +352,7 @@ func TestCreateVolume_RestoreCrossPrefixRejected(t *testing.T) {
 		Name:                "pvc-restore",
 		VolumeCapabilities:  mountCaps(),
 		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
-		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nfs", "datasetPrefix": "other-prefix"},
+		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nfs", "datasetPrefix": "other-prefix", "rejectCrossPrefixClones": "true"},
 		VolumeContentSource: snapshotSource("snap-1"),
 	})
 	if status.Code(err) != codes.InvalidArgument {
@@ -378,11 +378,35 @@ func TestCreateVolume_CloneCrossPrefixRejected(t *testing.T) {
 		Name:                "pvc-clone",
 		VolumeCapabilities:  mountCaps(),
 		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
-		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nfs", "datasetPrefix": "other-prefix"},
+		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nfs", "datasetPrefix": "other-prefix", "rejectCrossPrefixClones": "true"},
 		VolumeContentSource: volumeSource("pvc-src"),
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument for cross-prefix clone, got %v", err)
+	}
+}
+
+// TestCreateVolume_CrossPrefixAllowedByDefault: without rejectCrossPrefixClones
+// a cross-prefix clone and restore are accepted.
+func TestCreateVolume_CrossPrefixAllowedByDefault(t *testing.T) {
+	src := &storagev1alpha1.ZfsDataset{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-src"},
+		Spec: storagev1alpha1.ZfsDatasetSpec{
+			PoolGUID: "999", Dataset: "k8s/pvc-src", Type: storagev1alpha1.DatasetTypeFilesystem,
+		},
+	}
+	cs := newController(newTestClient(t, src))
+	_, err := cs.CreateVolume(context.Background(), &csi.CreateVolumeRequest{
+		Name:                "pvc-clone",
+		VolumeCapabilities:  mountCaps(),
+		CapacityRange:       &csi.CapacityRange{RequiredBytes: 1 << 30},
+		Parameters:          map[string]string{"poolGUID": "999", "protocol": "nfs", "datasetPrefix": "scratch"},
+		VolumeContentSource: volumeSource("pvc-src"),
+	})
+	// No reconciler runs here, so an accepted request ends in a readiness
+	// timeout rather than success; only a prefix rejection would be InvalidArgument.
+	if status.Code(err) == codes.InvalidArgument {
+		t.Fatalf("cross-prefix clone should be allowed by default, got %v", err)
 	}
 }
 

@@ -237,3 +237,24 @@ func TestParseParams_OwnershipErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestParseParams_RejectCrossPrefixClones(t *testing.T) {
+	base := map[string]string{"poolGUID": "1", "protocol": "nfs"}
+	rp, err := ParseParams(base)
+	if err != nil || rp.RejectCrossPrefixClones {
+		t.Fatalf("default: err=%v reject=%v, want false", err, rp != nil && rp.RejectCrossPrefixClones)
+	}
+	base["rejectCrossPrefixClones"] = "true"
+	if rp, err = ParseParams(base); err != nil || !rp.RejectCrossPrefixClones {
+		t.Fatalf("true: err=%v", err)
+	}
+	base["rejectCrossPrefixClones"] = "maybe"
+	if _, err = ParseParams(base); err == nil {
+		t.Fatal("expected error for non-boolean value")
+	}
+	// Inherits from the PVC-annotation layer.
+	merged := ResolveParameters(nil, map[string]string{}, map[string]string{"x/rejectCrossPrefixClones": "true"}, "x/")
+	if merged["rejectCrossPrefixClones"] != "true" {
+		t.Errorf("annotation layer not honoured: %v", merged)
+	}
+}

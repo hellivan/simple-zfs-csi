@@ -82,12 +82,13 @@ changes.
   minute). While it is `Lost`, publishes of the volume fail fast. Do not delete
   the object to "fix" it.
 
-- **Changing the parent prefix affects future clones and restores.** Both reject
-  a source whose parent differs from the target StorageClass's `datasetPrefix`
-  (D6, `checkSamePrefix` in [../internal/csi/clone.go](../internal/csi/clone.go)).
-  Renaming `k8s/a` → `k8s/b` is unaffected; renaming `k8s/a` → `archive/a` means
-  the volume can no longer be cloned or restored from through a StorageClass
-  with `datasetPrefix: k8s`.
+- **Changing the parent prefix can affect future clones and restores.** Cross-prefix
+  clones/restores are allowed by default. With `rejectCrossPrefixClones: "true"`
+  (defaults, StorageClass or PVC annotation) both reject a source whose parent differs
+  from the target's `datasetPrefix` (D6, `checkSamePrefix` in
+  [../internal/csi/clone.go](../internal/csi/clone.go)). Then renaming `k8s/a` →
+  `k8s/b` is unaffected, but `k8s/a` → `archive/a` means the volume can no longer be
+  cloned or restored from through a StorageClass with `datasetPrefix: k8s`.
 
 ---
 
