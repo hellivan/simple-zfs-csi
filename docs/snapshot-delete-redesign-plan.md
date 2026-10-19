@@ -1,8 +1,8 @@
 # Snapshot delete redesign: plan
 
-Status: **plan complete, nothing implemented** (2026-10-15); model and live ZFS replay done, strategy D chosen. Companion to
+Status: **done** (2026-10-19): implemented in 0.0.45, migrated and verified on the cluster, see
+[migration-0.0.45-report-2026-10-19.md](migration-0.0.45-report-2026-10-19.md). Strategy D chosen after model and live ZFS replay. Companion to
 [snapshot-delete-scenarios.md](snapshot-delete-scenarios.md), which holds the scenario table and the model results.
-No code is written until this plan is complete and approved.
 
 ## Goals
 
@@ -146,7 +146,7 @@ Original scope:
   `delete-path-verification-2026-08-03.md`, `IMPLEMENTATION_PROGRESS.md`, and the scenario doc (D column).
 
 ### S6. One-time migration script (P7)
-**Status:** implemented as `cmd/zfs-migrate` (`internal/migrate`). Dry run by default, `--apply` to change; it uses the current kube context and runs zfs in the toolbox pod. Verified: unit tests on memzfs; a read-only dry run on the real cluster (617 actions: 265 objects labelled, 87 `restore-source` marked, no findings); `--apply` on an old-style layout built under `verify_zfs_functions` (`go test -tags zfsreal ./internal/migrate`, guarded to that root, never contacts Kubernetes). Not yet run with `--apply` on the cluster: needs the user's approval.
+**Status:** implemented as `cmd/zfs-migrate` (`internal/migrate`). Dry run by default, `--apply` to change; it uses the current kube context and runs zfs in the toolbox pod. Verified: unit tests on memzfs; a read-only dry run on the real cluster (617 actions: 265 objects labelled, 87 `restore-source` marked, no findings); `--apply` on an old-style layout built under `verify_zfs_functions` (`go test -tags zfsreal ./internal/migrate`, guarded to that root, never contacts Kubernetes). Run with `--apply` on the cluster on 2026-10-19 (632 actions, final audit clean, 271 objects labelled); see the report linked at the top.
 
 Why: from S4 on the driver selects objects by label (see `labels.md`). Objects created before S1 (and any created by a
 pre-S1 driver while the new one rolls out) carry no labels. Labels are not optional for correctness: an unlabelled raw
@@ -182,7 +182,7 @@ Steps:
 3. `--apply` runs them; re-audit must report zero to-label, zero `restore-source`. Orphans stay a human decision.
 4. Verified live first on a layout built the old way (volume, snapshot, restore, clone, group) in `verify_zfs_functions`; run on the
    cluster only after the user approves the audit output.
-5. Ordering with the release: deploy the S1 driver first (new objects get labels at creation), run the script, audit clean, then the S4 driver.
+5. Ordering with the release (as executed): run the script with the old driver (0.0.44), audit clean, upgrade straight to the new driver (0.0.45), then a straggler pass for anything the old driver created in between. A separate S1-only release was not needed.
    **Rollback is not trivial.** Labels are inert, but `destroy -d` on a `restore-source` that has no clone removes it at once (verified:
    ZFS destroys a deferred snapshot immediately when nothing clones it), and the old driver restores from `restore-source`. After the
    migration the old driver cannot restore from those snapshots. The migration is therefore one-way unless the `restore-source` step is
@@ -196,9 +196,9 @@ provisioned), no read of a missing `creationTime`, and no default for an empty `
 migration must therefore stamp `status.provisionedAt` on every Ready or Lost ZfsDataset and ZfsSnapshot, and must reject or fix a
 ZfsSnapshot without `sourceType` before the new driver runs.
 
-### S7. Release and verify
-- The user releases. Live test on a throwaway namespace: the joplin group test, a restore, deletes in the orders of scenarios 6, 12 and 13.
-- The audit must find no unlabelled object and no `restore-source` before the new driver is deployed (the driver has no code for them).
+### S7. Release and verify: DONE (2026-10-19)
+- Released as 0.0.45. Live tests on a throwaway namespace: restore, deletes in the orders of scenarios 6 and 13 (snapshot first, source first), and a two-member group snapshot with restores. All clean; see the report.
+- The audit found no unlabelled object and no `restore-source` before and after the new driver was deployed.
 
 ### Future improvements
 - Select delete targets by label instead of name: destroy a snapshot only if its `role` is `raw` or `clone-origin` and its `owner` equals the

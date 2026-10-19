@@ -6,10 +6,10 @@
 > earlier is the user's risk. Text below that says to keep them is historical.
 
 
-Status: **discussion baseline**, not a decision.
+Status: **historical**. Superseded by ADR-0041 (both guards removed) and ADR-0042 (strategy D).
+Kept only as the discussion that led there; nothing below describes the current code.
 
-This document captures the current decision frame so we can continue later
-without losing context.
+This document captured the decision frame at the time.
 
 ---
 

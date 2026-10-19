@@ -142,8 +142,9 @@ snapshot lives *on* the volume's dataset.
 
 ## Migrating to the raw-only snapshot design (strategy D) and upgrading the driver
 
-One-time procedure for the upgrade from `0.0.44` (or any earlier version) to the first
-release containing ADR-0042. Run it from any machine; it needs nothing from the
+One-time procedure for the upgrade from `0.0.44` (or any earlier version) to `0.0.45`, the first
+release containing ADR-0042. Executed on 2026-10-19, see
+[migration-0.0.45-report-2026-10-19.md](migration-0.0.45-report-2026-10-19.md). Run it from any machine; it needs nothing from the
 chat session. Background: [snapshot-delete-redesign-plan.md](snapshot-delete-redesign-plan.md).
 
 **What it does.** `zfs-migrate` stamps ownership labels on every driver-created
@@ -240,6 +241,11 @@ any blocker, means stop and investigate (the message names the object).
 It re-audits at the end and exits `1` unless the audit is clean. Safe to re-run
 (idempotent) if it is interrupted. From here on do not delete snapshots or volumes
 until step 6 is done.
+
+Every `zfs` command is one `kubectl exec`, so a network or DNS blip aborts the run midway
+(seen on 2026-10-19: `lookup kube.sl.home: no such host`). The `restore-source` marks run
+before the labels, so an interrupted apply has usually already passed the one-way point:
+fix the connection, re-run `--apply`, and upgrade the driver without further delay.
 
 ### 5. Upgrade the driver
 
