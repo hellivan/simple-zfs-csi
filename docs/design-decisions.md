@@ -11,6 +11,50 @@ in [runbooks.md](runbooks.md).
 
 ---
 
+## ADR-0044 — Scrubs as CRDs: `ZfsPoolScrubJob` and `ZfsPoolScrubCronJob`
+
+**Status:** Accepted, not yet implemented (2026-10) · **Scope:** two new CRDs, operator reconcilers (replace `ScrubReconciler`'s ConfigMap pool list), Helm `maintenance.scrub` rendering, RBAC · **Supersedes:** decisions 1 and 2 of ADR-0012 (the config-file pool list and the ConfigMap-driven CronJob reconciliation). Decisions 3 to 5 of ADR-0012 stand.
+
+### Context
+
+ADR-0012 configures scrubs only through `values.yaml`, rendered into an operator ConfigMap. There is no way to start a scrub on demand except `kubectl create job --from=cronjob/scrub-<guid>`, and there is no persistent per-run status. The Job/CronJob split of Kubernetes itself is a good model for both needs.
+
+### Decisions
+
+1. **Two namespaced CRDs, both keyed by pool GUID.**
+   - `ZfsPoolScrubJob` (`spec.poolGUID`, optional `timeout`, `activeDeadlineSeconds`, `ttlSecondsAfterFinished`): one scrub run. The operator creates a native `Job` from it, owned by the CR, and mirrors the outcome into `status` (`phase` Pending/Running/Succeeded/Failed, `jobName`, `startTime`, `completionTime`, `message`).
+   - `ZfsPoolScrubCronJob` (`spec.poolGUID`, `schedule`, optional `suspend`, `startingDeadlineSeconds`, `timeout`, `activeDeadlineSeconds`, history limits): the operator reconciles one native `CronJob` from it, owned by the CR. It keeps the ADR-0012 behavior: node affinity on `ZfsPool.status.currentNode`, re-pinned on takeover, and suspended while the pool is offline.
+
+2. **Opt-in is "a CR exists".** A pool is scrubbed only if someone created a CR for it. There is no allow-list and no auto-all-pools. The Helm chart renders one `ZfsPoolScrubCronJob` per entry of `maintenance.scrub.pools` (the values keep their current shape, with optional per-pool overrides).
+
+3. **Pod template stays in a ConfigMap, without the pool list.** Image, host-exec mode, volumes and service account still come from the chart. The ConfigMap carries only this base pod/Job template, which both reconcilers clone. The CRs carry only per-pool settings. The pool list and `defaultSchedule` move to the rendered CRs. Both reconcilers **watch the ConfigMap** and re-reconcile all their CRs when the template changes, so a chart upgrade rolls out to existing CronJobs without an operator restart.
+
+4. **Native CronJob stays underneath.** Scheduling, `concurrencyPolicy: Forbid`, and history limits come from Kubernetes. Scheduled runs are visible as Jobs and logs, as before. Only manual runs get a CR status object. Writing scheduled-run results to `ZfsPool.status` remains deferred (ADR-0012 decision 4).
+
+5. **No operator-side coordination of overlapping scrubs.** ZFS allows one scrub or resilver per pool at a time. Per the OpenZFS docs (zpool-scrub(8): "ZFS only allows one at a time") and `libzfs_pool.c` (`zpool_scan`), `zpool scrub` on a pool that is already scrubbing returns `EBUSY` (`cannot scrub <pool>: currently scrubbing`), and during a resilver it is also refused. `zpool scrub -w` therefore exits non-zero and `zpool-scrub` fails the Job. This covers manual vs scheduled runs, two manual Jobs and multiple CronJobs for one pool. A paused scrub is resumed by `zpool scrub` (documented behavior), and that Job then waits for it. The operator adds no "one active scrub per pool" rule. The Job's failure message is copied into `ZfsPoolScrubJob.status.message`.
+
+6. **No retries.** Jobs use `backoffLimit: 0` and `restartPolicy: Never`: a failed scrub is a signal, not a transient error. Timeouts: the binary's `--timeout` stays below the Job's `activeDeadlineSeconds`. CronJobs additionally set `startingDeadlineSeconds` (a default of a few hours, overridable per CR) so a missed schedule after downtime is neither skipped silently nor fired arbitrarily late. A Job's timeout does not cancel the ZFS scrub itself, which keeps running in the kernel.
+
+7. **No migration.** Existing `scrub-<guid>` CronJobs from ADR-0012 are not adopted. The feature has no users yet, and the assumption is a clean install. Anyone with old CronJobs deletes them by hand.
+
+### Consequences
+
+- Manual scrub: `kubectl apply` a `ZfsPoolScrubJob`. Scheduled scrub: Helm values or a `ZfsPoolScrubCronJob`.
+- The ConfigMap loading and `--scrub-config-file` pool-list parsing are reduced to the template only.
+- The operator needs RBAC for the two CRDs and their status.
+- A manual `ZfsPoolScrubJob` for a pool with no CronJob is allowed.
+- Not verified against the installed ZFS version: the `EBUSY` behavior is taken from OpenZFS master docs and source.
+
+### Plan
+
+1. API types, CRD generation, deepcopy.
+2. `ZfsPoolScrubJob` reconciler (Job creation, node pinning, status mirroring, TTL).
+3. `ZfsPoolScrubCronJob` reconciler (CronJob ownership, re-pin on takeover, suspend when offline); drop the pool list from `ScrubReconciler`.
+4. Chart: CRDs, RBAC, template ConfigMap, render `ZfsPoolScrubCronJob`s from `maintenance.scrub.pools`.
+5. Tests: reconciler unit tests and `helm template`; a live scrub is the manual e2e.
+
+---
+
 ## ADR-0043 — Cross-`datasetPrefix` clones and restores are allowed by default; `rejectCrossPrefixClones` opts in to the D6 rejection, checked on the destination only
 
 **Status:** Accepted and implemented (2026-10) · **Scope:** `internal/csi/{params,clone}.go` · **Amends:** D6 in [snapshot-lifecycle-redesign.md](snapshot-lifecycle-redesign.md) and the cross-prefix sentence in ADR-0019
@@ -2372,7 +2416,7 @@ parent datasets with `-p` — the missing parent being the actual root cause.
 
 ## ADR-0012 — Pool maintenance: operator-reconciled scrub CronJobs
 
-**Status:** Accepted (2026-07-18) · **Scope:** new `cmd/zpool-scrub` (bundled in the discovery image), operator `ScrubReconciler` + config ConfigMap, `ZfsPool` watch, Helm values + RBAC · **Builds on** the `ZfsPool` discovery/takeover model (ADR-0003).
+**Status:** Accepted (2026-07-18); decisions 1 and 2 superseded by [ADR-0044](#adr-0044--scrubs-as-crds-zfspoolscrubjob-and-zfspoolscrubcronjob) · **Scope:** new `cmd/zpool-scrub` (bundled in the discovery image), operator `ScrubReconciler` + config ConfigMap, `ZfsPool` watch, Helm values + RBAC · **Builds on** the `ZfsPool` discovery/takeover model (ADR-0003).
 
 ### Context
 
