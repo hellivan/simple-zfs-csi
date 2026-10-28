@@ -28,13 +28,13 @@ type ZfsPoolScrubJobSpec struct {
 	PoolGUID string `json:"poolGUID"`
 
 	// Timeout is passed to the scrub binary as its wait limit. When unset, the
-	// chart's maintenance.scrub.timeout applies. Keep it below
+	// chart's maintenance.scrub.defaults.timeout applies. Keep it below
 	// ActiveDeadlineSeconds.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
 	// ActiveDeadlineSeconds is the Kubernetes Job's wall-clock limit. When unset,
-	// the chart's maintenance.scrub.activeDeadlineSeconds applies.
+	// the chart's maintenance.scrub.defaults.activeDeadlineSeconds applies.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
@@ -118,18 +118,18 @@ type ZfsPoolScrubCronJobSpec struct {
 	Suspend *bool `json:"suspend,omitempty"`
 
 	// StartingDeadlineSeconds is how late a missed start may still run. When
-	// unset, the chart's maintenance.scrub.startingDeadlineSeconds applies.
+	// unset, the chart's maintenance.scrub.defaults.startingDeadlineSeconds applies.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	StartingDeadlineSeconds *int64 `json:"startingDeadlineSeconds,omitempty"`
 
 	// Timeout is passed to the scrub binary as its wait limit. When unset, the
-	// chart's maintenance.scrub.timeout applies.
+	// chart's maintenance.scrub.defaults.timeout applies.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
 	// ActiveDeadlineSeconds is each Job's wall-clock limit. When unset, the
-	// chart's maintenance.scrub.activeDeadlineSeconds applies.
+	// chart's maintenance.scrub.defaults.activeDeadlineSeconds applies.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`

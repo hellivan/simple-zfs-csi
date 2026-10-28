@@ -416,7 +416,7 @@ subjects:
     name: {{ include "simple-zfs-csi.serviceAccountName" (dict "root" . "component" "operator") }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
-{{- if and .Values.operator.enabled .Values.maintenance.scrub.enabled }}
+{{- if .Values.operator.enabled }}
 ---
 # Scrub maintenance: the operator reconciles ZfsPoolScrubJob / ZfsPoolScrubCronJob
 # CRs into Jobs / CronJobs from the template ConfigMap (ADR-0044). Namespaced.

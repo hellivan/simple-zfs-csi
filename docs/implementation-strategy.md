@@ -225,7 +225,7 @@ Periodic `zpool scrub` per pool, configured in values, surfaced as pass/fail Job
   CronJob (re-pinned on takeover, suspended when offline); `ZfsPoolScrubJob` → one
   pinned Job with status mirrored back. Both clone a base template from a ConfigMap
   they watch. `concurrencyPolicy: Forbid`, `backoffLimit: 0`.
-- Chart: `maintenance.scrub.{enabled,defaultSchedule,pools[]}` renders one
+- Chart: `maintenance.scrub.{pools[],defaults}` renders one
   `ZfsPoolScrubCronJob` per pool; operator Jobs/CronJobs/Pods/CRD RBAC.
 - Verify: unit tests (status parse → exit code, CronJob render/pin/suspend/prune),
   `helm template`; live scrub Job is the manual e2e.

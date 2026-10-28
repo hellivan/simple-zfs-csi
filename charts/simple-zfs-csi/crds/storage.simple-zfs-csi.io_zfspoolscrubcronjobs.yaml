@@ -65,7 +65,7 @@ spec:
               activeDeadlineSeconds:
                 description: |-
                   ActiveDeadlineSeconds is each Job's wall-clock limit. When unset, the
-                  chart's maintenance.scrub.activeDeadlineSeconds applies.
+                  chart's maintenance.scrub.defaults.activeDeadlineSeconds applies.
                 format: int64
                 minimum: 1
                 type: integer
@@ -87,7 +87,7 @@ spec:
               startingDeadlineSeconds:
                 description: |-
                   StartingDeadlineSeconds is how late a missed start may still run. When
-                  unset, the chart's maintenance.scrub.startingDeadlineSeconds applies.
+                  unset, the chart's maintenance.scrub.defaults.startingDeadlineSeconds applies.
                 format: int64
                 minimum: 0
                 type: integer
@@ -104,7 +104,7 @@ spec:
               timeout:
                 description: |-
                   Timeout is passed to the scrub binary as its wait limit. When unset, the
-                  chart's maintenance.scrub.timeout applies.
+                  chart's maintenance.scrub.defaults.timeout applies.
                 type: string
             required:
             - poolGUID

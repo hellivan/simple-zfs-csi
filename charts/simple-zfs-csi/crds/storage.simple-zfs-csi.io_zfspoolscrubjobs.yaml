@@ -63,7 +63,7 @@ spec:
               activeDeadlineSeconds:
                 description: |-
                   ActiveDeadlineSeconds is the Kubernetes Job's wall-clock limit. When unset,
-                  the chart's maintenance.scrub.activeDeadlineSeconds applies.
+                  the chart's maintenance.scrub.defaults.activeDeadlineSeconds applies.
                 format: int64
                 minimum: 1
                 type: integer
@@ -76,7 +76,7 @@ spec:
               timeout:
                 description: |-
                   Timeout is passed to the scrub binary as its wait limit. When unset, the
-                  chart's maintenance.scrub.timeout applies. Keep it below
+                  chart's maintenance.scrub.defaults.timeout applies. Keep it below
                   ActiveDeadlineSeconds.
                 type: string
               ttlSecondsAfterFinished:

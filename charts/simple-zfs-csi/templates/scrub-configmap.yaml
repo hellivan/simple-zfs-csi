@@ -1,4 +1,4 @@
-{{- if and .Values.operator.enabled .Values.maintenance.scrub.enabled }}
+{{- if .Values.operator.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,23 +11,23 @@ data:
   # Consumed by the operator's ZfsPoolScrubJob and ZfsPoolScrubCronJob
   # reconcilers (ADR-0044). `template` is a base CronJob they clone: the
   # CronJob reconciler uses all of it, the Job reconciler its jobTemplate. They
-  # set name, schedule, node affinity and the --pool-guid argument; per-CR
-  # settings override the defaults below.
+  # set name, schedule, node affinity and the --pool-guid argument. The values
+  # here come from maintenance.scrub.defaults and apply to every CR; settings on
+  # a CR override them.
   config.yaml: |
     template:
       metadata:
         labels:
           app.kubernetes.io/component: scrub
       spec:
-        schedule: {{ .Values.maintenance.scrub.defaultSchedule | quote }}
         concurrencyPolicy: Forbid
-        startingDeadlineSeconds: {{ .Values.maintenance.scrub.startingDeadlineSeconds }}
-        successfulJobsHistoryLimit: {{ .Values.maintenance.scrub.successfulJobsHistoryLimit }}
-        failedJobsHistoryLimit: {{ .Values.maintenance.scrub.failedJobsHistoryLimit }}
+        startingDeadlineSeconds: {{ .Values.maintenance.scrub.defaults.startingDeadlineSeconds }}
+        successfulJobsHistoryLimit: {{ .Values.maintenance.scrub.defaults.successfulJobsHistoryLimit }}
+        failedJobsHistoryLimit: {{ .Values.maintenance.scrub.defaults.failedJobsHistoryLimit }}
         jobTemplate:
           spec:
             backoffLimit: 0
-            activeDeadlineSeconds: {{ .Values.maintenance.scrub.activeDeadlineSeconds }}
+            activeDeadlineSeconds: {{ .Values.maintenance.scrub.defaults.activeDeadlineSeconds }}
             template:
               metadata:
                 labels:
@@ -61,10 +61,10 @@ data:
                       - --nsenter-target-pid={{ .Values.discovery.hostExec.targetPid }}
                       {{- end }}
                       {{- end }}
-                      - --timeout={{ .Values.maintenance.scrub.timeout }}
+                      - --timeout={{ .Values.maintenance.scrub.defaults.timeout }}
                     securityContext:
                       privileged: true
-                    {{- with .Values.maintenance.scrub.resources }}
+                    {{- with .Values.maintenance.scrub.defaults.resources }}
                     resources:
                       {{- toYaml . | nindent 22 }}
                     {{- end }}
