@@ -1,0 +1,143 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: zfspoolscrubcronjobs.storage.simple-zfs-csi.io
+spec:
+  group: storage.simple-zfs-csi.io
+  names:
+    kind: ZfsPoolScrubCronJob
+    listKind: ZfsPoolScrubCronJobList
+    plural: zfspoolscrubcronjobs
+    shortNames:
+    - zpscrubcron
+    singular: zfspoolscrubcronjob
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolGUID
+      name: Pool
+      type: string
+    - jsonPath: .spec.schedule
+      name: Schedule
+      type: string
+    - jsonPath: .status.currentNode
+      name: Node
+      type: string
+    - jsonPath: .status.suspended
+      name: Suspended
+      type: boolean
+    - jsonPath: .status.lastScheduleTime
+      name: Last
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ZfsPoolScrubCronJob schedules recurring scrubs of a ZFS pool. The operator
+          maintains a Kubernetes CronJob of the same name, pinned to the node currently
+          hosting the pool, and re-pins it when the pool moves.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ZfsPoolScrubCronJobSpec schedules recurring scrubs of one pool. The CR must
+              live in the operator's namespace. See design-decisions ADR-0044.
+            properties:
+              activeDeadlineSeconds:
+                description: |-
+                  ActiveDeadlineSeconds is each Job's wall-clock limit. When unset, the
+                  chart's maintenance.scrub.activeDeadlineSeconds applies.
+                format: int64
+                minimum: 1
+                type: integer
+              failedJobsHistoryLimit:
+                description: FailedJobsHistoryLimit overrides the chart default.
+                format: int32
+                minimum: 0
+                type: integer
+              poolGUID:
+                description: |-
+                  PoolGUID is the ZFS pool GUID (the ZfsPool metadata.name without the
+                  "zpool-" prefix).
+                minLength: 1
+                type: string
+              schedule:
+                description: Schedule is a cron expression, as for a Kubernetes CronJob.
+                minLength: 1
+                type: string
+              startingDeadlineSeconds:
+                description: |-
+                  StartingDeadlineSeconds is how late a missed start may still run. When
+                  unset, the chart's maintenance.scrub.startingDeadlineSeconds applies.
+                format: int64
+                minimum: 0
+                type: integer
+              successfulJobsHistoryLimit:
+                description: SuccessfulJobsHistoryLimit overrides the chart default.
+                format: int32
+                minimum: 0
+                type: integer
+              suspend:
+                description: |-
+                  Suspend stops new scrubs from being scheduled. The operator also suspends
+                  the CronJob by itself while the pool has no reachable node.
+                type: boolean
+              timeout:
+                description: |-
+                  Timeout is passed to the scrub binary as its wait limit. When unset, the
+                  chart's maintenance.scrub.timeout applies.
+                type: string
+            required:
+            - poolGUID
+            - schedule
+            type: object
+          status:
+            description: ZfsPoolScrubCronJobStatus reports the observed state of the
+              scheduled scrub.
+            properties:
+              cronJobName:
+                description: CronJobName is the name of the Kubernetes CronJob the
+                  operator maintains.
+                type: string
+              currentNode:
+                description: CurrentNode is the node the CronJob is currently pinned
+                  to.
+                type: string
+              lastScheduleTime:
+                description: LastScheduleTime is when the CronJob last started a Job.
+                format: date-time
+                type: string
+              message:
+                description: Message is human-readable detail, for example why the
+                  CronJob is suspended.
+                type: string
+              suspended:
+                description: |-
+                  Suspended is whether the CronJob is currently suspended, either by
+                  spec.suspend or because the pool has no reachable node.
+                type: boolean
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,123 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: zfspoolscrubjobs.storage.simple-zfs-csi.io
+spec:
+  group: storage.simple-zfs-csi.io
+  names:
+    kind: ZfsPoolScrubJob
+    listKind: ZfsPoolScrubJobList
+    plural: zfspoolscrubjobs
+    shortNames:
+    - zpscrubjob
+    singular: zfspoolscrubjob
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolGUID
+      name: Pool
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.startTime
+      name: Started
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ZfsPoolScrubJob is one scrub run of a ZFS pool. The operator creates a
+          Kubernetes Job from it, pinned to the node currently hosting the pool, and
+          mirrors the outcome into status. ZFS itself refuses a scrub while another
+          scrub or resilver is running, so an overlapping run simply fails.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ZfsPoolScrubJobSpec requests one scrub of the pool identified by PoolGUID.
+              The CR must live in the operator's namespace. See design-decisions ADR-0044.
+            properties:
+              activeDeadlineSeconds:
+                description: |-
+                  ActiveDeadlineSeconds is the Kubernetes Job's wall-clock limit. When unset,
+                  the chart's maintenance.scrub.activeDeadlineSeconds applies.
+                format: int64
+                minimum: 1
+                type: integer
+              poolGUID:
+                description: |-
+                  PoolGUID is the ZFS pool GUID (the ZfsPool metadata.name without the
+                  "zpool-" prefix).
+                minLength: 1
+                type: string
+              timeout:
+                description: |-
+                  Timeout is passed to the scrub binary as its wait limit. When unset, the
+                  chart's maintenance.scrub.timeout applies. Keep it below
+                  ActiveDeadlineSeconds.
+                type: string
+              ttlSecondsAfterFinished:
+                description: |-
+                  TTLSecondsAfterFinished deletes the Job (not this CR) that long after it
+                  finishes. The CR keeps the result in its status.
+                format: int32
+                minimum: 0
+                type: integer
+            required:
+            - poolGUID
+            type: object
+          status:
+            description: ZfsPoolScrubJobStatus reports the observed state of the scrub
+              run.
+            properties:
+              completionTime:
+                description: CompletionTime is when the run reached a terminal phase.
+                format: date-time
+                type: string
+              jobName:
+                description: JobName is the name of the Kubernetes Job running the
+                  scrub.
+                type: string
+              message:
+                description: |-
+                  Message is human-readable detail. For a failed run it carries the tail of
+                  the scrub container's output (for example "currently scrubbing" when ZFS
+                  refused because a scrub was already running).
+                type: string
+              phase:
+                description: Phase is the coarse state of the run. Succeeded and Failed
+                  are terminal.
+                type: string
+              startTime:
+                description: StartTime is when the Job started.
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -492,17 +492,29 @@ csiDriver:
   fsGroupPolicy: ReadWriteOnceWithFSType
 
 # -------- Pool maintenance --------
-# ZFS pools need periodic scrubbing. When enabled, the operator reconciles one
-# CronJob per listed pool, pinned to the pool's current node (following takeover)
-# and suspended while the pool is offline. Each run is a Kubernetes Job that
-# succeeds on a clean scrub and fails on errors — monitor via kube-state-metrics
-# (`kube_job_status_failed`). See docs/design-decisions.md ADR-0012.
+# ZFS pools need periodic scrubbing. When enabled, the chart renders one
+# ZfsPoolScrubCronJob per listed pool; the operator turns each into a CronJob
+# pinned to the pool's current node (following takeover) and suspended while the
+# pool is offline. Pools not listed are never scrubbed. Each run is a Kubernetes
+# Job that succeeds on a clean scrub and fails on errors, or when ZFS refuses
+# because a scrub/resilver is already running. Monitor via kube-state-metrics
+# (`kube_job_status_failed`) and read the Job logs.
+#
+# A one-off scrub is a ZfsPoolScrubJob in the release namespace:
+#   apiVersion: storage.simple-zfs-csi.io/v1alpha1
+#   kind: ZfsPoolScrubJob
+#   metadata: { name: scrub-manual-1 }
+#   spec: { poolGUID: "1234567890" }
+# See docs/design-decisions.md ADR-0044.
 maintenance:
   scrub:
-    # -- Enable operator-reconciled scrub CronJobs (requires the operator).
+    # -- Enable the scrub reconcilers and render the scrub CronJob CRs (requires the operator).
     enabled: false
     # -- Default cron schedule for pools that don't set their own.
     defaultSchedule: "0 3 * * 0"
+    # -- How late (seconds) a missed scheduled start may still run, e.g. after
+    # operator or control-plane downtime. Per-CR override: spec.startingDeadlineSeconds.
+    startingDeadlineSeconds: 21600
     # -- Max time a single scrub Job may run before being killed.
     activeDeadlineSeconds: 86400
     # -- Timeout passed to the scrub binary (should be <= activeDeadlineSeconds).

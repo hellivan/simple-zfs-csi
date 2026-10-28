@@ -8,19 +8,12 @@ metadata:
     {{- include "simple-zfs-csi.labels" . | nindent 4 }}
     app.kubernetes.io/component: scrub
 data:
-  # Consumed by the operator's ScrubReconciler (ADR-0012). `template` is a base
-  # CronJob the operator clones per pool, setting name, schedule, node affinity
-  # and the --pool-guid argument.
+  # Consumed by the operator's ZfsPoolScrubJob and ZfsPoolScrubCronJob
+  # reconcilers (ADR-0044). `template` is a base CronJob they clone: the
+  # CronJob reconciler uses all of it, the Job reconciler its jobTemplate. They
+  # set name, schedule, node affinity and the --pool-guid argument; per-CR
+  # settings override the defaults below.
   config.yaml: |
-    enabled: {{ .Values.maintenance.scrub.enabled }}
-    defaultSchedule: {{ .Values.maintenance.scrub.defaultSchedule | quote }}
-    pools:
-      {{- range .Values.maintenance.scrub.pools }}
-      - guid: {{ .guid | quote }}
-        {{- with .schedule }}
-        schedule: {{ . | quote }}
-        {{- end }}
-      {{- end }}
     template:
       metadata:
         labels:
@@ -28,6 +21,7 @@ data:
       spec:
         schedule: {{ .Values.maintenance.scrub.defaultSchedule | quote }}
         concurrencyPolicy: Forbid
+        startingDeadlineSeconds: {{ .Values.maintenance.scrub.startingDeadlineSeconds }}
         successfulJobsHistoryLimit: {{ .Values.maintenance.scrub.successfulJobsHistoryLimit }}
         failedJobsHistoryLimit: {{ .Values.maintenance.scrub.failedJobsHistoryLimit }}
         jobTemplate:

@@ -221,13 +221,12 @@ Periodic `zpool scrub` per pool, configured in values, surfaced as pass/fail Job
   health/error result (host-exec).
 - `cmd/zpool-scrub`: resolve GUID → pool, scrub, exit non-zero on errors/unhealthy;
   bundled into the discovery image (CronJob overrides the command).
-- Operator `ScrubReconciler`: read `--scrub-config-file` (per-pool `{guid, schedule}`),
-  watch `ZfsPool` + the ConfigMap, ensure one `CronJob scrub-<guid>` pinned via
-  `nodeAffinity` on `kubernetes.io/hostname == status.currentNode`; suspend when
-  offline; label-prune pools removed from config. `concurrencyPolicy: Forbid`,
-  `backoffLimit: 0`.
-- Chart: `maintenance.scrub.{enabled,defaultSchedule,pools[]}` → operator ConfigMap;
-  operator `batch/cronjobs` RBAC; mount the config file.
+- Operator reconcilers (reworked by ADR-0044): `ZfsPoolScrubCronJob` → one pinned
+  CronJob (re-pinned on takeover, suspended when offline); `ZfsPoolScrubJob` → one
+  pinned Job with status mirrored back. Both clone a base template from a ConfigMap
+  they watch. `concurrencyPolicy: Forbid`, `backoffLimit: 0`.
+- Chart: `maintenance.scrub.{enabled,defaultSchedule,pools[]}` renders one
+  `ZfsPoolScrubCronJob` per pool; operator Jobs/CronJobs/Pods/CRD RBAC.
 - Verify: unit tests (status parse → exit code, CronJob render/pin/suspend/prune),
   `helm template`; live scrub Job is the manual e2e.
 

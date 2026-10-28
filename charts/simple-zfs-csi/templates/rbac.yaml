@@ -418,8 +418,8 @@ subjects:
 {{- end }}
 {{- if and .Values.operator.enabled .Values.maintenance.scrub.enabled }}
 ---
-# Scrub maintenance: the operator reconciles per-pool scrub CronJobs from the
-# scrub ConfigMap and the live ZfsPools (ADR-0012). Namespaced.
+# Scrub maintenance: the operator reconciles ZfsPoolScrubJob / ZfsPoolScrubCronJob
+# CRs into Jobs / CronJobs from the template ConfigMap (ADR-0044). Namespaced.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -432,9 +432,26 @@ rules:
   - apiGroups: ["batch"]
     resources: ["cronjobs"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch"]
+  # Read a failed run's container message into ZfsPoolScrubJob.status.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfspoolscrubjobs", "zfspoolscrubcronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfspoolscrubjobs/status", "zfspoolscrubcronjobs/status"]
+    verbs: ["get", "update", "patch"]
+  # Needed to set ownerReferences with blockOwnerDeletion.
+  - apiGroups: ["storage.simple-zfs-csi.io"]
+    resources: ["zfspoolscrubjobs/finalizers", "zfspoolscrubcronjobs/finalizers"]
+    verbs: ["update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

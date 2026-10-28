@@ -55,7 +55,7 @@ func main() {
 	flag.StringVar(&leaderElecNS, "leader-election-namespace", os.Getenv("POD_NAMESPACE"), "Namespace for the leader-election lease (defaults to $POD_NAMESPACE).")
 	flag.BoolVar(&dhchapEnabled, "nvmeof-dhchap", true, "Enable NVMe-oF DH-CHAP in-band authentication (ADR-0011); NQN allow-listing applies regardless.")
 	flag.StringVar(&dhchapSecretKey, "nvmeof-dhchap-secret-key", "dhchap-key", "Data key under which the DH-CHAP secret is stored in the per-attach Secret.")
-	flag.StringVar(&scrubConfigMap, "scrub-config-map", "", "Name of the scrub config ConfigMap in the operator namespace (empty disables scrub reconciliation).")
+	flag.StringVar(&scrubConfigMap, "scrub-config-map", "", "Name of the scrub template ConfigMap in the operator namespace (empty disables the ZfsPoolScrubJob/ZfsPoolScrubCronJob reconcilers).")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -131,12 +131,21 @@ func main() {
 	}
 
 	if scrubConfigMap != "" {
-		if err := (&controller.ScrubReconciler{
+		if err := (&controller.ZfsPoolScrubJobReconciler{
+			Client:        mgr.GetClient(),
+			APIReader:     mgr.GetAPIReader(),
+			Namespace:     namespace,
+			ConfigMapName: scrubConfigMap,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to set up zfspoolscrubjob reconciler")
+			os.Exit(1)
+		}
+		if err := (&controller.ZfsPoolScrubCronJobReconciler{
 			Client:        mgr.GetClient(),
 			Namespace:     namespace,
 			ConfigMapName: scrubConfigMap,
 		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to set up scrub reconciler")
+			setupLog.Error(err, "unable to set up zfspoolscrubcronjob reconciler")
 			os.Exit(1)
 		}
 	}

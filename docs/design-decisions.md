@@ -13,7 +13,7 @@ in [runbooks.md](runbooks.md).
 
 ## ADR-0044 — Scrubs as CRDs: `ZfsPoolScrubJob` and `ZfsPoolScrubCronJob`
 
-**Status:** Accepted, not yet implemented (2026-10) · **Scope:** two new CRDs, operator reconcilers (replace `ScrubReconciler`'s ConfigMap pool list), Helm `maintenance.scrub` rendering, RBAC · **Supersedes:** decisions 1 and 2 of ADR-0012 (the config-file pool list and the ConfigMap-driven CronJob reconciliation). Decisions 3 to 5 of ADR-0012 stand.
+**Status:** Accepted and implemented (2026-10) · **Scope:** two new CRDs, operator reconcilers (replace `ScrubReconciler`'s ConfigMap pool list), Helm `maintenance.scrub` rendering, RBAC · **Supersedes:** decisions 1 and 2 of ADR-0012 (the config-file pool list and the ConfigMap-driven CronJob reconciliation). Decisions 3 to 5 of ADR-0012 stand.
 
 ### Context
 

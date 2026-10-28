@@ -1,0 +1,16 @@
+{{- if and .Values.operator.enabled .Values.maintenance.scrub.enabled }}
+{{- range .Values.maintenance.scrub.pools }}
+---
+apiVersion: storage.simple-zfs-csi.io/v1alpha1
+kind: ZfsPoolScrubCronJob
+metadata:
+  name: scrub-{{ .guid }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "simple-zfs-csi.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: scrub
+spec:
+  poolGUID: {{ .guid | quote }}
+  schedule: {{ .schedule | default $.Values.maintenance.scrub.defaultSchedule | quote }}
+{{- end }}
+{{- end }}
