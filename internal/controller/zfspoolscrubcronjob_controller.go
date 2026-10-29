@@ -152,7 +152,7 @@ func (r *ZfsPoolScrubCronJobReconciler) SetupWithManager(mgr ctrl.Manager) error
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.ZfsPoolScrubCronJob{}).
 		Owns(&batchv1.CronJob{}).
-		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPool)).
+		Watches(&storagev1alpha1.ZfsPool{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPool), poolChanged()).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.requestsForAll), builder.WithPredicates(configMapPred)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Named("zfspoolscrubcronjob").
