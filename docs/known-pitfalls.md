@@ -1232,6 +1232,35 @@ audit of what's actually visible in that container's mount namespace — "it's
 privileged, it can mount anything" is true of *capability*, not of *path
 resolution*, and it was the latter that bit here.
 
+## 24. A `ZfsPool` watch without `poolChanged()` re-reconciles every 30 seconds
+
+**Symptom:** a reconciler that watches `ZfsPool` runs continuously on an idle
+cluster, about every 30 s, doing real API calls (and, for objects that rebuild a
+pod template, logging a PodSecurity warning each time). Found live on the scrub
+CronJob reconciler.
+
+**Root cause:** the discovery loop rewrites `ZfsPool.status.lastUpdated` as a
+heartbeat every ~30 s. Every such write is a watch event, so any
+`Watches(&ZfsPool{}, ...)` fires for each pool on each tick, even though nothing
+a reconciler cares about (`currentNode`, `health`, mount path, ...) changed.
+Ignoring status updates altogether is **not** the fix: `currentNode` and `health`
+live in the status and drive takeover re-pinning and offline handling.
+
+**Guard:** pass `poolChanged()` as the watch option on **every**
+`Watches(&storagev1alpha1.ZfsPool{}, ...)`. It drops an update only when
+`status.lastUpdated` is the sole difference, and passes every other change
+(spec, labels, deletion, any other status field). See
+[internal/controller/pool_predicates.go](../internal/controller/pool_predicates.go).
+Used by the dataset, snapshot, group-snapshot, share, attach-request and scrub
+CronJob reconcilers.
+
+**Takeaway:** when adding a controller that maps `ZfsPool` events to its own
+objects, copy the `poolChanged()` option from an existing one. A reconciler that
+reads a pool only once (such as `ZfsPoolScrubJobReconciler`) needs no watch and
+no filter.
+
+---
+
 ## Adjacent operational gotchas (not bugs, but frequently confusing)
 
 ### ZVOL vs filesystem sizing
